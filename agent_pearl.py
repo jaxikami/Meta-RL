@@ -90,7 +90,7 @@ ENTROPY_TERM_CLIP = 50.0
 # ─── Latent-Variable Helpers ──────────────────────────────────────────────────
 
 
-def product_of_gaussians(mus, sigmas_sq):
+def product_of_gaussians(mus, sigmas_sq, include_prior=True):
     """Combine independent Gaussian factors into one via product of Gaussians.
 
     Implements PEARL's permutation-invariant aggregation over a set of
@@ -100,13 +100,30 @@ def product_of_gaussians(mus, sigmas_sq):
     Args:
         mus: Tensor of factor means, shape [N, latent_dim].
         sigmas_sq: Tensor of factor variances, shape [N, latent_dim] (positive).
+        include_prior: If True, fold the N(0, I) prior in as an additional
+            factor (precision 1, mean 0).  This is PEARL's formulation and it
+            matters for two reasons here.  (a) It bounds the posterior variance
+            at 1.0, so a posterior can never be *wider* than the prior — with
+            the prior omitted, a single high-variance factor produced a
+            posterior with sigma^2 >> 1, i.e. a z sample far outside anything
+            the actor was trained on.  (b) It makes the zero-factor case fall
+            out of the same formula instead of being special-cased, which is
+            what keeps the training-time posterior (``ContextEncoder.forward``
+            over a context minibatch) and the rollout-time incremental
+            posterior (``PEARLAgent.update_context``) algebraically identical.
+            They must match: the actor is trained on z drawn from the former
+            and deployed on z drawn from the latter.
 
     Returns:
         A tuple (mu, sigma_sq) of the combined posterior, each shape [latent_dim].
     """
     sigmas_sq = torch.clamp(sigmas_sq, min=1e-7)
-    sigma_sq = 1.0 / torch.sum(1.0 / sigmas_sq, dim=0)
-    mu = sigma_sq * torch.sum(mus / sigmas_sq, dim=0)
+    precision = torch.sum(1.0 / sigmas_sq, dim=0)
+    weighted_mu = torch.sum(mus / sigmas_sq, dim=0)
+    if include_prior:
+        precision = precision + 1.0
+    sigma_sq = 1.0 / precision
+    mu = sigma_sq * weighted_mu
     return mu, sigma_sq
 
 
@@ -114,7 +131,7 @@ def product_of_gaussians(mus, sigmas_sq):
 
 
 class RunningMeanStd:
-    """Online (Welford) running mean/variance estimator for reward scaling.
+    """Bounded-window running mean/variance estimator for reward scaling.
 
     Used to standardise the SAC reward target to roughly unit scale.  The env's
     per-step reward is penalty-dominated and large in magnitude (order 1-10),
@@ -122,12 +139,43 @@ class RunningMeanStd:
     KL bottleneck and entropy terms become negligible.  Dividing the reward by a
     running standard deviation keeps the critic target O(1/(1-gamma)) regardless
     of the raw penalty magnitude, so the other loss terms stay meaningful.
+
+    ``max_count`` IS THE FIX FOR THE PRIMARY DIVERGENCE MECHANISM in this
+    project.  Previously ``count`` was unbounded AND ``update`` was called from
+    the SAC minibatch path (meta_batch * updates_per_iter = 80 calls of 1024
+    samples = ~82k samples per outer iteration).  Two things went wrong:
+
+      1. ``count`` reached ~8M by iteration 100 and ~57M by iteration 700, so
+         each new batch moved the estimate by <1% and then <0.15%.  The reward
+         scale FROZE at the value it had during early, random-policy rollouts —
+         exactly when the Lagrangian penalties are largest.
+      2. Because the frozen std was large, ``r / std`` shrank as the policy got
+         worse, shrinking the Bellman target, shrinking every gradient, and
+         removing the signal needed to recover.  This is visible in
+         policy/pearl_meta_log.json: from iter 60 to 762 avg_reward went
+         -27 -> -2438 (90x WORSE) while critic_loss went 10.9 -> 0.46 (24x
+         BETTER).  A critic fitting ever more perfectly while the policy
+         collapses is the signature of a vanishing target scale, not of a
+         diverging critic (which was the earlier, mistaken reading).
+         Downstream: with critic_loss ~ 0.46 the encoder's only informative
+         gradient (d critic_loss / d z) also vanished, so the KL term won by
+         default and the posterior collapsed (KL -> 1e-3).
+
+    Capping ``count`` turns this into an exponentially-weighted estimator with
+    an effective window of ``max_count`` samples, so the scale keeps tracking
+    the reward distribution of recent data.  It is only meaningful in
+    combination with the other half of the fix: ``update`` is now called ONCE
+    PER COLLECTED ENV STEP (via ``PEARLAgent.observe_rewards``) rather than once
+    per replayed minibatch sample, so ``count`` measures env steps and the
+    window is interpretable (1e5 env steps ~= 830 episodes ~= 400 outer
+    iterations at COLLECT_EPISODES_PER_ITER=2).
     """
 
-    def __init__(self, eps=1e-4):
+    def __init__(self, eps=1e-4, max_count=1e5):
         self.mean = 0.0
         self.var = 1.0
         self.count = eps
+        self.max_count = float(max_count)
 
     def update(self, x):
         """Fold a batch of scalar rewards into the running statistics."""
@@ -148,7 +196,11 @@ class RunningMeanStd:
         m_a = self.var * self.count
         m_b = b_var * b_count
         self.var = (m_a + m_b + delta * delta * self.count * b_count / tot) / tot
-        self.count = tot
+        # Cap the effective sample count so this stays a bounded-window
+        # estimator that keeps tracking recent data (see the class docstring:
+        # an unbounded count froze the reward scale at its random-policy value
+        # and starved every gradient in the run).
+        self.count = min(tot, self.max_count)
 
     @property
     def std(self):
@@ -304,7 +356,7 @@ class TanhGaussianActor(nn.Module):
         log_std = torch.clamp(self.log_std_head(feat), LOG_STD_MIN, LOG_STD_MAX)
         return mean, log_std
 
-    def sample(self, obs, z, deterministic=False, with_logprob=True):
+    def sample(self, obs, z, deterministic=False, with_logprob=True, mask=None):
         """Sample a tanh-squashed action and its log-probability.
 
         Args:
@@ -312,6 +364,17 @@ class TanhGaussianActor(nn.Module):
             z: Latent context, shape [B, latent_dim].
             deterministic: If True, return tanh(mean) with no sampling noise.
             with_logprob: If True, also return the summed log-probability.
+            mask: Optional SERL stage mask, shape [B, n_reactors, action_dim],
+                1.0 where the dim is structurally free.  When given, masked dims
+                contribute ZERO to the returned log-probability.  This matters:
+                a structurally locked dim is overwritten downstream by
+                ``PEARLAgent._apply_safety``, so it has no effect on the
+                environment, yet its only gradient came from the entropy term —
+                which drove its log_std to LOG_STD_MAX and inflated logp by a
+                large, meaningless constant.  That constant then (a) corrupted
+                automatic alpha tuning and (b) was injected into the Bellman
+                target as alpha*logp, which is the pathology ENTROPY_TERM_CLIP
+                was papering over.
 
         Returns:
             A tuple (action, logp) where action has shape
@@ -343,8 +406,12 @@ class TanhGaussianActor(nn.Module):
         # multiplied by alpha straight into the critic's Bellman target, this
         # produced the exploding critic loss seen in training.
         log_one_minus_a_sq = 2.0 * (np.log(2.0) - u - F.softplus(-2.0 * u))
+        logp = dist.log_prob(u) - log_one_minus_a_sq      # [..., nR, action_dim]
+        if mask is not None:
+            # Structurally locked dims never reach the environment; exclude them
+            # from the entropy accounting entirely (see the `mask` arg docstring).
+            logp = logp * mask
         # Sum over action dims and reactors -> per-sample scalar log-prob.
-        logp = dist.log_prob(u) - log_one_minus_a_sq
         logp = logp.sum(dim=(-1, -2))                     # [B]
         return a, logp
 
@@ -527,7 +594,9 @@ class PEARLAgent:
                  gamma=0.99, tau=5e-3, lr=3e-4, kl_lambda=0.1, encoder_lr=None,
                  reward_scale=1.0, normalize_rewards=True,
                  use_context=True, use_safeguard=True,
-                 target_entropy=None):
+                 target_entropy=None, posterior_window=64,
+                 reward_window=1e5, alpha_min=None,
+                 target_entropy_per_dim=None):
         """Initialise the PEARL agent and its optimizers.
 
         Args:
@@ -556,6 +625,42 @@ class PEARLAgent:
             use_context: Enable task inference (True) or fix z=0 (baseline, False).
             use_safeguard: Apply the SERL stage mask (structural action locking).
             target_entropy: SAC target entropy; defaults to -action_dim*n_reactors.
+                Interpreted PER ACTIVE ACTION DIMENSION: the alpha update scales
+                it by the fraction of dims the SERL mask leaves free at each
+                state (see ``update``).  With no mask, or with every dim active,
+                this reduces exactly to the standard heuristic.
+            posterior_window: Number of most-recent transitions the ONLINE
+                rollout posterior aggregates (None = unbounded, the old
+                behaviour).  Must match the training-time ``context_size`` in
+                ``update``: the incremental product-of-Gaussians in
+                ``update_context`` previously accumulated EVERY step of the
+                episode, so by step 120 the precision sum was ~120 factors and
+                sigma^2 ~ 1/120, while the actor had only ever been trained on z
+                drawn from a 64-factor posterior.  Deploying a systematically
+                sharper (and differently located) z than training produced is a
+                train/deploy mismatch independent of whether the encoder itself
+                is any good.
+            reward_window: Effective sample window for the reward-scale
+                estimator, in ENV STEPS (see RunningMeanStd).
+            alpha_min: Hard FLOOR on the SAC temperature (None = only the
+                numerical LOG_ALPHA_MIN bound applies).  Directly targets the
+                collapse observed in policy/pearl_meta_log.json: alpha decayed
+                monotonically 0.976 -> 0.055 over 125 iterations, and the
+                held-out optimum (0 violations at iteration 25) sat exactly
+                where alpha was passing 0.55 — after which held-out violations
+                went 0 -> 56 -> 93 as alpha fell through 0.3 and 0.17.  Because
+                alpha only falls while the policy's entropy exceeds the target,
+                a monotone decay with no rebound means the target is demanding
+                more determinism than this 40-task problem can afford: the
+                policy locks in before it has learned to generalise, with no
+                exploration noise left to escape.  A floor keeps a minimum
+                exploration pressure alive through the window where the
+                collapse happens.
+            target_entropy_per_dim: Entropy target PER FREE ACTION DIMENSION.
+                Takes precedence over ``target_entropy`` when given.  Less
+                negative = more entropy demanded = alpha decays more slowly, so
+                this is the smoother alternative to a hard ``alpha_min`` floor.
+                The standard SAC heuristic is -1.0 per dim.
         """
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -566,9 +671,34 @@ class PEARLAgent:
         self.kl_lambda = kl_lambda
         self.reward_scale = reward_scale
         self.normalize_rewards = normalize_rewards
-        self.ret_rms = RunningMeanStd() if normalize_rewards else None
+        self.ret_rms = (RunningMeanStd(max_count=reward_window)
+                        if normalize_rewards else None)
         self.use_context = use_context
         self.use_safeguard = use_safeguard
+        self.posterior_window = (int(posterior_window)
+                                 if posterior_window else None)
+
+        # How z is drawn from the running posterior during a rollout.  See
+        # ``_resample_z`` — this is a *deployment* knob, not a training one.
+        #   'sample' : redraw z ~ q(z|c) every control step (the old, and only,
+        #              behaviour). PEARL does NOT do this.
+        #   'mean'   : z = posterior mean, no sampling. The correct analogue of
+        #              actor `deterministic=True` for evaluation.
+        #   'hold'   : draw once after `z_hold_after` steps of belief-forming,
+        #              then hold z fixed for the rest of the episode — PEARL's
+        #              actual posterior-sampling scheme (one task hypothesis per
+        #              trajectory).
+        #   'zero'   : z == 0 regardless of the posterior. ABLATION ONLY, for
+        #              evaluating a TRAINED meta agent with its task inference
+        #              switched off. This is the decisive test of the project's
+        #              central claim: if a meta agent scores the same with z
+        #              forced to zero, then task inference contributes nothing
+        #              and its advantage over the baseline comes purely from
+        #              having trained across many tasks rather than from
+        #              adapting to the one it is in. It matches the baseline's
+        #              z exactly, so the two differ only in training.
+        self.z_mode = "sample"
+        self.z_hold_after = 10
 
         # Effective latent width fed to networks (>=1 so tensors are well-formed;
         # in baseline mode z is a constant zero vector of width 1).
@@ -601,18 +731,54 @@ class PEARLAgent:
         # Automatic temperature (entropy) tuning.
         self.target_entropy = (target_entropy if target_entropy is not None
                                else -float(action_dim * n_reactors))
+        # Per-active-dimension entropy target.  The alpha update multiplies this
+        # by the number of dims the SERL mask leaves free, so a state where most
+        # dims are structurally locked does not demand the same total entropy as
+        # a fully-free state.  Identical to the old behaviour when nothing is
+        # masked.
+        if target_entropy_per_dim is not None:
+            self._entropy_per_dim = float(target_entropy_per_dim)
+            self.target_entropy = (self._entropy_per_dim
+                                   * float(action_dim * n_reactors))
+        else:
+            self._entropy_per_dim = (self.target_entropy
+                                     / float(action_dim * n_reactors))
         self.log_alpha = torch.zeros(1, device=device, requires_grad=True)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=lr)
+        # Effective lower bound on log_alpha: the numerical guard, raised to the
+        # caller's alpha floor when one is given (see the alpha_min docstring).
+        self.alpha_min = alpha_min
+        self._log_alpha_min = (
+            LOG_ALPHA_MIN if alpha_min is None
+            else max(LOG_ALPHA_MIN, float(np.log(alpha_min))))
 
         # Safety layer: the SERL stage mask (applied in _apply_safety) plus the
         # environment's Lagrangian penalties.  No learned projection network.
+        # Cached default (post-tanh) action for structurally locked dims: LF/C5/
+        # outflow off, time multiplier at its physical default.  Precomputed
+        # because _apply_safety now runs inside the gradient loop, not just in
+        # action selection.
+        _default_latent = torch.zeros(action_dim, device=device)
+        _default_latent[0] = -0.34657359
+        _default_latent[1:] = -10.0
+        self._default_a = torch.tanh(_default_latent)     # [action_dim]
 
         # ── Live posterior state (maintained during a rollout) ──────────────
+        # Accumulators start at the N(0, I) PRIOR (precision 1, weighted mean 0)
+        # so the zero-transition posterior is exactly the prior and the
+        # incremental form matches product_of_gaussians(..., include_prior=True).
         self.z_mu = torch.zeros(self._z_dim, device=device)
         self.z_sigma_sq = torch.ones(self._z_dim, device=device)
         self.z = torch.zeros(self._z_dim, device=device)
-        self._z_precision_sum = torch.zeros(self._z_dim, device=device)
+        self._z_precision_sum = torch.ones(self._z_dim, device=device)
         self._z_weighted_mu_sum = torch.zeros(self._z_dim, device=device)
+        # Sliding window of per-transition factors, so the online posterior
+        # aggregates the last `posterior_window` transitions instead of the
+        # whole episode (see the posterior_window arg docstring).  Exact, O(1):
+        # the evicted factor's contribution is subtracted from the accumulators.
+        self._z_factors = (deque(maxlen=self.posterior_window)
+                           if self.posterior_window else None)
+        self._z_steps = 0
 
     # ── Latent-context management ───────────────────────────────────────────
 
@@ -625,15 +791,34 @@ class PEARLAgent:
         self.z_mu = torch.zeros(self._z_dim, device=device)
         self.z_sigma_sq = torch.ones(self._z_dim, device=device)
         # Running precision-weighted accumulators for the incremental
-        # product-of-Gaussians posterior (see update_context).
-        self._z_precision_sum = torch.zeros(self._z_dim, device=device)
+        # product-of-Gaussians posterior (see update_context), seeded with the
+        # N(0, I) prior factor so zero transitions == the prior exactly.
+        self._z_precision_sum = torch.ones(self._z_dim, device=device)
         self._z_weighted_mu_sum = torch.zeros(self._z_dim, device=device)
+        if self._z_factors is not None:
+            self._z_factors.clear()
+        self._z_steps = 0
         self._resample_z()
 
     def _resample_z(self):
-        """Sample z from the current posterior (or fix z=0 in baseline mode)."""
-        if not self.use_context:
+        """Draw z from the current posterior per ``self.z_mode``.
+
+        In baseline mode (use_context=False) z is always the zero vector, which
+        makes the baseline's policy genuinely deterministic under
+        ``select_action(deterministic=True)``.  The meta agent's was NOT: with
+        z_mode='sample' (the only prior behaviour) z was redrawn on every single
+        control step, so 'deterministic' evaluation still injected fresh
+        N(z_mu, z_sigma) noise into the policy conditioning 120 times per
+        episode.  Since the encoder had collapsed to the prior (KL ~ 1e-3), that
+        noise carried no task information at all — it was pure action jitter,
+        and the meta-vs-baseline eval was comparing a jittered controller
+        against a clean one.  'mean' and 'hold' remove that confound.
+        """
+        if not self.use_context or self.z_mode == "zero":
             self.z = torch.zeros(self._z_dim, device=device)
+            return
+        if self.z_mode == "mean":
+            self.z = self.z_mu.clone()
             return
         std = torch.sqrt(torch.clamp(self.z_sigma_sq, min=1e-8))
         self.z = self.z_mu + std * torch.randn_like(std)
@@ -670,9 +855,9 @@ class PEARLAgent:
             return
         # Normalise the reward feature the same way it is normalised for the
         # Bellman target (divide by the running std; read-only here — the
-        # running stats are only *updated* from training minibatches in
-        # update(), never from update_context, so calling this during
-        # evaluation rollouts cannot contaminate the statistics).  Without
+        # running stats are updated ONLY from freshly collected env steps via
+        # observe_rewards(), which the evaluation paths never call, so running
+        # this during an evaluation rollout cannot contaminate them).  Without
         # this, the encoder's per-transition input mixes a normalized obs/
         # action (O(1)) with a raw, penalty-dominated reward (O(10-200)),
         # letting that one feature dominate the factor network and destabilize
@@ -687,15 +872,52 @@ class PEARLAgent:
         mu_i = mu_i.squeeze(0)
         sigma_i_sq = torch.clamp(sigma_i_sq.squeeze(0), min=1e-7)
         prec_i = 1.0 / sigma_i_sq
+
+        # Sliding window: evict the oldest factor's contribution before adding
+        # the new one, so the posterior always reflects the last
+        # `posterior_window` transitions — the same number the encoder is
+        # trained on.  Exact (product of Gaussians is associative *and*
+        # invertible in precision space) and O(1) per step.
+        if self._z_factors is not None:
+            if len(self._z_factors) == self._z_factors.maxlen:
+                old_mu, old_prec = self._z_factors[0]
+                self._z_precision_sum = self._z_precision_sum - old_prec
+                self._z_weighted_mu_sum = (self._z_weighted_mu_sum
+                                           - old_mu * old_prec)
+            self._z_factors.append((mu_i, prec_i))
+
         self._z_precision_sum = self._z_precision_sum + prec_i
         self._z_weighted_mu_sum = self._z_weighted_mu_sum + mu_i * prec_i
-        self.z_sigma_sq = 1.0 / self._z_precision_sum
+        # Precision can only be >= 1 (the prior factor seeds it), so this is
+        # always well-conditioned and sigma^2 <= 1.
+        self.z_sigma_sq = 1.0 / torch.clamp(self._z_precision_sum, min=1e-6)
         self.z_mu = self.z_sigma_sq * self._z_weighted_mu_sum
-        self._resample_z()
+
+        self._z_steps += 1
+        # 'hold' mode: let the belief form for z_hold_after steps (resampling as
+        # it sharpens), then freeze the drawn hypothesis for the rest of the
+        # episode.  z_mu/z_sigma_sq keep updating either way so diagnostics stay
+        # live; only the *drawn* z is frozen.
+        if not (self.z_mode == "hold" and self._z_steps > self.z_hold_after):
+            self._resample_z()
 
     # ── Safe action selection ───────────────────────────────────────────────
 
-    def _apply_safety(self, state_t, raw_squashed):
+    def _stage_mask(self, obs):
+        """SERL stage mask for an observation of any batch shape.
+
+        Args:
+            obs: Observation tensor, shape [..., n_reactors, obs_dim].
+
+        Returns:
+            Mask tensor, shape [..., n_reactors, action_dim], or None when the
+            safeguard is disabled.
+        """
+        if not self.use_safeguard:
+            return None
+        return FermentationEnv.get_action_mask(obs[..., :self.obs_dim]).to(device)
+
+    def _apply_safety(self, state_t, raw_squashed, mask=None):
         """Apply the SERL stage mask to a squashed action.
 
         Locks structurally inactive action dimensions to their physical defaults
@@ -703,22 +925,62 @@ class PEARLAgent:
         of the safety stack; the environment's Lagrangian penalties provide the
         soft-constraint half.
 
+        Shape-agnostic in the leading dimensions (broadcasts a [action_dim]
+        default), so it can be applied to a single [n_reactors, action_dim]
+        action during rollout AND to a [B, n_reactors, action_dim] minibatch
+        inside the gradient loop.  The masking is a plain multiply by 0/1, so
+        gradients flow only through the dims that actually reach the env — which
+        is exactly the desired behaviour.
+
         Args:
-            state_t: State tensor, shape [n_reactors, obs_dim].
-            raw_squashed: Tanh-squashed action, shape [n_reactors, action_dim].
+            state_t: State tensor, shape [..., n_reactors, obs_dim].
+            raw_squashed: Tanh-squashed action, shape [..., n_reactors, action_dim].
+            mask: Precomputed stage mask; derived from state_t when None.
 
         Returns:
-            Stage-masked action tensor, shape [n_reactors, action_dim].
+            Stage-masked action tensor, same shape as raw_squashed.
         """
         if not self.use_safeguard:
             return raw_squashed
-        mask = FermentationEnv.get_action_mask(
-            state_t[..., :self.obs_dim]).to(device)
-        default_latent = torch.zeros_like(raw_squashed)
-        default_latent[..., 0] = -0.34657359
-        default_latent[..., 1:] = -10.0
-        default_squashed = torch.tanh(default_latent[0])
-        return raw_squashed * mask + default_squashed.unsqueeze(0) * (1 - mask)
+        if mask is None:
+            mask = self._stage_mask(state_t)
+        return raw_squashed * mask + self._default_a * (1.0 - mask)
+
+    def _safe_sample(self, obs, z, deterministic=False, with_logprob=True):
+        """Sample an action, mask it, and mask its entropy accounting.
+
+        THE POINT OF THIS HELPER is that the executed action stored in the replay
+        buffer is the MASKED one, so the critic only ever learns Q(o, a) for
+        actions whose locked dims sit at the SERL defaults.  Previously the actor
+        loss evaluated ``critic(o, a_pi)`` with an UNMASKED ``a_pi``, and the
+        Bellman target evaluated ``critic_target(o2, a2)`` with an unmasked
+        ``a2`` — both querying the critic far off the data distribution on every
+        locked dimension.  The actor was therefore optimising an extrapolated
+        Q-surface for dims the environment ignores, in both agents.  Routing
+        every policy sample that touches the critic through here fixes that.
+
+        Args:
+            obs: Observation tensor, shape [..., n_reactors, obs_dim].
+            z: Latent context, shape [..., latent_dim].
+            deterministic: If True, use the policy mean.
+            with_logprob: If True, also return the masked log-probability.
+
+        Returns:
+            A tuple (action, logp, n_active) where action is stage-masked, logp
+            excludes locked dims (None when with_logprob is False), and n_active
+            is the per-sample count of free action dims (shape obs.shape[:-2]).
+        """
+        mask = self._stage_mask(obs)
+        a, logp = self.actor.sample(obs, z, deterministic=deterministic,
+                                    with_logprob=with_logprob, mask=mask)
+        a = self._apply_safety(obs, a, mask=mask)
+        if mask is None:
+            n_active = torch.full(obs.shape[:-2],
+                                  float(self.action_dim * self.n_reactors),
+                                  device=device)
+        else:
+            n_active = mask.sum(dim=(-1, -2))
+        return a, logp, n_active
 
     def select_action(self, state, deterministic=False):
         """Select a safe action for one control step using the current latent z.
@@ -743,6 +1005,27 @@ class PEARLAgent:
             safe = self._apply_safety(state_t, raw)
         return safe.cpu().numpy(), raw.cpu().numpy()
 
+    # ── Reward-scale tracking ───────────────────────────────────────────────
+
+    def observe_rewards(self, rewards):
+        """Fold freshly COLLECTED env rewards into the reward-scale estimate.
+
+        Must be called from the data-collection path (once per env step, with
+        each reward counted exactly once), NOT from the SAC update path.  The
+        update path replays the same transitions thousands of times, which
+        inflated RunningMeanStd's sample count by ~82k per outer iteration and
+        froze the reward scale within ~100 iterations — see the RunningMeanStd
+        docstring for why that was the primary divergence mechanism here.
+
+        Do NOT call this during evaluation rollouts: the reward scale is part of
+        the agent's learned state and evaluation must not mutate it.
+
+        Args:
+            rewards: Scalar or sequence of summed per-step env rewards.
+        """
+        if self.ret_rms is not None:
+            self.ret_rms.update(rewards)
+
     # ── Off-policy SAC + encoder update ─────────────────────────────────────
 
     @property
@@ -764,8 +1047,8 @@ class PEARLAgent:
         # Same std-only normalization as the Bellman-target reward (see
         # update()), applied here so the encoder's reward input feature sits at
         # the same O(1) scale as the normalized obs/action features instead of
-        # the raw, penalty-dominated magnitude.  Read-only: the running std was
-        # already updated this task-step from the RL minibatch in update().
+        # the raw, penalty-dominated magnitude.  Read-only: the running std is
+        # updated only from freshly collected env steps (observe_rewards).
         if self.ret_rms is not None:
             r = r / self.ret_rms.std
         trans = torch.cat([
@@ -847,8 +1130,14 @@ class PEARLAgent:
             # Bellman target stays O(1/(1-gamma)) regardless of the raw
             # penalty-dominated magnitude.  Std-only (no mean subtraction) keeps
             # the sign/ranking of rewards intact.
+            #
+            # READ-ONLY here.  The running statistics are now updated exclusively
+            # from freshly collected env steps via observe_rewards(); updating
+            # them from replayed minibatches (as this line used to) counted every
+            # transition thousands of times, froze the scale at its
+            # random-policy value, and starved every gradient in the run.  It
+            # also cost a GPU->CPU sync per task per update.
             if self.ret_rms is not None:
-                self.ret_rms.update(r.detach().cpu().numpy())
                 r = r / self.ret_rms.std
             r = r * self.reward_scale
             d = d.float()
@@ -869,7 +1158,9 @@ class PEARLAgent:
 
             # ── 1. Critic (+ encoder + KL) update ───────────────────────────
             with torch.no_grad():
-                a2, logp2 = self.actor.sample(o2, z.detach())
+                # a2 is STAGE-MASKED before it reaches the critic, matching the
+                # executed actions the buffer actually holds (see _safe_sample).
+                a2, logp2, _ = self._safe_sample(o2, z.detach())
                 q1_t, q2_t = self.critic_target(o2, a2, z.detach())
                 # Clip the entropy term injected into the Bellman target. The
                 # bounds on log_std/pre-tanh value above keep logp well-behaved
@@ -899,7 +1190,10 @@ class PEARLAgent:
             # actor_loss backprops through the (frozen-for-this-step) critic to
             # reach the actor; because we zero and step ONLY the actor optimizer,
             # the incidental critic gradients are discarded.
-            a_pi, logp_pi = self.actor.sample(o, z.detach())
+            # a_pi is STAGE-MASKED, so critic(o, a_pi) is queried on the same
+            # action distribution the critic was trained on instead of
+            # extrapolating on every structurally locked dimension.
+            a_pi, logp_pi, n_active = self._safe_sample(o, z.detach())
             q1_pi, q2_pi = self.critic(o, a_pi, z.detach())
             q_pi = torch.min(q1_pi, q2_pi)
             actor_loss = (self.alpha.detach() * logp_pi - q_pi).mean()
@@ -910,8 +1204,15 @@ class PEARLAgent:
             self.actor_opt.step()
 
             # ── 3. Temperature update ───────────────────────────────────────
+            # Entropy target scales with the number of dims the SERL mask leaves
+            # FREE at each state.  logp_pi now excludes locked dims, so pairing
+            # it with a fixed -12 total would demand the full 12-dim entropy
+            # budget from however few dims happen to be active — driving alpha
+            # up spuriously in late stages.  Reduces to the old fixed target
+            # whenever all dims are active.
+            target_ent = self._entropy_per_dim * n_active.detach()
             alpha_loss = -(self.log_alpha
-                           * (logp_pi.detach() + self.target_entropy)).mean()
+                           * (logp_pi.detach() + target_ent)).mean()
             self.alpha_opt.zero_grad()
             alpha_loss.backward()
             self.alpha_opt.step()
@@ -919,7 +1220,10 @@ class PEARLAgent:
             # signal can push log_alpha to grow without bound (observed here —
             # alpha climbing past 1.0 and continuing to rise every iteration).
             with torch.no_grad():
-                self.log_alpha.clamp_(LOG_ALPHA_MIN, LOG_ALPHA_MAX)
+                # Lower bound is the configurable alpha floor when set, else the
+                # bare numerical guard (see the alpha_min arg docstring for why
+                # an unfloored alpha collapsed exploration here).
+                self.log_alpha.clamp_(self._log_alpha_min, LOG_ALPHA_MAX)
 
             # ── Polyak target update (per task step) ────────────────────────
             # Fused multi-tensor ops (_foreach_*) issue ONE kernel for the whole
@@ -974,6 +1278,10 @@ class PEARLAgent:
             "critic_target": self.critic_target.state_dict(),
             "log_alpha": self.log_alpha.detach().cpu(),
             "use_context": self.use_context,
+            # Recorded so a mismatched deployment window is caught on load
+            # rather than silently reintroducing the train/deploy z mismatch
+            # this field exists to prevent.
+            "posterior_window": self.posterior_window,
         }
         if self.ret_rms is not None:
             # Cast explicitly: RunningMeanStd.update() already keeps these as
@@ -1054,5 +1362,26 @@ class PEARLAgent:
             self.log_alpha.copy_(ckpt["log_alpha"].to(device))
         if self.ret_rms is not None and "ret_rms" in ckpt:
             self.ret_rms.mean, self.ret_rms.var, self.ret_rms.count = ckpt["ret_rms"]
+            # Checkpoints written before the bounded-window fix carry an enormous
+            # count (~5e7, because the estimator was updated from every replayed
+            # minibatch sample). Left as-is, the first few post-load updates
+            # would be weighted to nothing. Clamp on load so the window is
+            # honoured immediately.
+            self.ret_rms.count = min(float(self.ret_rms.count),
+                                     self.ret_rms.max_count)
         if self.use_context and "encoder" in ckpt:
             self.encoder.load_state_dict(ckpt["encoder"])
+        # The actor was trained on z drawn from a posterior over exactly
+        # `posterior_window` transitions; deploying it with a different window
+        # hands it a systematically sharper (or flatter) z than it ever saw.
+        # Adopt the trained value and say so, rather than silently keeping
+        # whatever the caller constructed this agent with.
+        ck_window = ckpt.get("posterior_window", "absent")
+        if ck_window != "absent" and ck_window != self.posterior_window:
+            print(f"[Checkpoint] {path}: posterior_window {self.posterior_window}"
+                  f" -> {ck_window} (adopting the trained value; the actor's z "
+                  f"distribution depends on it).")
+            self.posterior_window = ck_window
+            self._z_factors = (deque(maxlen=self.posterior_window)
+                               if self.posterior_window else None)
+            self.clear_z()

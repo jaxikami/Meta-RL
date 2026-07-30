@@ -87,11 +87,35 @@ python train_pearl_single_run.py train_meta
 python train_pearl_single_run.py train_baseline
 python train_pearl_single_run.py evaluate
 
-# 3. for an actual meta-vs-baseline verdict, sweep several seeds instead of
+# 3. cheap diagnostic on EXISTING checkpoints, no training: how much of the
+#    meta-vs-baseline gap is just per-step latent resampling noise?
+python train_pearl_single_run.py eval_z_probe
+
+# 4. cheap diagnostic on EXISTING checkpoints, no training: escalate each
+#    disturbance's magnitude until the agent(s) actually fail, to check
+#    whether the fixed eval scenarios have any headroom for a meta-vs-baseline
+#    difference to show up in at all (defaults to the baseline only; add
+#    meta/meta_noz once a break point is known):
+python train_pearl_single_run.py severity_sweep
+python train_pearl_single_run.py severity_sweep baseline,meta,meta_noz
+
+# 5. for an actual meta-vs-baseline verdict, sweep several seeds instead of
 #    trusting a single run (see note above on run-to-run variance):
 python train_pearl_seed_sweep.py            # seeds 0,1,2
 python train_pearl_seed_sweep.py 0 1 2 3 4  # explicit seed list
 ```
+
+All five `train_pearl_single_run.py` modes (pass as the first CLI argument, or set
+`MODE` at the top of the file):
+
+| mode | what it does |
+|---|---|
+| `train_meta` | meta-trains PEARL, saves `pearl_meta.pth` / `pearl_meta_best.pth` |
+| `train_baseline` | trains the non-adaptive baseline, saves `pearl_baseline.pth` / `pearl_baseline_best.pth` |
+| `evaluate` | loads both checkpoints, runs the full in-distribution / OOD / disturbance comparison |
+| `eval_z_probe` | measures all z-draw modes (`sample`/`mean`/`hold`) on a trained meta checkpoint, no retraining |
+| `severity_sweep` | escalates each disturbance's magnitude on existing checkpoints to find where the eval has headroom at all — see "Why `severity_sweep` exists" below |
+| `all` | `train_meta` → `train_baseline` → `evaluate` |
 
 Hyperparameters (task-pool size, meta-iterations, batch/context sizes, reward
 scale, warm-up, priors, disturbance magnitudes) are at the top of
@@ -104,10 +128,29 @@ draws from the training prior), genuinely **out-of-distribution** tasks (widened
 priors, beyond the training ranges), and three **mid-episode disturbances**
 (inlet step, enzyme drop, mass drift).
 
+Three arms are evaluated, not two:
+
+| arm | latent z | trained on |
+|---|---|---|
+| `meta` | inferred from context | 40-task pool |
+| `meta_noz` | forced to 0 (ablation) | 40-task pool |
+| `baseline` | always 0 | nominal task only |
+
+`meta` vs `meta_noz` isolates the contribution of **task inference**; `meta_noz`
+vs `baseline` isolates the contribution of **multi-task training**, with z held
+at 0 in both. Only the first is the proposal's claim, so the ablation arm is what
+makes the headline number interpretable rather than merely favourable.
+
 It prints and saves to `policy/pearl_eval.json`:
 
-- a reward / violations / feasible-rate table (mean ± std) per scenario, per agent;
-- a per-scenario verdict (Δreward and fewer-violations, meta − baseline);
+- a reward / violations / feasible-rate table (mean ± std) per scenario, per arm;
+- a **productivity** table (ethanol harvested, feedstock consumed, mean actuator
+  positions) — because the reward is penalty-dominated, a conservative
+  low-throughput policy can post zero violations, and that must be visible;
+- a per-scenario verdict (Δreward and fewer-violations, meta − baseline), flagged
+  when meta "wins" while harvesting under half of baseline's ethanol;
+- an **ablation** table decomposing the gap into task inference vs multi-task
+  training;
 - disturbance-recovery metrics (post-onset mean reward, post-onset violation
   rate, recovery time in control steps),
 
@@ -119,7 +162,38 @@ reward/violation bars per scenario) and `pearl_disturbance_response.png`
 disturbance rows are the test. The claim "basic safe RL can't handle
 uncertainty" is supported when the baseline shows markedly lower reward and/or
 more violations than the meta agent on the test rows, while the two stay close
-on the control row.
+on the control row — **and** the ablation table attributes a real share of that
+gap to task inference rather than to multi-task training alone, **and** the
+productivity table shows the meta agent is not simply running the plant slower.
+Check all three before concluding anything; the violation count alone rewards
+conservatism, and a controller whose actuator positions are identical across
+in-distribution, OOD and every disturbance is not adapting whatever it scores.
+
+## Why `severity_sweep` exists
+
+Meta-training was fixed to include mid-episode disturbances in its task
+distribution (`collect_rollout(disturb=True)`, gated by `META_DISTURB_PROB`),
+because the encoder had previously only ever seen static parameter draws and
+was then evaluated on regime changes it had no chance to represent. That fix
+resolved the specific failure it targeted (`disturb_mass_drift` stopped being
+catastrophic), but the retrained result showed every arm — `meta`, `meta_noz`,
+and the non-adaptive baseline trained on the nominal task only, with **no**
+disturbance ever — scoring 0.00 violations on all three fixed disturbance
+scenarios, with reward deltas well inside episode-level noise.
+
+A scenario the non-adaptive baseline already solves perfectly cannot be
+evidence for adaptation, whatever the meta agent does on it. `severity_sweep`
+asks the prior question directly: holding onset fixed and escalating only
+magnitude (see `SEVERITY_SWEEP_LEVELS`), at what severity does a non-adaptive
+agent actually fail? A level counts as a break if mean violations exceed
+`SEVERITY_BREAK_VIOL`, feasibility drops below 100%, or ethanol output falls
+below `SEVERITY_BREAK_ETHANOL_FRAC` of that arm's undisturbed output — the
+last criterion because holding violations at zero by not running the plant is
+itself a failure mode. If no break point exists at any severity tested, the
+shared SERL mask + Lagrangian safety stack — not the policy — is what supplies
+feasibility, and no policy-level adaptation claim is testable in this
+environment without a structural change (e.g. tighter constraints, a higher
+productivity weight, or `use_safeguard=False`).
 
 ## Notes and caveats
 
@@ -128,7 +202,25 @@ on the control row.
 - The safety guarantee is two-layered but soft on physical limits: the SERL mask
   makes structurally-illegal actions impossible, while overflow/underflow limits
   are enforced through Lagrangian reward penalties rather than a hard projection.
-- The critic is trained on the executed (stage-masked) action while the actor
-  optimizes its own differentiable raw action; both agents share this.
+- The critic is trained on the executed (stage-masked) action, and the actor now
+  optimizes a **stage-masked** sample too. It previously optimized its raw
+  unmasked action, which queried the critic off its data distribution on every
+  structurally locked dimension; both agents were affected.
+- Progress is measured by a periodic **deterministic held-out** evaluation
+  (`HELDOUT_EVAL_EVERY`), which is what checkpoint selection and early stopping
+  act on. The rolling mean of stochastic training episodes it replaced was
+  selection on noise: it reported best-2.4 for a checkpoint that scored 24.7 at
+  eval, and its argmin always landed near iteration 60, hiding a 30x divergence.
+- The reward-scale estimator is a **bounded-window** estimator updated only from
+  freshly collected env steps. With an unbounded count updated from replayed
+  minibatches it froze at the random-policy penalty magnitude within ~100
+  iterations, which shrank the Bellman target as the policy degraded and removed
+  the signal needed to recover.
+- The meta agent's latent draw is controlled by `PEARLAgent.z_mode`
+  (`sample`/`mean`/`hold`). Evaluation defaults to `mean`, so
+  `select_action(deterministic=True)` is genuinely deterministic for both agents
+  — under the old always-resample behaviour only the baseline (z ≡ 0) was.
+  `posterior_window` bounds the online posterior to the same number of
+  transitions the encoder is trained on.
 - Run `smoke_test_pearl.py` first on any new machine to confirm shapes and
   imports before committing to a full training run.

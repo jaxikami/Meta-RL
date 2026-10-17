@@ -561,10 +561,35 @@ def check_severity_sweep_levels():
         assert not (lo <= levels[-1] <= hi), \
             f"{kind}: worst level {levels[-1]} is inside training support " \
             f"[{lo}, {hi}] — the sweep never leaves the trained regime"
-    for arm in T.SEVERITY_SWEEP_AGENTS:
+    for arm in tuple(T.SEVERITY_SWEEP_AGENTS) + tuple(T.SEVERITY_CLEAN_ARMS):
         assert arm in ("baseline", "meta", "meta_noz"), arm
     assert 0.0 < T.SEVERITY_BREAK_ETHANOL_FRAC < 1.0, T.SEVERITY_BREAK_ETHANOL_FRAC
-    print("[OK] severity sweep levels: eval-anchored, monotone, extrapolating")
+
+    # The CLEAN WINDOW must actually be clean: every level in it has to keep
+    # predicted post-onset reactor mass clear of the M >= 1.0 clamp, or its
+    # violations are partly a mass-ledger artifact rather than control failure
+    # (this is exactly what disqualified mass_drift -0.035 and -0.050).
+    # Full-horizon env (NOT _short_env, whose max_steps=20 would make every
+    # level look clamp-safe): the clamp risk depends on the real post-onset step
+    # count, so this must track env_safe's actual max_steps.
+    env = FermentationEnv(n_reactors=3)
+    onset = env.max_steps // 2
+    for kind, mags in T.SEVERITY_CLEAN_WINDOW.items():
+        assert kind in T.META_DISTURB_KINDS, kind
+        for mag in mags:
+            if kind != "mass_drift":
+                continue
+            m_final, at_risk = T._drift_clamp_risk(env, mag, onset)
+            assert not at_risk, (
+                f"clean window level {mag} leaves only {m_final:.3g} kg, which "
+                f"trips the clamp — it is not measurement-clean")
+        # A clean window is pointless if it sits where the baseline never fails,
+        # so require it to lie beyond meta's training support (the region the
+        # sweep showed the baseline handles perfectly).
+        lo, hi = T.META_DISTURB_MAG_RANGES[kind]
+        assert all(not (lo <= m <= hi) for m in mags), (kind, mags, lo, hi)
+    print("[OK] severity sweep levels: eval-anchored, monotone, extrapolating; "
+          "clean window clamp-safe")
 
 
 def check_observe_rewards():

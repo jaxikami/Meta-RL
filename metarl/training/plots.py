@@ -21,7 +21,8 @@ PLOT_INK, PLOT_INK2, PLOT_GRID = "#0b0b0b", "#52514e", "#d8d7d2"
 PLOT_NEUTRAL = "#b4b3ad"
 # Constraints counted per step (product_purity counts per rejected lot).
 STEP_CONSTRAINTS = ("overflow", "underflow", "harvest_titer", "instability",
-                    "mass_balance", "storage_overflow", "storage_underflow")
+                    "mass_balance", "storage_overflow", "storage_underflow",
+                    "turnaround_conflict")
 CONSTRAINT_COLORS = {
     "overflow": "#2a78d6",
     "underflow": "#eb6834",
@@ -31,6 +32,7 @@ CONSTRAINT_COLORS = {
     "mass_balance": "#008300",
     "storage_overflow": "#6a4fb3",
     "storage_underflow": "#8c6d1f",
+    "turnaround_conflict": "#0f8b8d",
 }
 VIOL_MIX_MIN_LABEL_PCT = 6.0
 ACTUATORS = (
@@ -56,10 +58,14 @@ def _style_ax(ax, INK2, GRID):
 def _plot_distributions(results, names, labels, arms, colors, INK, INK2, GRID,
                         plt):
     """Per-episode on-spec ethanol per arm and scenario (box plus points)."""
-    fig, axs = plt.subplots(1, len(names), figsize=(4.1 * len(names), 5.0),
+    cols = min(len(names), 6)
+    rows = -(-len(names) // cols)
+    fig, axs = plt.subplots(rows, cols, figsize=(4.1 * cols, 5.0 * rows),
                             squeeze=False, sharey=True)
     fig.patch.set_facecolor("#fcfcfb")
-    for ax, n, lab in zip(axs[0], names, labels):
+    for ax in axs.flat[len(names):]:
+        ax.set_visible(False)
+    for ax, n, lab in zip(axs.flat, names, labels):
         _style_ax(ax, INK2, GRID)
         data, present = [], []
         for arm in arms:
@@ -90,8 +96,9 @@ def _plot_distributions(results, names, labels, arms, colors, INK, INK2, GRID,
         ax.set_xticklabels(present, rotation=20, ha="right", fontsize=9,
                            color=INK2)
         ax.set_title(lab, fontsize=10.5, color=INK, fontweight="bold")
-    axs[0][0].set_ylabel("On-spec ethanol per episode  (x10^7)", fontsize=9.5,
-                         color=INK2)
+    for row in axs:
+        row[0].set_ylabel("On-spec ethanol per episode  (x10^7)",
+                          fontsize=9.5, color=INK2)
     fig.suptitle("Per-episode production distributions", fontweight="bold",
                  fontsize=12.5, color=INK)
     fig.tight_layout(rect=(0, 0, 1, 0.92))
@@ -329,6 +336,12 @@ def _plot_violation_severity(results, names, labels, INK, INK2, GRID, plt):
     plt.close(fig)
 
 
+def scenario_probe(name):
+    """The DISTURB_PROBES key traced on scenario ``name`` (its step pattern), or None."""
+    label, _, pattern = name.rpartition("_")
+    return label if pattern == "step" and label in DISTURB_PROBES else None
+
+
 def _shared_episode(res, arms):
     """The one episode on which every arm does comparatively well."""
     ranks = []
@@ -346,7 +359,7 @@ def _plot_disturbance_response(results, names, arms, colors, INK, INK2, GRID,
     """The faulted reactor's answering actuator (solid) vs the faulted quantity."""
     from matplotlib.lines import Line2D
 
-    dist = [n for n in names if n in DISTURB_PROBES
+    dist = [n for n in names if scenario_probe(n)
             and all("traces" in results[n][a] for a in arms)]
     if not dist:
         print("[plot] disturbance response skipped: no per-episode traces")
@@ -357,7 +370,7 @@ def _plot_disturbance_response(results, names, arms, colors, INK, INK2, GRID,
     fig.patch.set_facecolor("#fcfcfb")
     for c, n in enumerate(dist):
         ax, ax_s = axs[0][c], axs[1][c]
-        _, qlabel, a_idx = DISTURB_PROBES[n]
+        _, qlabel, a_idx = DISTURB_PROBES[scenario_probe(n)]
         alabel, fn = ACTUATORS[a_idx]
         ep = _shared_episode(results[n], arms)
         tr0 = results[n][arms[0]]["traces"]

@@ -11,10 +11,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ─── Local ────────────────────────────────────────────────────────────────────
+from metarl.env.config import MIN_HARVEST_TITER, TITER_SCALE
 from metarl.env.faults import N_DISTURBANCE_KINDS
+from metarl.env.layout import ETHANOL_CHANNELS, STAGE_CHANNELS, reactor_action
+from metarl.env.plant import DISCHARGE_CUTOFF
 from metarl.apn.network import project_to_safe
 from metarl.agent.common import device, LOG_ALPHA_MAX, ENTROPY_TERM_CLIP
 from metarl.agent.replay import WINDOW_CHUNK_LEN, _to_device, _as_long
+
+# Pre-tanh outlet command whose flow fraction (tanh + 1) / 2 is half the cutoff.
+HOLD_PRE_TANH_TARGET = float(np.arctanh(DISCHARGE_CUTOFF - 1.0))
 
 
 class LearningMixin:
@@ -67,6 +73,16 @@ class LearningMixin:
         mu = torch.where(empty, torch.zeros_like(mu), mu)
         sigma_sq = torch.where(empty, torch.ones_like(sigma_sq), sigma_sq)
         return mu, sigma_sq
+
+    def _stall_flags(self, o, priv):
+        """[B, N] 1.0 where a reactor is unloading a batch below the harvest spec.
+
+        Reads the privileged exact titer, so it is a training-time signal only.
+        """
+        titer = priv[:, list(ETHANOL_CHANNELS)] * TITER_SCALE
+        unload = o[:, STAGE_CHANNELS[:, 3]] > 0.5
+        below = titer < MIN_HARVEST_TITER * (1.0 + self.hold_margin)
+        return (unload & below).float()
 
     def _critic_cond(self, z, ctx, priv=None):
         """The critics' conditioning vector: z [, task] [, privileged state]."""
@@ -128,7 +144,7 @@ class LearningMixin:
                 if ref is not None and p.grad is not None:
                     p.add_(ref, alpha=step)
 
-    def _anchor_terms(self, o, zd, fault, gate=None, weight=None):
+    def _anchor_terms(self, o, zd, fault, gate=None, weight=None, stall=None):
         """The warm-start anchor's penalty and its diagnostics.
 
         The squared gap between this actor's and the loaded policy's mean
@@ -156,6 +172,8 @@ class LearningMixin:
             kind = fault.long().clamp(0, kw.numel() - 1)
             w_gap = torch.where(flag > 0, self.anchor_fault_frac * kw[kind],
                                 torch.full_like(gap, self.anchor_weight))
+        if stall is not None:
+            w_gap = w_gap * (1.0 - stall)
         pen_gap = torch.where(flag > 0, gap_post, gap)
         penalty = ((w_gap * pen_gap).mean() if weight is None
                    else (weight * w_gap * pen_gap).sum())
@@ -274,9 +292,17 @@ class LearningMixin:
             if f > 0.0:
                 aux_loss = aux_loss + f * aux_err(z)
 
+        # The hold rule reads the privileged titer: only arms that store it.
+        hold_on = self.hold_penalty_weight > 0.0 or self.hold_gate_target
+        stalled = (self._stall_flags(o, priv) if hold_on
+                   else torch.zeros(o.shape[0], 1, device=o.device))
+        stall_any = stalled.amax(dim=-1)
         gate_loss = torch.zeros((), device=device)
         if self.adapt_gate:
-            gate_loss = F.binary_cross_entropy_with_logits(self.gate(mu), fault)
+            gate_target = (torch.maximum(fault, stall_any)
+                           if self.hold_gate_target else fault)
+            gate_loss = F.binary_cross_entropy_with_logits(self.gate(mu),
+                                                           gate_target)
 
         critic_obj = critic_loss
         if self.use_context:
@@ -307,6 +333,7 @@ class LearningMixin:
         alpha_loss = torch.zeros((), device=device)
         map_pen = torch.zeros((), device=device)
         anchor_pen = torch.zeros((), device=device)
+        hold_pen = torch.zeros((), device=device)
         nan = torch.full((), float("nan"), device=device)
         gap_nominal = gap_fault = nan
         if train_actor:
@@ -342,8 +369,21 @@ class LearningMixin:
             # ── 2c. Anchor to the warm-start policy ──────────────────────────
             if self.anchor_actor is not None and self._anchor_active():
                 anchor_pen, gap_nominal, gap_fault = self._anchor_terms(
-                    o, zd, fault_code, gate=gate_open, weight=w_gate)
+                    o, zd, fault_code, gate=gate_open, weight=w_gate,
+                    stall=stall_any if self.hold_penalty_weight > 0.0 else None)
                 actor_loss = actor_loss + anchor_pen
+
+            # ── 2d. Hold rule: keep the outlet shut on a below-spec batch ────
+            # Applied to the ungated actor so the actor itself learns it. Any
+            # discharge above DISCHARGE_CUTOFF drains (and violates every inner
+            # step), so the hinge acts on the pre-tanh mean until the command
+            # is below half the cutoff, averaged over the stalled entries only.
+            if self.hold_penalty_weight > 0.0:
+                out_dims = [reactor_action(i, 3) for i in range(stalled.shape[1])]
+                pre = self.actor(o, zd)[0][:, out_dims]
+                excess = F.relu(pre - HOLD_PRE_TANH_TARGET)
+                hold_pen = (stalled * excess).sum() / stalled.sum().clamp(min=1.0)
+                actor_loss = actor_loss + self.hold_penalty_weight * hold_pen
 
             self.actor_opt.zero_grad()
             actor_loss.backward()
@@ -396,6 +436,8 @@ class LearningMixin:
             "aux_loss": float(aux_loss.detach()),
             "map_loss": float(map_pen.detach()),
             "anchor_loss": float(anchor_pen.detach()),
+            "hold_loss": float(hold_pen.detach()),
+            "stall_frac": float(stall_any.mean()),
             "anchor_gap_nominal": float(gap_nominal),
             "anchor_gap_fault": float(gap_fault),
             # |posterior mean|, not |sample|.

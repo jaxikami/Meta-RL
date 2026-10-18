@@ -22,18 +22,25 @@ Violation ids (the lean study's 1-6, then the storage tank's):
     6  mass-balance drift        conservation residual beyond tolerance (plant)
     7  storage overflow          S > S_MAX                          (plant, per step)
     8  storage underflow         S < S_MIN                          (plant, per step)
+    9  turnaround conflict       more than one vessel in turnaround (cleanup, or
+                                 charging a fresh batch): the shared clean-in-
+                                 place skid and inoculum line; one event per
+                                 extra vessel; the episode's first charge is
+                                 exempt                             (plant, per step)
 
 The headline violation count of an outer step is the number of violation
 EVENTS in it: every (inner step, constraint, instance) triple, where the
-instance is the reactor for ids 1-5 and the plant for 6-8 (a lot is an
+instance is the reactor for ids 1-5 and the plant for 6-9 (a lot is an
 instance of 4). ``violation_counts`` splits it by constraint and sums to it
 exactly. Two vessels overflowing in the same hour are two events.
 
 Mid-episode disturbances (``schedule_disturbance``): flow faults ``leak`` and
 ``feed_gain`` (one reactor or all), ``feed_conc`` (the shared feed tanks);
 biochemical faults ``disturb_kinetics_decay``, ``toxin_spike``,
-``cell_viability``, ``contamination`` (one reactor or all); and the storage
-tank's ``downstream_rate`` (downstream draw x magnitude).
+``cell_viability``, ``contamination`` (one reactor or all); the storage
+tank's ``downstream_rate`` (downstream draw x magnitude) and
+``storage_capacity`` (usable volume x magnitude); and the scheduling fault
+``turnaround_delay`` (every turnaround x magnitude long).
 
 A discharge commanded below ``DISCHARGE_CUTOFF`` of the maximum outflow shuts
 the valve, so a batch can be held in the unload stage without draining it.
@@ -204,6 +211,7 @@ class PlantFermentationEnv(InstrumentMixin, FaultMixin, LedgerMixin):
         self.product_purity_lambda = np.zeros(n)
         self.storage_overflow_lambda = 0.0
         self.storage_underflow_lambda = 0.0
+        self.turnaround_lambda = 0.0
 
         self.lagrange_updates_enabled = True
         self.reset_lambdas_per_episode = False
@@ -408,7 +416,9 @@ class PlantFermentationEnv(InstrumentMixin, FaultMixin, LedgerMixin):
         self.M[i] = 10000.0
         self.C[i, :] = 0.0
         self.C[i, self.idx['Cell']] = (1000.0 * 147.0) / 10000.0
-        self.stage_credits[i] = float(self.base_credits[0])
+        # A turnaround_delay fault stretches the charge, as the cleanup.
+        self.stage_credits[i] = (float(self.base_credits[0])
+                                 * self._turnaround_mult)
         self.n_batches_completed += 1
         self.reactor_batches_completed[i] += 1
 
@@ -464,6 +474,8 @@ class PlantFermentationEnv(InstrumentMixin, FaultMixin, LedgerMixin):
             else:
                 self.current_stage[i] += 1
                 self.stage_credits[i] = float(self.base_credits[self.current_stage[i]])
+                if self.current_stage[i] == 4:
+                    self.stage_credits[i] *= self._turnaround_mult
 
         # ==================== Phase 2: hardware execution ====================
         simulation_dt = dt / self.n_inner_steps
@@ -615,7 +627,9 @@ class PlantFermentationEnv(InstrumentMixin, FaultMixin, LedgerMixin):
             penalty += self.PURITY_SHAPING_COEF * float(np.sum(depth ** 2))
 
         # ── Storage soft walls ───────────────────────────────────────────────
-        s_frac = self.S_mass / self.S_max
+        # A storage_capacity fault moves the overflow wall (not the reading).
+        s_cap = self.S_max * self._storage_cap_mult
+        s_frac = self.S_mass / s_cap
         s_edge = 1.0 - self.STORAGE_OVERFLOW_BUFFER_FRAC
         if s_frac > s_edge:
             d_ = min(1.0, (s_frac - s_edge) / self.STORAGE_OVERFLOW_BUFFER_FRAC)
@@ -626,7 +640,7 @@ class PlantFermentationEnv(InstrumentMixin, FaultMixin, LedgerMixin):
             penalty += self.BUFFER_COEF * d_ * d_
 
         # ── Constraint 7: storage overflow ───────────────────────────────────
-        s_over = max(0.0, (self.S_mass - self.S_max) / self.S_max)
+        s_over = max(0.0, (self.S_mass - s_cap) / s_cap)
         if s_over > 0:
             record(7, s_over)
             penalty += self.BASE_SPIKE * (1.0 + s_over)
@@ -646,6 +660,24 @@ class PlantFermentationEnv(InstrumentMixin, FaultMixin, LedgerMixin):
         penalty += self.storage_underflow_lambda * lag
         self.storage_underflow_lambda = float(self._update_lambda(
             np.array([self.storage_underflow_lambda]), np.array([lag]))[0])
+
+        # ── Constraint 9: turnaround conflict (scheduling) ───────────────────
+        # One clean-in-place skid and one inoculum line serve the plant: a
+        # vessel in cleanup, or charging a fresh batch, holds them. Every
+        # vessel starts the episode charging, so a first batch is exempt.
+        in_turn = ((self.current_stage == 4)
+                   | ((self.current_stage == 0)
+                      & (self.reactor_batches_completed >= 1)))
+        extra = max(0, int(in_turn.sum()) - 1)
+        if extra:
+            record(9, np.ones(extra))
+            penalty += self.BASE_SPIKE * extra
+            # A count, not a depth.
+            depth_sum.pop(9, None)
+            depth_max.pop(9, None)
+        penalty += self.turnaround_lambda * extra
+        self.turnaround_lambda = float(self._update_lambda(
+            np.array([self.turnaround_lambda]), np.array([float(extra)]))[0])
 
         # ── Constraint 5: instability ────────────────────────────────────────
         unstable = np.zeros(n, dtype=bool)

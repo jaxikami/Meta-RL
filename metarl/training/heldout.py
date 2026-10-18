@@ -27,7 +27,8 @@ from metarl.training.config import (SELECT_MAX_WORST_VIOL, SELECT_VIOL_WEIGHT,
                                     NO_REGRESS_CLEAN_VIOL)
 from metarl.training.arms import ARMS, get_arm, _build_agent
 from metarl.training.tasks import make_env
-from metarl.training.rollouts import branched_rollouts
+from metarl.training.rollouts import (branched_rollouts,
+                                      collect_episode_record)
 from metarl.training.metrics import (latent_separability, gate_opening,
                                      _finite_mean)
 
@@ -220,9 +221,8 @@ def _rollout_worker_init():
     torch.set_num_threads(1)
 
 
-def _rollout_job(job):
-    """Run ``branched_rollouts`` for one task inside a worker process."""
-    arm, sensor_model, weights, task, faults, onset, z_mode, index = job
+def _worker_agent(arm, sensor_model, weights):
+    """This worker's environment and agent for ``arm``, with ``weights`` installed."""
     key = (arm, sensor_model)
     if key not in _WORKER_AGENTS:
         env = make_env(lagrangian=ARMS[arm].lagrangian,
@@ -230,12 +230,27 @@ def _rollout_job(job):
         _WORKER_AGENTS[key] = (env, _build_agent(env, arm))
     env, agent = _WORKER_AGENTS[key]
     agent.load_rollout_weights(weights)
+    return env, agent
+
+
+def _collect_job(job):
+    """Run one stochastic training episode inside a worker process."""
+    arm, sensor_model, weights, task_id, task, schedule, seed = job
+    env, agent = _worker_agent(arm, sensor_model, weights)
+    return collect_episode_record(env, agent, task_id, task, schedule, seed)
+
+
+def _rollout_job(job):
+    """Run ``branched_rollouts`` for one task inside a worker process."""
+    arm, sensor_model, weights, task, faults, onset, z_mode, index = job
+    env, agent = _worker_agent(arm, sensor_model, weights)
     return branched_rollouts(env, agent, task, faults, onset, z_mode,
                              index=index)
 
 
 class RolloutPool:
-    """Worker processes running one arm's held-out rollouts, one task per job.
+    """Worker processes running one arm's rollouts: held-out checks (one task
+    per job) and stochastic training episodes (one episode per job).
 
     CPU-only (``PLANT_DEVICE=cpu`` is set for the pool's lifetime). Each
     worker builds its own environment and agent once and receives the current
@@ -262,6 +277,21 @@ class RolloutPool:
         jobs = [(self.arm, self.sensor_model, weights, t, tuple(faults),
                  onset, z_mode, i) for i, t in enumerate(tasks)]
         return list(self._ex.map(_rollout_job, jobs))
+
+    def collect_async(self, agent, jobs):
+        """Start training episodes with ``agent``'s current weights.
+
+        Args:
+            agent: The training agent (its weights are copied now).
+            jobs: (task_id, task, schedule, seed) tuples.
+
+        Returns:
+            Futures of ``collect_episode_record`` results, in job order.
+        """
+        weights = agent.rollout_weights()
+        return [self._ex.submit(_collect_job, (self.arm, self.sensor_model,
+                                               weights) + tuple(j))
+                for j in jobs]
 
     def close(self):
         """Shut the workers down and restore PLANT_DEVICE."""

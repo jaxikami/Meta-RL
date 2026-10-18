@@ -118,9 +118,20 @@ downstream fed. A scripted scheduler shows both sides
 | 6 | mass-balance drift | plant, episode end | residual / tolerance |
 | 7 | **storage overflow** | plant, per step | `(S − S_MAX)/S_MAX` |
 | 8 | **storage underflow** | plant, per step | `(S_MIN − S)/S_MIN` |
+| 9 | **turnaround conflict** (scheduling) | plant, per step, one event per extra vessel | count |
 
 The headline count is violation **events**: every (hour, constraint, instance)
-triple, the instance being the reactor for 1–5 and the plant for 6–8. Two
+triple, the instance being the reactor for 1–5 and the plant for 6–9.
+
+- **9, turnaround conflict.** One clean-in-place skid and one inoculum line
+  serve the plant, so only one vessel may be in turnaround (cleanup, or
+  charging a fresh batch) at a time. Every vessel starts the episode
+  charging, so a first batch is exempt. It is a scheduling constraint: the
+  stage clocks must stagger the batches. The trained `saferl` and `meta`
+  overlap ~2 vessel-hours per undisturbed episode (30% of episodes). It is
+  priced like 7–8 (`BASE_SPIKE` per event plus a dual) and needs no new
+  observation channel: every vessel's stage is visible. Policies trained
+  before it existed never saw it in the reward. Two
 vessels overflowing in the same hour are two events; `violation_counts` sums
 to the headline exactly.
 
@@ -170,19 +181,56 @@ contamination rates and the downstream rate.
 |---|---|---|---|---|
 | `leak` | one reactor or all | extra mass loss per hour | 0.004–0.016 | 0.010 |
 | `feed_gain` | one pump or all | gain × magnitude | 0.60–1.45 | 1.30 |
-| `feed_conc` | the shared feed tanks | composition × magnitude | 0.30–1.40 | recurrent dilution |
+| `feed_conc` | the shared feed tanks | composition × magnitude | 0.30–1.40 | 0.55 (`dilution`) |
 | `disturb_kinetics_decay` | one reactor or all | hydrolysis and uptake × magnitude | 0.15–0.70 | 0.20 |
 | `toxin_spike` | one reactor or all | its feed-line inhibitors, a broth pulse, uptake × 1/magnitude | 2.0–8.0 | 6.50 |
 | `cell_viability` | one reactor or all | viable cells × magnitude | 0.30–0.70 | 0.50 |
 | `contamination` | one reactor or all | its broth ethanol oxidised per hour | 0.0005–0.004 | — |
 | **`downstream_rate`** | the storage tank | downstream draw × magnitude | 0.40–1.60 | 0.50 |
+| **`turnaround_delay`** | the shared turnaround equipment | every cleanup and re-charge that starts after onset × magnitude long | 1.5–5.0 | 4.0 |
+| **`storage_capacity`** | the storage tank | usable volume × magnitude (the overflow wall moves, the level reading does not) | 0.75–0.97 | 0.90 |
 
+- Every kind has four temporal **patterns** (`FAULT_PATTERNS`, built by
+  `tasks.pattern_schedule`):
+
+  | pattern | profile | evaluation timing (h of 600) |
+  |---|---|---|
+  | `step` | full magnitude from onset to the end | onset 300 |
+  | `spike` | full magnitude, then cleared | 300–324 |
+  | `gradual` | ramps up in 6 treads to full magnitude | 300 → 480 |
+  | `recurrent` | on, off, on, off, on | 150–230, 310–390, 470–550 |
+
+  A once-firing kind is cleared by an entry of magnitude 1.0 (a kill is not
+  undone: the cells regrow), an additive kind (`leak`, `contamination`) by
+  its end step. A ramp adds `magnitude / 6` per tread for an additive kind,
+  multiplies by `magnitude^(1/6)` for `cell_viability`, and steps linearly
+  from 1.0 otherwise. A toxin's acute broth pulse is sized by the RISE in
+  feed toxin, so a ramp's pulses add up to one step's and each recurrence
+  pulses anew.
 - Meta-training picks one reactor uniformly, or all three with probability
-  `META_PLANTWIDE_FRAC = 0.2`. Patterns are the lean ones (single, drift,
-  compound, lot change); the compound pairs add `downstream_rate + feed_gain`.
+  `META_PLANTWIDE_FRAC = 0.2`, and a pattern from `META_FAULT_PATTERNS`
+  (step 0.35, spike 0.15, gradual 0.15, recurrent 0.20, plus training-only
+  compound 0.15: two kinds stepping together), with spike lengths, ramp
+  length and on / off windows drawn per episode (`META_SPIKE_H`,
+  `META_GRADUAL_FRAC`, `META_RECURRENT_*`). The compound pairs add
+  `downstream_rate + feed_gain`.
 - In evaluation and in the held-out panel, a per-reactor fault **rotates**:
   episode k faults reactor `k mod 3`, identically for every arm, so the
   comparison stays paired and every vessel is faulted on a third of the tasks.
+- `turnaround_delay` is the scheduling fault: the clean-in-place skid and
+  inoculum line run slow, so turnarounds overlap (constraint 9) unless the
+  stage clocks re-stagger the batches. It costs `saferl` no output (the tank
+  bottleneck leaves vessels idle anyway) but triples its conflicts at 4×; a
+  fixed-rate recipe also overfills, since its charge feeds for longer. The
+  stretched stage clock is visible in each vessel's credit channel.
+- `storage_capacity` is the storage-volume fault (a heel, fouling, or a
+  lowered high-level trip). The policies hold the tank near 330 t (max 350 t)
+  at mid-episode, so a 0.90 tank (360 t) forces no overflow at onset, yet
+  `saferl`, which keeps filling as before, overflows ~140 h per episode. The
+  new limit is not observed: it shows only through the overflow penalty.
+- Both are plant-wide and in the descriptor (`turnaround_mult`,
+  `storage_capacity`: `TASK_CONTEXT_DIM` 15 → 17), so a `meta` checkpoint
+  from before them no longer loads; retrain it.
 - `downstream_rate` is new: a distillation slowdown fills the tank (overflow,
   or batches held back); a surge empties it. The storage mass is online, so it
   is inferable, and it sits in `GATE_FAULT_KINDS` with the leak and pump
@@ -264,11 +312,33 @@ with these plant-specific settings:
   `saferl`**. If `saferl`'s best check is never feasible, training says so.
 - `GATE_FAULT_KINDS = (leak, feed_gain, downstream_rate)`: the faults that
   move an online measurement.
+- The privileged fault flag (the gate's target, the anchor's switch) is on
+  while a fault holds the plant off its task's values: a step latches it, a
+  spike or a recurrent fault's off-window clears it, so the gate learns to
+  close again when the plant recovers.
+- `EARLY_STOP_PATIENCE = 50` checks (500 iterations;
+  `PLANT_EARLY_STOP_PATIENCE` overrides it). At 30, `saferl` stopped ~12%
+  short of its previous held-out output.
+- Training episodes run in the held-out worker pool while the GPU updates
+  (`COLLECT_IN_WORKERS`): each iteration's episodes use the weights from
+  before its updates and enter the replay after them. The task and fault
+  draws are the in-process ones, in the same order. Profiled, collection was
+  ~25% of an iteration and the updates ~65%.
+- Constraint 9 adds ~2.5 events per undisturbed episode to the policies
+  trained before it, so `SELECT_MAX_VIOL = 3` may admit no `saferl` check
+  until it has learned to stagger turnarounds: check the retrained
+  `saferl`'s held-out violations before trusting the selection.
 - The held-out panel adds `downstream_rate@0.6`; per-reactor branches rotate.
-- `EVAL_EPISODES = 100` (lean 200; a plant episode costs ~3×).
-- Evaluation scenarios: in-distribution, OOD, the six `EVAL_DISTURBANCES`
-  (five rotating per-reactor faults and `downstream_rate@0.5`), and the
-  recurrent dilution.
+- `EVAL_EPISODES = 100` (lean 200; a plant episode costs ~3×;
+  `PLANT_EVAL_EPISODES` overrides it for a quick run).
+- Evaluation scenarios: in-distribution, OOD, then every
+  `EVAL_DISTURBANCES` kind under every pattern, named `<kind>_<pattern>`
+  (`leak`, `feed_gain`, `dilution`, `kinetics_decay`, `toxin`,
+  `cell_viability`, `downstream_rate`, `turnaround_delay`,
+  `storage_capacity` × `step`, `spike`, `gradual`, `recurrent`): 38
+  scenarios, ~4× the old nine. The held-out panel (now with
+  `turnaround_delay@3.5` and `storage_capacity@0.88`) and the latent gate
+  still use step faults.
 
 Figures (`results/plot/[tag]/`) are the lean set (`compare_safety`,
 `compare_episodes_violated`, `compare_production`, `compare_quality`,
@@ -281,6 +351,36 @@ violation events, the storage range and each episode's faulted reactor.
 
 The lean `optional/headroom.py` and `optional/calibrate_faults.py` are not
 ported yet; `compare_headroom.png` is not drawn.
+
+### Ablation study (`metarl/ablation.py`)
+
+The Fermentation-PPO ablation's design on the `meta` arm: each variant is
+`ARMS["meta"]` with components switched off, trained, selected and evaluated
+by the study's own code, over several seeds.
+
+| component | ablated by | what else goes with it |
+|---|---|---|
+| `z` | `use_context=False` | the aux head, privileged critics and the adaptation gate |
+| `multitask` | `multitask=False` (nominal task only) | held-out selection on the undisturbed checks only |
+| `lagrangian` | `lagrangian=False` | none: the static shaping stays, as for `baseline` |
+| `mask` | `action_mask=False` | none, but the plant has no interlock, so unmasked flows reach the shield and the plant |
+| `apn` | `apn=False` | the mapping penalty |
+| `warmstart` | `warm_start=None` (from scratch) | the anchor, L2-SP decay, actor warm-up, gate and no-regression selection |
+
+The gate has no switch of its own: it is on exactly when `z` and `warmstart`
+both are. `--design factorial --components z multitask` splits `ADAPT` into
+the disturbed distribution and inference (`full`, `no_z`, `no_multitask`,
+`no_z_multitask`, each against the `saferl` reference row).
+
+Seed k runs under the run tag `ablation/seed<k>`. Its `saferl` trains there
+first (copy `policy/saferl*.pth` into `policy/ablation/seed<k>/` to reuse one)
+and is evaluated as the reference row. Every variant then trains with the
+study's protocol, early stopping included; `--budget N` instead runs each for
+exactly N iterations. Evaluation uses `evaluate`'s scenarios and tasks, so
+deltas against `full` are paired per task within a seed. Outputs:
+`results/log/ablation/summary.csv` and `ablation_curves.png`,
+`ablation_final.png`, `ablation_severity.png` in `results/plot/ablation/`.
+Leave-one-out over three seeds is 21 meta-sized runs plus three `saferl` runs.
 
 ---
 
@@ -306,6 +406,7 @@ into mixins, one module per concern.
 | `metarl/training/tasks.py` / `rollouts.py` | task pools and fault schedules; training and deterministic episodes |
 | `metarl/training/evaluate.py` / `z_informativeness.py` | evaluation and the latent gate |
 | `metarl/training/metrics.py` / `plots.py` / `logs.py` | statistics, figures, JSON logs |
+| `metarl/ablation.py` | ablation study of the meta arm's components (`python -m metarl.ablation`) |
 | `tests/smoke_test.py` | fast CPU check of every code path and the design properties |
 | `legacy/` | the previous implementation's modules, superseded |
 
@@ -332,7 +433,14 @@ python -m metarl all
 ```
 
 Or one stage at a time: `train_saferl`, `train_meta`, `evaluate`,
-`z_informativeness`, `plot_eval`, `plot_curves`. Seeds and tags, in
+`z_informativeness`, `plot_eval`, `plot_curves`.
+
+The ablation study (leave-one-out, seeds 0–2; `--help` for the options,
+`--dry-run` to list the runs, `--summarize-only` to redraw):
+
+```bash
+python -m metarl.ablation
+``` Seeds and tags, in
 PowerShell:
 
 ```powershell
@@ -345,6 +453,9 @@ $env:PLANT_SEED=1; $env:PLANT_RUN_TAG="seed1"; python -m metarl all
 | `PLANT_RUN_TAG` | subfolder for checkpoints, logs and figures |
 | `PLANT_APN_PATH` | APN checkpoint path (default `policy/apn_plant.pth`) |
 | `PLANT_HELDOUT_WORKERS` | held-out worker processes; `0` or `1` runs in-process |
+| `PLANT_COLLECT_WORKERS` | `0` collects training episodes in-process instead of in the worker pool |
+| `PLANT_EVAL_EPISODES` | evaluation tasks per scenario (default 100) |
+| `PLANT_EARLY_STOP_PATIENCE` | early-stop patience in held-out checks (default 50) |
 | `PLANT_DEVICE` | force the training device, e.g. `cpu` |
 | `PLANT_VERBOSE_PBAR` | `1` adds losses and latent diagnostics to the progress bar |
 
@@ -356,4 +467,5 @@ Outputs: `policy/[tag]/<arm>.pth` and `<arm>_best.pth`; `results/log/[tag]/`
 
 `numpy`, `numba`, `torch`, `matplotlib`, `tqdm` (optional). Gradient updates
 use a CUDA/ROCm GPU when available (the critics are ~8–9M parameters);
-rollouts always run on the CPU, held-out checks in worker processes.
+rollouts always run on the CPU, held-out checks and training episodes in
+worker processes.

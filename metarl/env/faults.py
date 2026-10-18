@@ -15,6 +15,7 @@ from metarl.env.config import (SPECIES_IDX, C_MAX_LIMITS, I_ETH,
 VALID_DISTURBANCES = (
     "leak", "feed_gain", "feed_conc", "disturb_kinetics_decay",
     "toxin_spike", "cell_viability", "contamination", "downstream_rate",
+    "turnaround_delay", "storage_capacity",
 )
 
 DISTURBANCE_INDEX_MAP = {
@@ -26,6 +27,8 @@ DISTURBANCE_INDEX_MAP = {
     6: "cell_viability",
     7: "contamination",
     8: "downstream_rate",
+    9: "turnaround_delay",
+    10: "storage_capacity",
 }
 
 DISTURBANCE_ALIASES = {
@@ -42,12 +45,19 @@ DISTURBANCE_KIND_INDEX = {k: i for i, k in DISTURBANCE_INDEX_MAP.items()}
 N_DISTURBANCE_KINDS = len(DISTURBANCE_INDEX_MAP)
 
 # Kinds that act on the plant as a whole and take no reactor: the shared feed
-# tanks and the storage tank's downstream draw. Every other kind acts on one
-# reactor, or on all of them when scheduled with ``reactor=None``.
-PLANT_DISTURBANCES = ("feed_conc", "downstream_rate")
+# tanks, the storage tank's downstream draw and volume, and the shared
+# turnaround equipment. Every other kind acts on one reactor, or on all of
+# them when scheduled with ``reactor=None``.
+PLANT_DISTURBANCES = ("feed_conc", "downstream_rate", "turnaround_delay",
+                      "storage_capacity")
 
 # Kinds that act continuously from onset and ADD across entries.
 ADDITIVE_DISTURBANCES = ("leak", "contamination")
+
+
+def _toxin_pulse(mag, cap, per_unit):
+    """Acute broth pulse (g/L) of a toxin step from clean feed to ``mag``."""
+    return min(cap, max(0.0, mag - 1.0) * per_unit)
 
 
 def parse_active_disturbances(selection):
@@ -60,7 +70,7 @@ def parse_active_disturbances(selection):
           contains a 0.
         - Kind names or aliases.
         - Presets: 'flow', 'kinetics', 'biology' / 'biochemical', 'storage',
-          'none'.
+          'scheduling', 'none'.
 
     Args:
         selection: Ints, strings, or preset name.
@@ -79,7 +89,9 @@ def parse_active_disturbances(selection):
     if selection == "flow":
         return ("leak", "feed_gain", "feed_conc")
     if selection == "storage":
-        return ("downstream_rate",)
+        return ("downstream_rate", "storage_capacity")
+    if selection == "scheduling":
+        return ("turnaround_delay",)
     if selection in ("kinetics", "disturb_kinetics_decay", "kinetics_decay"):
         return ("disturb_kinetics_decay",)
     if selection in ("biology", "biochemical"):
@@ -149,7 +161,10 @@ class FaultMixin:
         self._current_leak_rate = self.leak_frac.copy()
         self._current_kinetic_activity = np.ones(n)
         self._current_contam_rate = np.zeros(n)
+        self._current_toxin_mag = np.ones(n)
         self._downstream_mult = 1.0
+        self._turnaround_mult = 1.0
+        self._storage_cap_mult = 1.0
 
     def set_task(self, task):
         """Force a specific task on every subsequent reset() (None: nominal)."""
@@ -168,13 +183,15 @@ class FaultMixin:
     # ------------------------------------------------------- disturbances
 
     def schedule_disturbance(self, kind, onset_step, magnitude, reactor=None,
-                             channel=None):
+                             channel=None, end_step=None):
         """Register a mid-episode disturbance.
 
-        ``leak`` and ``contamination`` act continuously from onset and ADD to
-        each other (and a leak to the task's baseline). Every other kind fires
-        once at onset, relative to the task's own values, so a later entry of
-        the same kind on the same reactor overwrites an earlier one.
+        ``leak`` and ``contamination`` act continuously from onset (until
+        ``end_step`` when given) and ADD to each other (and a leak to the
+        task's baseline). Every other kind fires once at onset, relative to
+        the task's own values, so a later entry of the same kind on the same
+        reactor overwrites an earlier one, and an entry of magnitude 1.0
+        restores the task's value.
 
         Args:
             kind: One of VALID_DISTURBANCES (or an alias):
@@ -198,16 +215,28 @@ class FaultMixin:
                                magnitude (plant-wide): < 1 is a distillation
                                slowdown that fills the tank, > 1 a surge that
                                empties it.
+                'turnaround_delay' -- every turnaround (cleanup, and
+                               charging the next batch) that STARTS after onset
+                               takes magnitude x its nominal stage time
+                               (plant-wide: the shared clean-in-place skid and
+                               inoculum line).
+                'storage_capacity' -- the storage tank's usable volume x
+                               magnitude (plant-wide: a heel or fouling, or a
+                               lowered high-level trip); the overflow wall
+                               moves, the level reading does not.
             onset_step: Inner-step index at which the disturbance begins.
             magnitude: Disturbance size (see per-kind semantics above).
             reactor: Reactor index the fault acts on, or None for every
                 reactor. Must be None for PLANT_DISTURBANCES.
             channel: ``disturb_kinetics_decay`` only: 'eta' (hydrolysis),
                 'uptake' / 'ph' (sugar uptake), or None for both.
+            end_step: ADDITIVE_DISTURBANCES only: first inner step at which
+                the entry no longer acts (None: to the end of the episode).
 
         Raises:
-            ValueError: On an unknown kind, a reactor index out of range, or a
-                reactor given for a plant-wide kind.
+            ValueError: On an unknown kind, a reactor index out of range, a
+                reactor given for a plant-wide kind, or an ``end_step`` on a
+                kind that fires once or not after its onset.
         """
         kind = DISTURBANCE_ALIASES.get(kind, kind)
         if kind not in VALID_DISTURBANCES:
@@ -221,10 +250,18 @@ class FaultMixin:
             if not 0 <= reactor < self.n_reactors:
                 raise ValueError(f"reactor {reactor} out of range "
                                  f"0..{self.n_reactors - 1}")
+        if end_step is not None:
+            if kind not in ADDITIVE_DISTURBANCES:
+                raise ValueError(f"{kind} fires once: end it with a later "
+                                 f"entry of magnitude 1.0, not end_step")
+            if int(end_step) <= int(onset_step):
+                raise ValueError(f"end_step {end_step} is not after onset "
+                                 f"{onset_step}")
+            end_step = int(end_step)
         self._disturbances.append({
             "kind": kind, "onset": int(onset_step),
             "magnitude": float(magnitude), "reactor": reactor,
-            "channel": channel, "fired": False,
+            "channel": channel, "end": end_step, "fired": False,
         })
 
     def clear_disturbances(self):
@@ -248,7 +285,9 @@ class FaultMixin:
             ``feed_gain`` (x commanded), ``kinetic_activity`` (x nominal),
             broth ``inhibitors`` (F + ACT + HMF), ``cells`` and ``ethanol``
             (g/L). Plant scalars: ``feed_conc`` (x the task's feed),
-            ``storage`` (kg) and ``downstream_rate`` (x S_OUT_RATE).
+            ``storage`` (kg), ``downstream_rate`` (x S_OUT_RATE),
+            ``turnaround`` (x nominal turnaround time) and
+            ``storage_capacity`` (usable volume, kg).
         """
         C = self.C
         return {
@@ -262,27 +301,38 @@ class FaultMixin:
             "feed_conc": float(self._current_feed_conc_mag),
             "storage": float(self.S_mass),
             "downstream_rate": float(self._downstream_mult),
+            "turnaround": float(self._turnaround_mult),
+            "storage_capacity": float(self.S_max * self._storage_cap_mult),
         }
 
     def fault_active(self):
-        """Whether a scheduled fault has acted on the plant this episode.
+        """Whether a scheduled fault holds the plant off its task's values now.
 
         Privileged (training only), like ``get_effective_context``: True from
-        the first inner step in which a disturbance changed something, for the
-        rest of the episode.
+        the first inner step in which a disturbance changed something, while
+        the effective descriptor differs from the task's own. A step fault
+        therefore latches; a spike, or each off-window of a recurrent fault,
+        clears it (a kill keeps it: the descriptor records the knock-down).
         """
-        return self._fault_seen
+        return self._fault_seen and self._off_task()
+
+    def _off_task(self):
+        """Whether the effective descriptor differs from the task's prior one."""
+        ctx0 = np.asarray(self.current_task["context"], dtype=np.float64)
+        return bool(np.any(np.abs(self.get_effective_context() - ctx0)
+                           > 1e-12 * (1.0 + np.abs(ctx0))))
 
     def fault_kind(self):
         """Which kind of fault acted first this episode, as a code.
 
-        0 until ``fault_active`` turns on, then the ``DISTURBANCE_INDEX_MAP``
-        code of the kind that turned it on. Privileged like ``fault_active``.
+        The ``DISTURBANCE_INDEX_MAP`` code of the kind that first turned
+        ``fault_active`` on, while it is on; 0 otherwise. Privileged like
+        ``fault_active``.
 
         Returns:
             int in [0, N_DISTURBANCE_KINDS].
         """
-        return self._fault_kind
+        return self._fault_kind if self.fault_active() else 0
 
     def _mark_fault(self, kind):
         """Record that a fault of ``kind`` acted on the plant this step."""
@@ -302,7 +352,8 @@ class FaultMixin:
             [float(ctx0[0]) * self._current_feed_conc_mag, float(ctx0[1])],
             self.feed_gain, self._current_leak_rate,
             self._current_kinetic_activity, self._current_contam_rate,
-            [self._downstream_mult]])
+            [self._downstream_mult, self._turnaround_mult,
+             self._storage_cap_mult]])
         assert out.size == TASK_CONTEXT_DIM
         return out
 
@@ -326,6 +377,8 @@ class FaultMixin:
                 continue
             kind, mag = d["kind"], d["magnitude"]
             tgt = self._targets(d)
+            if d.get("end") is not None and t >= d["end"]:
+                continue
             if kind == "leak":
                 leak_rate[tgt] += mag
                 if mag != 0.0:
@@ -346,6 +399,10 @@ class FaultMixin:
                 self._current_feed_conc_mag = mag
             elif kind == "downstream_rate":
                 self._downstream_mult = float(mag)
+            elif kind == "turnaround_delay":
+                self._turnaround_mult = float(mag)
+            elif kind == "storage_capacity":
+                self._storage_cap_mult = float(mag)
             elif kind == "feed_gain":
                 self.feed_gain[tgt] = self._task_feed_gain0[tgt] * mag
             elif kind == "disturb_kinetics_decay":
@@ -360,15 +417,25 @@ class FaultMixin:
                 for i in tgt:
                     self.C_C5[i, inh] = self._task_C_C5_0[i, inh] * mag
                     self.C_LF[i, inh] = self._task_C_LF_0[i, inh] * mag
-                    if mag > 1.0:
-                        # Acute broth pulse at onset, capped below C_MAX_LIMITS.
-                        i_F, i_ACT, i_HMF = inh
+                    # Acute broth pulse, capped below C_MAX_LIMITS: the rise
+                    # of the step-from-clean pulse between the feed's current
+                    # toxin level and the new one. A single step pulses as
+                    # before, a ramp's pulses add up to one step's, and each
+                    # recurrence (after a 1.0 entry restores the feed) pulses
+                    # anew.
+                    i_F, i_ACT, i_HMF = inh
+                    prev = float(self._current_toxin_mag[i])
+                    dFH = _toxin_pulse(mag, 4.5, 1.5) - _toxin_pulse(prev, 4.5, 1.5)
+                    dA = _toxin_pulse(mag, 0.85, 0.35) - _toxin_pulse(prev, 0.85, 0.35)
+                    if dFH > 0.0:
                         self.C[i, i_F] = min(float(C_MAX_LIMITS[i_F]),
-                                             self.C[i, i_F] + min(4.5, (mag - 1.0) * 1.5))
+                                             self.C[i, i_F] + dFH)
                         self.C[i, i_HMF] = min(float(C_MAX_LIMITS[i_HMF]),
-                                               self.C[i, i_HMF] + min(4.5, (mag - 1.0) * 1.5))
+                                               self.C[i, i_HMF] + dFH)
+                    if dA > 0.0:
                         self.C[i, i_ACT] = min(float(C_MAX_LIMITS[i_ACT]),
-                                               self.C[i, i_ACT] + min(0.85, (mag - 1.0) * 0.35))
+                                               self.C[i, i_ACT] + dA)
+                    self._current_toxin_mag[i] = mag
                 # The lasting harm is the uptake cut (the lean study's
                 # 1 / magnitude since 2026-09-26).
                 act = float(1.0 / max(1.0, mag))

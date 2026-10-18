@@ -20,6 +20,7 @@ class LedgerMixin:
         self.product_purity_lambda = np.zeros(n)
         self.storage_overflow_lambda = 0.0
         self.storage_underflow_lambda = 0.0
+        self.turnaround_lambda = 0.0
 
     # ------------------------------------------------------- bookkeeping
 

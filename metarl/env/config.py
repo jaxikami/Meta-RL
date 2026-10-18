@@ -301,13 +301,16 @@ def _per_reactor(name):
 # the meta arm's task-aware critics. kinetic_activity is 1.0 and contam_rate 0
 # in the prior; they move only when a biochemical fault or a contamination
 # fires in that reactor. downstream_rate is the storage tank's outflow as a
-# multiple of S_OUT_RATE, 1.0 in the prior; a `downstream_rate` fault moves it.
+# multiple of S_OUT_RATE, turnaround_mult the turnaround time and
+# storage_capacity the tank's usable volume as multiples of nominal, all 1.0
+# in the prior; the fault of the same name moves each.
 TASK_CONTEXT_NAMES = (["feed_solids", "feed_gx"]
                       + _per_reactor("feed_gain")
                       + _per_reactor("leak_frac")
                       + _per_reactor("kinetic_activity")
                       + _per_reactor("contam_rate")
-                      + ["downstream_rate"])
+                      + ["downstream_rate", "turnaround_mult",
+                         "storage_capacity"])
 TASK_CONTEXT_DIM = len(TASK_CONTEXT_NAMES)
 # Offsets of each group in the descriptor.
 CTX_SOLIDS, CTX_GX = 0, 1
@@ -316,15 +319,19 @@ CTX_LEAK = CTX_GAIN + N_REACTORS
 CTX_KIN = CTX_LEAK + N_REACTORS
 CTX_CONTAM = CTX_KIN + N_REACTORS
 CTX_DOWNSTREAM = CTX_CONTAM + N_REACTORS
+CTX_TURNAROUND = CTX_DOWNSTREAM + 1
+CTX_STORAGE_CAP = CTX_TURNAROUND + 1
 
 # Standardization for the auxiliary regression target (the lean study's
 # per-quantity centers and scales, repeated per reactor).
 TASK_CONTEXT_CENTER = np.array(
     [1.00, 1.00] + [1.00] * N_REACTORS + [0.00075] * N_REACTORS
-    + [1.00] * N_REACTORS + [0.0] * N_REACTORS + [1.00], dtype=np.float64)
+    + [1.00] * N_REACTORS + [0.0] * N_REACTORS + [1.00, 1.00, 1.00],
+    dtype=np.float64)
 TASK_CONTEXT_SCALE = np.array(
     [0.12, 0.12] + [0.09] * N_REACTORS + [0.00045] * N_REACTORS
-    + [0.20] * N_REACTORS + [0.001] * N_REACTORS + [0.20], dtype=np.float64)
+    + [0.20] * N_REACTORS + [0.001] * N_REACTORS + [0.20, 0.50, 0.10],
+    dtype=np.float64)
 
 
 def standardize_context(context):
@@ -380,7 +387,8 @@ NOMINAL_PARAMS.flags.writeable = False
 def _context(solids, gx, gains, leaks):
     """A prior task's descriptor: no fault has acted yet."""
     return np.concatenate([[solids, gx], gains, leaks,
-                           np.ones(N_REACTORS), np.zeros(N_REACTORS), [1.0]])
+                           np.ones(N_REACTORS), np.zeros(N_REACTORS),
+                           [1.0, 1.0, 1.0]])
 
 
 def nominal_task():

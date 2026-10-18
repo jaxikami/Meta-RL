@@ -135,6 +135,11 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         self.gate_weight = float(gate_weight)
         self.gate_sharpness = float(gate_sharpness)
         self.gate_override = None
+        # Hold rule (training only): penalty weight on opening the outlet of a
+        # below-spec batch, its margin, and whether stalls also train the gate.
+        self.hold_penalty_weight = 0.0
+        self.hold_margin = 0.03
+        self.hold_gate_target = False
         self.last_gate = float("nan")
         self._critic_c_dim = (self._z_dim
                               + (TASK_CONTEXT_DIM if self.critic_task_context

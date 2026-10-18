@@ -18,7 +18,7 @@ from metarl.training.config import (SEED, Z_INFORM_MIN_SNR,
 from metarl.training.arms import (ARMS, BEST_META_PATH, META_PATH,
                                   _build_agent, _load_preferring_best)
 from metarl.training.tasks import (seed_everything, make_env, make_task_pool,
-                                   as_fault_schedule)
+                                   apply_fault_schedule)
 from metarl.training.rollouts import sensor_stream_key
 from metarl.training.metrics import (latent_separability, gate_opening,
                                      _finite_mean, _paired_delta,
@@ -32,10 +32,7 @@ def _z_rollout(env, agent, task, disturbance=None, z_mode="mean", fixed_z=None,
     prev = agent.z_mode
     prev_key = getattr(env, "sensor_stream_key", None)
     try:
-        env.clear_disturbances()
-        for d in as_fault_schedule(disturbance, index):
-            env.schedule_disturbance(d["kind"], d["onset"], d["magnitude"],
-                                     reactor=d["reactor"])
+        apply_fault_schedule(env, disturbance, index)
         env.set_task(task)
         env.sensor_stream_key = sensor_stream_key(task, disturbance, index)
         state = env.reset()

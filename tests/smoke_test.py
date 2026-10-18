@@ -56,7 +56,8 @@ from metarl.env.config import (N_REACTORS, nominal_task, sample_task,
                                NOMINAL_PARAMS, C_MAX_LIMITS, C_C5_BASE,
                                C_LF_BASE, S_MAX, S_MIN, S_OUT_RATE, S_INITIAL,
                                R_MASS, R_STAGE, CTX_GAIN, CTX_LEAK, CTX_KIN,
-                               CTX_DOWNSTREAM, REACTOR_FLOW_SCALE,
+                               CTX_DOWNSTREAM, CTX_TURNAROUND, CTX_STORAGE_CAP,
+                               REACTOR_FLOW_SCALE,
                                MIN_PRODUCT_TITER)
 from metarl.env.core import (integrate_rk4, integrate_rk4_reference,
                              calculate_rates_numba, co2_formation_rates)
@@ -81,15 +82,19 @@ from metarl.training.config import (CONTEXT_SIZE, META_AUX_STATE_TARGETS,
                                     META_DISTURB_KINDS,
                                     META_DISTURB_MAG_RANGES,
                                     META_FAULT_PATTERNS, EVAL_DISTURBANCES,
-                                    EVAL_FAULT_SCENARIOS, HELDOUT_DISTURBANCES,
+                                    FAULT_PATTERNS, HELDOUT_DISTURBANCES,
                                     META_ANCHOR_FAULT_DIMS)
 from metarl.training.arms import _build_agent
 from metarl.training.early_stopping import EarlyStopper
 from metarl.training.tasks import (make_env, make_task_pool, resolve_reactor,
-                                   maybe_schedule_disturbance)
+                                   maybe_schedule_disturbance,
+                                   pattern_schedule, apply_fault_schedule)
+from metarl.training.evaluate import eval_fault_scenarios
 from metarl.training.rollouts import (collect_rollout, sensor_stream_key,
                                       _start_episode, _advance,
-                                      _episode_metrics, branched_rollouts)
+                                      _episode_metrics, branched_rollouts,
+                                      collect_episode_record,
+                                      ingest_episode_record)
 from metarl.training.heldout import _regressions, RolloutPool
 from metarl.apn.train import new_apn
 
@@ -408,14 +413,17 @@ def check_fault_targeting():
     assert not env.fault_active()
     assert set(VALID_DISTURBANCES) == set(META_DISTURB_KINDS)
     # Meta-training draws: reactors spread over all three and plant-wide.
-    reactors = set()
+    reactors, patterns = set(), set()
     for _ in range(200):
         d = maybe_schedule_disturbance(env, prob=1.0, rng=rng,
                                          patterns=META_FAULT_PATTERNS)
-        for k, _, _, r in d["schedule"]:
+        patterns.add(d["pattern"])
+        for k, o, _, r, end in d["schedule"]:
             assert (r is None) if k in PLANT_DISTURBANCES else (r is None or 0 <= r < 3)
+            assert 1 <= o < env.max_steps and (end is None or end > o)
             reactors.add(r)
     assert reactors == {0, 1, 2, None}, reactors
+    assert patterns == set(META_FAULT_PATTERNS), patterns
     env.clear_disturbances()
     print("  fault targeting OK (one reactor or all; plant kinds refuse a "
           "reactor; flag latches, not on a neutral magnitude)")
@@ -519,7 +527,8 @@ def check_fault_coverage(ref_info):
     probes = {"leak": (0.05, None), "feed_gain": (1.4, None),
               "feed_conc": (0.3, None), "disturb_kinetics_decay": (0.3, None),
               "toxin_spike": (6.5, None), "cell_viability": (0.3, None),
-              "contamination": (0.004, None), "downstream_rate": (0.3, None)}
+              "contamination": (0.004, None), "downstream_rate": (0.3, None),
+              "turnaround_delay": (5.0, None), "storage_capacity": (0.75, None)}
     print("    kind                     open-loop viol    closed-loop viol  "
           "closed-loop on-spec")
     for kind, (mag, reactor) in probes.items():
@@ -548,11 +557,130 @@ def check_magnitudes_in_support():
     for kind, mag, _ in HELDOUT_DISTURBANCES:
         lo, hi = META_DISTURB_MAG_RANGES[kind]
         assert lo < mag < hi, (kind, mag)
-    for sched in EVAL_FAULT_SCENARIOS.values():
-        for kind, _, mag, *_ in sched:
-            lo, hi = META_DISTURB_MAG_RANGES[kind]
-            assert lo <= mag <= max(hi, 1.0), (kind, mag)
     print("  magnitudes in support OK")
+
+
+def _apply_until(env, t_end):
+    """Fire scheduled faults step by step up to ``t_end``, without biology."""
+    for t in range(t_end):
+        env.time_step_count = t
+        env._apply_disturbances()
+
+
+def check_fault_patterns():
+    """Every kind has four patterns: step, spike, gradual and recurrent."""
+    env = PlantFermentationEnv(sensor_model=False)
+    env.set_task(nominal_task())
+    grid = eval_fault_scenarios(env.max_steps // 2, env.max_steps)
+    assert set(grid) == {f"{k}_{p}" for k in EVAL_DISTURBANCES
+                         for p in FAULT_PATTERNS}, sorted(grid)
+    for name, sched in grid.items():
+        assert sched, name
+        apply_fault_schedule(env, sched, index=1)
+    # spike: on, then the task's value again (multiplicative, and additive),
+    # and the privileged fault flag with it.
+    for kind, mag, probe in (("feed_gain", 1.3, lambda e: e.feed_gain[0]),
+                             ("leak", 0.01, lambda e: e._current_leak_rate[0])):
+        env.reset()
+        apply_fault_schedule(env, pattern_schedule(kind, mag, "spike", 10, 0,
+                                                   spike_h=5))
+        base = probe(env)
+        _apply_until(env, 12)
+        on = probe(env)
+        assert env.fault_active() and env.fault_kind() == DISTURBANCE_KIND_INDEX[kind]
+        _apply_until(env, 20)
+        assert on != base and np.isclose(probe(env), base), (kind, base, on)
+        assert not env.fault_active() and env.fault_kind() == 0, kind
+    # gradual ends at full strength; a ramped kill multiplies to one kill.
+    env.reset()
+    apply_fault_schedule(env, pattern_schedule("feed_gain", 1.3, "gradual", 10,
+                                               0, gradual_h=50))
+    _apply_until(env, 30)
+    mid = env.feed_gain[0]
+    _apply_until(env, 70)
+    assert 1.0 < mid < 1.3 and np.isclose(env.feed_gain[0], 1.3), mid
+    env.reset()
+    c0 = env.C[1, 9]
+    apply_fault_schedule(env, pattern_schedule("cell_viability", 0.5,
+                                               "gradual", 10, 1, gradual_h=50))
+    _apply_until(env, 70)
+    assert np.isclose(env.C[1, 9], c0 * 0.5), (c0, env.C[1, 9])
+    # toxin: a ramp's acute pulses add up to one step's; recurrence pulses
+    # anew (a magnitude whose two pulses stay below the broth cap).
+    pulses = {}
+    for pattern in ("step", "gradual", "recurrent"):
+        env.reset()
+        f0 = env.C[2, 6]
+        apply_fault_schedule(env, pattern_schedule(
+            "toxin_spike", 2.0, pattern, 10, 2, gradual_h=50,
+            windows=((10, 30), (40, 60))))
+        _apply_until(env, 70)
+        pulses[pattern] = env.C[2, 6] - f0
+    assert np.isclose(pulses["gradual"], pulses["step"]), pulses
+    assert np.isclose(pulses["recurrent"], 2 * pulses["step"]), pulses
+    # recurrent: off between windows, on again after.
+    env.reset()
+    apply_fault_schedule(env, pattern_schedule("downstream_rate", 0.5,
+                                               "recurrent", 0, None,
+                                               windows=((10, 20), (30, 40))))
+    seen = []
+    for t in range(45):
+        env.time_step_count = t
+        env._apply_disturbances()
+        seen.append(env._downstream_mult)
+    assert seen[15] == 0.5 and seen[25] == 1.0 and seen[35] == 0.5, seen
+    env.clear_disturbances()
+    print(f"  fault patterns OK ({len(grid)} evaluation scenarios = "
+          f"{len(EVAL_DISTURBANCES)} kinds x {', '.join(FAULT_PATTERNS)}; "
+          f"spikes clear, ramps reach full strength, toxin pulses telescope)")
+
+
+def check_scheduling_and_storage_faults():
+    """Turnaround conflicts (9) are counted; turnaround_delay and
+    storage_capacity act on the stage times and the overflow wall."""
+    env = PlantFermentationEnv(sensor_model=False)
+    env.set_task(nominal_task())
+    env.clear_disturbances()
+    # Every vessel starts the episode charging: exempt.
+    obs = env.reset()
+    _, _, _, info = env.step(apply_stage_mask_np(obs, _pol_idle(obs)))
+    assert 9 not in info["violation_counts"], info["violation_counts"]
+    # Two vessels in turnaround after a batch: one conflict event per hour.
+    env.reset()
+    env.reactor_batches_completed[:] = 1
+    env.current_stage[:] = (4, 0, 2)
+    env.stage_credits[:] = (50.0, 50.0, 50.0)
+    _, _, _, info = env._step_internal(np.tile([T1, -1, -1, -1.0], N_REACTORS))
+    assert info["violation_counts"].get(9) == 1, info["violation_counts"]
+    # turnaround_delay: a cleanup that starts after onset takes 3x as long,
+    # and so does the charge that follows it.
+    env.clear_disturbances()
+    env.schedule_disturbance("turnaround_delay", 0, 3.0)
+    env.reset()
+    env.current_stage[0] = 3
+    env.M[0] = 50.0
+    env.stage_credits[0] = 0.5
+    env._step_internal(np.tile([T1, -1, -1, -1.0], N_REACTORS))
+    assert env.current_stage[0] == 4
+    assert np.isclose(env.stage_credits[0], 3.0 * env.base_credits[4]), env.stage_credits[0]
+    env.stage_credits[0] = 0.5
+    env._step_internal(np.tile([T1, -1, -1, -1.0], N_REACTORS))
+    assert env.current_stage[0] == 0
+    assert np.isclose(env.stage_credits[0], 3.0 * env.base_credits[0]), env.stage_credits[0]
+    assert np.isclose(env.get_effective_context()[CTX_TURNAROUND], 3.0)
+    # storage_capacity: the overflow wall moves to 90% of S_MAX.
+    for mag, want in ((1.0, False), (0.9, True)):
+        env.clear_disturbances()
+        env.schedule_disturbance("storage_capacity", 0, mag)
+        env.reset()
+        env.S_mass = 0.95 * S_MAX
+        _, _, _, info = env._step_internal(np.tile([T1, -1, -1, -1.0], N_REACTORS))
+        assert (7 in info["violation_counts"]) == want, (mag, info["violation_counts"])
+    assert np.isclose(env.get_effective_context()[CTX_STORAGE_CAP], 0.9)
+    env.clear_disturbances()
+    print("  scheduling and storage faults OK (first charge exempt; two "
+          "vessels in turnaround conflict; turnaround_delay stretches "
+          "cleanup and charge; storage_capacity moves the overflow wall)")
 
 
 # ───────────────────────────────────────────────────────────────── agent
@@ -648,6 +776,12 @@ def check_recurrent_encoder():
     stats = tagent.update(preplay, meta_batch=1, batch_size=16, context_size=window)
     for k in ("critic_loss", "actor_loss", "kl", "aux_loss"):
         assert np.isfinite(stats[k]), (k, stats[k])
+    # A context-free arm (saferl) stores no privileged state and still updates.
+    sagent = PEARLAgent(STATE_DIM, ACTION_DIM, use_context=False)
+    sreplay = MultiTaskReplayBuffer(STATE_DIM, ACTION_DIM)
+    collect_rollout(env, sagent, sreplay, 0, nominal_task())
+    sstats = sagent.update(sreplay, meta_batch=1, batch_size=8, min_buffer=8)
+    assert np.isfinite(sstats["critic_loss"]), sstats
     print("  recurrent encoder OK (training posterior = online GRU state; "
           "short windows refused; meta-arm update finite)")
 
@@ -826,8 +960,10 @@ def check_branched_rollouts_and_pool():
         return
     t0 = time.time()
     pool = RolloutPool("saferl", 2, sensor_model=env.sensor_model)
+    sched = [("feed_gain", 50, 1.3, 1)]
     try:
         par = pool.run(agent, tasks, faults, onset, "mean")
+        far = pool.collect_async(agent, [(0, tasks[0], sched, 123)])[0].result()
     finally:
         pool.close()
     ser = [branched_rollouts(env, agent, t, faults, onset, index=i)
@@ -836,7 +972,22 @@ def check_branched_rollouts_and_pool():
         for a_, b_ in zip(a_rows, b_rows):
             assert a_["violations"] == b_["violations"]
             assert np.isclose(a_["on_spec_ethanol"], b_["on_spec_ethanol"])
-    print(f"  branched rollouts and worker pool OK ({time.time() - t0:.0f}s)")
+    # A training episode collected in a worker is the in-process one (both
+    # on one torch thread), and lands in the replay the same way. (Last: an
+    # in-process episode moves this agent's normalisers.)
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        near = collect_episode_record(env, agent, 0, tasks[0], sched, 123)
+    finally:
+        torch.set_num_threads(threads)
+    assert far["steps"] == near["steps"], (far["steps"], near["steps"])
+    assert np.isclose(far["reward"], near["reward"]), (far["reward"], near["reward"])
+    rep = MultiTaskReplayBuffer(STATE_DIM, ACTION_DIM)
+    ingest_episode_record(agent, rep, far)
+    assert rep.size(0) == far["steps"] == len(far["transitions"])
+    print(f"  branched rollouts and worker pool OK ({time.time() - t0:.0f}s; "
+          f"a worker-collected training episode equals the in-process one)")
 
 
 def check_selection_logic():
@@ -873,6 +1024,8 @@ def main():
     check_privileged_state_and_sensors()
     check_fault_coverage(ref_info)
     check_magnitudes_in_support()
+    check_fault_patterns()
+    check_scheduling_and_storage_faults()
     check_agent_shapes_and_modes()
     check_recurrent_encoder()
     check_warm_start_and_gate()

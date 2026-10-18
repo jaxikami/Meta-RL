@@ -5,19 +5,28 @@ import copy
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
 import numpy as np
+import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from metarl.env.config import standardize_context, N_REACTORS, CTX_GAIN
 from metarl.env.layout import ACTION_DIM, ACTION_DIM_PER_REACTOR
 from metarl.training.config import CONSTRAINT_NAMES, DEPTH_CONSTRAINTS
 from metarl.training.tasks import (resolve_reactor, as_fault_schedule,
+                                   apply_fault_schedule,
                                    maybe_schedule_disturbance)
 
 
 def collect_rollout(env, agent, replay, task_id, task, add_to_replay=True,
-                    disturb=False, rng=None, strat=None, patterns=None):
-    """Run one stochastic training episode; returns (reward, violations, steps)."""
-    if disturb:
+                    disturb=False, rng=None, strat=None, patterns=None,
+                    schedule=None):
+    """Run one stochastic training episode; returns (reward, violations, steps).
+
+    ``schedule`` (any ``as_fault_schedule`` form, [] for none) installs a
+    fault schedule drawn elsewhere; otherwise ``disturb`` draws one here.
+    """
+    if schedule is not None:
+        apply_fault_schedule(env, schedule)
+    elif disturb:
         maybe_schedule_disturbance(env, rng=rng, task_id=task_id, strat=strat,
                                    patterns=patterns)
     else:
@@ -60,6 +69,68 @@ def collect_rollout(env, agent, replay, task_id, task, add_to_replay=True,
     return total_r, total_v, steps
 
 
+class TransitionRecorder:
+    """Stands in for a replay buffer: keeps ``add``'s arguments in order."""
+
+    def __init__(self, priv_dim=0):
+        self.priv_dim = int(priv_dim)
+        self.items = []
+
+    def add(self, *args, **kwargs):
+        self.items.append((args, kwargs))
+
+
+def collect_episode_record(env, agent, task_id, task, schedule, seed):
+    """One training episode, recorded for another process's replay buffer.
+
+    Seeds this process's NumPy and torch generators and the instrument-noise
+    stream from ``seed``, so the episode is a function of its arguments.
+
+    Returns:
+        Dict with reward / violations / steps, the recorded ``transitions``
+        (``replay.add`` arguments), the visited ``obs`` / ``next_obs`` and
+        ``rewards`` (for the normalisers), and the shield's raw counters.
+    """
+    np.random.seed(int(seed) % (2 ** 32))
+    torch.manual_seed(int(seed))
+    prev_key = getattr(env, "sensor_stream_key", None)
+    env.sensor_stream_key = ("train", int(seed))
+    agent.proj_stats(reset=True)
+    rec = TransitionRecorder(priv_dim=getattr(agent, "critic_privileged_dim", 0))
+    try:
+        r, v, steps = collect_rollout(env, agent, rec, task_id, task,
+                                      schedule=list(schedule))
+    finally:
+        env.sensor_stream_key = prev_key
+    obs = np.stack([a[1] for a, _ in rec.items])
+    next_obs = np.stack([a[4] for a, _ in rec.items])
+    proj = (agent._proj_calls, agent._proj_noop, agent._proj_steps,
+            agent._proj_moved)
+    agent.proj_stats(reset=True)
+    return {"reward": r, "violations": v, "steps": steps,
+            "transitions": rec.items, "obs": obs, "next_obs": next_obs,
+            "rewards": [float(a[3]) for a, _ in rec.items], "proj": proj}
+
+
+def ingest_episode_record(agent, replay, rec):
+    """Add a ``collect_episode_record`` result to ``replay`` and ``agent``.
+
+    Exactly what ``collect_rollout`` does in-process after its episode: the
+    transitions, then the reward and observation normalisers, then the
+    shield's counters.
+    """
+    for args, kwargs in rec["transitions"]:
+        replay.add(*args, **kwargs)
+    agent.observe_rewards(rec["rewards"])
+    agent.observe_obs(rec["obs"], next_observations=rec["next_obs"])
+    calls, noop, steps, moved = rec["proj"]
+    agent._proj_calls += calls
+    agent._proj_noop += noop
+    agent._proj_steps += steps
+    agent._proj_moved += moved
+    return rec["reward"], rec["violations"], rec["steps"]
+
+
 def sensor_stream_key(task, disturbance=None, index=0):
     """Content-addressed instrument-noise stream id for a deterministic episode.
 
@@ -73,6 +144,7 @@ def sensor_stream_key(task, disturbance=None, index=0):
     dist = ("none",) if not sched else tuple(
         (str(d["kind"]), int(d["onset"]), round(float(d["magnitude"]), 12),
          -1 if d["reactor"] is None else int(d["reactor"]))
+        + (() if d["end"] is None else (int(d["end"]),))
         for d in sched)
     return ("det", ctx, dist)
 
@@ -82,10 +154,7 @@ CONSTRAINT_IDS = tuple(CONSTRAINT_NAMES)
 
 def _start_episode(env, agent, task, disturbance, stream_key, index=0):
     """Install a task and its faults, reset the plant and the posterior."""
-    env.clear_disturbances()
-    for d in as_fault_schedule(disturbance, index):
-        env.schedule_disturbance(d["kind"], d["onset"], d["magnitude"],
-                                 reactor=d["reactor"])
+    apply_fault_schedule(env, disturbance, index)
     env.set_task(task)
     env.sensor_stream_key = stream_key
     state = env.reset()

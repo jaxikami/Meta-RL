@@ -11,7 +11,9 @@ import numpy as np
 from metarl.env.config import N_REACTORS
 from metarl.env.layout import ACTION_DIM_PER_REACTOR
 from metarl.training.config import (SEED, EVAL_EPISODES, EVAL_Z_MODE,
-                                    EVAL_DISTURBANCES, EVAL_FAULT_SCENARIOS,
+                                    EVAL_DISTURBANCES, FAULT_PATTERNS,
+                                    EVAL_SPIKE_H, EVAL_GRADUAL_H,
+                                    EVAL_RECURRENT_WINDOWS, META_DRIFT_TREADS,
                                     CONSTRAINT_NAMES, DEPTH_CONSTRAINTS,
                                     Z_INFORM_MIN_SNR, LOG_DIR, PLOT_DIR,
                                     DISTURB_PROBES)
@@ -19,14 +21,15 @@ from metarl.training.arms import (ARMS, ARM_ORDER, CONTRASTS, active_arms,
                                   arm_paths, _build_agent,
                                   _load_preferring_best)
 from metarl.training.tasks import (seed_everything, make_env, make_task_pool,
-                                   as_fault_schedule)
+                                   as_fault_schedule, pattern_schedule)
 from metarl.training.rollouts import rollout_deterministic
 from metarl.training.metrics import (latent_separability, gate_opening,
                                      gate_opening_in_stage, _finite_mean,
                                      _paired_delta, _verdict_sign, _fmt_delta,
                                      _fmt_delta_sci)
 from metarl.training.logs import _json_default
-from metarl.training.plots import _plot_comparison, plot_training_curves
+from metarl.training.plots import (_plot_comparison, plot_training_curves,
+                                   scenario_probe)
 
 
 def _recovery_metrics(reward_traj, viol_traj, onset_outer, win=10):
@@ -210,19 +213,28 @@ def _eval_agent_on_tasks(env, agent, tasks, disturbance=None, z_mode=None,
     return out
 
 
-def eval_fault_scenarios(onset):
+def eval_fault_scenarios(onset, horizon=None):
     """The disturbed evaluation scenarios, exactly as ``evaluate`` runs them.
 
+    Every EVAL_DISTURBANCES kind under every FAULT_PATTERNS entry, named
+    "<label>_<pattern>"; step, spike and gradual start at ``onset``.
+
+    Args:
+        onset: First inner step of the step / spike / gradual patterns.
+        horizon: Episode length in inner steps (default ``2 * onset``).
+
     Returns:
-        Dict scenario name -> fault spec (a dict or a list of tuples; "rotate"
-        reactors resolve per episode).
+        Dict scenario name -> list of fault dicts ("rotate" reactors resolve
+        per episode).
     """
+    horizon = 2 * int(onset) if horizon is None else int(horizon)
     out = {}
-    for name, d in EVAL_DISTURBANCES.items():
-        out[name] = {"kind": d["kind"], "onset": onset,
-                     "magnitude": d["magnitude"], "reactor": d["reactor"]}
-    for name, sched in EVAL_FAULT_SCENARIOS.items():
-        out[name] = list(sched)
+    for label, d in EVAL_DISTURBANCES.items():
+        for pattern in FAULT_PATTERNS:
+            out[f"{label}_{pattern}"] = pattern_schedule(
+                d["kind"], d["magnitude"], pattern, onset, d["reactor"],
+                horizon, spike_h=EVAL_SPIKE_H, gradual_h=EVAL_GRADUAL_H,
+                treads=META_DRIFT_TREADS, windows=EVAL_RECURRENT_WINDOWS)
     return out
 
 
@@ -255,13 +267,13 @@ def evaluate():
         "in_distribution": {"tasks": id_tasks, "dist": None},
         "out_of_distribution": {"tasks": ood_tasks, "dist": None},
     }
-    for name, dist in eval_fault_scenarios(onset).items():
+    for name, dist in eval_fault_scenarios(onset, env.max_steps).items():
         scenarios[name] = {"tasks": id_tasks, "dist": dist}
 
     results = {}
     for name, sc in scenarios.items():
         print(f"[eval] {name} ...")
-        probe = name if name in DISTURB_PROBES else None
+        probe = scenario_probe(name)
         results[name] = {
             arm: _eval_agent_on_tasks(envs[arm], agents[arm], sc["tasks"],
                                       sc["dist"], trace_probe=probe)

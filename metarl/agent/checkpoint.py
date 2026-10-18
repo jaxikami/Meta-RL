@@ -95,6 +95,8 @@ class CheckpointMixin:
             ckpt["encoder"] = self.encoder.state_dict()
         if self.aux is not None:
             ckpt["aux"] = self.aux.state_dict()
+        if self.fault_head is not None:
+            ckpt["fault_head"] = self.fault_head.state_dict()
         if self.adapt_gate:
             ckpt["base_actor"] = self.base_actor.state_dict()
             ckpt["gate"] = self.gate.state_dict()
@@ -172,6 +174,8 @@ class CheckpointMixin:
             else:
                 print(f"[info] {path}: its aux head predicts a different "
                       f"target width; aux head not loaded")
+        if self.fault_head is not None and "fault_head" in ckpt:
+            self.fault_head.load_state_dict(ckpt["fault_head"])
         if self.adapt_gate:
             if "base_actor" not in ckpt or "gate" not in ckpt:
                 raise ValueError(

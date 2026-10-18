@@ -90,7 +90,8 @@ from metarl.training.tasks import (make_env, make_task_pool, resolve_reactor,
                                    maybe_schedule_disturbance,
                                    pattern_schedule, apply_fault_schedule)
 from metarl.training.evaluate import eval_fault_scenarios
-from metarl.training.rollouts import (collect_rollout, sensor_stream_key,
+from metarl.training.rollouts import (collect_rollout, rollout_deterministic,
+                                      sensor_stream_key,
                                       _start_episode, _advance,
                                       _episode_metrics, branched_rollouts,
                                       collect_episode_record,
@@ -868,6 +869,55 @@ def check_warm_start_and_gate():
         assert all(torch.equal(p0, p) for p0, p in zip(a0, agent.actor.parameters()))
         st = agent.update(replay, meta_batch=1, batch_size=16, context_size=CTX)
         assert np.isfinite(st["actor_loss"]) and np.isfinite(st["gate_loss"])
+        # Open training gate: a training rollout acts through the actor on
+        # every step, faulted or not (the detector itself is still shut),
+        # leaves no floor behind, and the update trains the fault-kind head;
+        # a deterministic rollout acts through the learned gate.
+        teach = _ctx_agent(adapt_gate=True, train_gate_open=True,
+                           fault_cls_weight=1.0, encoder_update_every=3)
+        teach.warm_start_from(path, anchor_weight=1.0)
+        seen = []
+        act_fn = teach.select_action
+
+        def spy(state, deterministic=False):
+            out = act_fn(state, deterministic=deterministic)
+            seen.append((deterministic, env.fault_kind() > 0, teach.last_gate))
+            return out
+
+        teach.select_action = spy
+        treplay = MultiTaskReplayBuffer(STATE_DIM, ACTION_DIM,
+                                        priv_dim=PRIVILEGED_STATE_DIM)
+        for _ in range(2):
+            collect_rollout(env, teach, treplay, 0, sample_task(rng),
+                            schedule=[("leak", 20, 0.01, 0)])
+        assert teach.gate_floor is None, "training gate floor left set"
+        train_steps = [(f, g) for det, f, g in seen if not det]
+        assert any(f for f, _ in train_steps) and any(not f for f, _ in train_steps)
+        assert all(g == 1.0 for _, g in train_steps), "training gate not open"
+        seen.clear()
+        rollout_deterministic(env, teach, sample_task(rng),
+                              disturbance=[("leak", 20, 0.01, 0)])
+        assert seen and all(g < 1e-3 for _, _, g in seen),             "a deterministic rollout acted through the training gate"
+        del teach.select_action
+        # The encoder steps on every third update only.
+        e0 = [p.detach().clone() for p in teach.encoder.parameters()]
+        for _ in range(2):
+            st = teach.update(treplay, meta_batch=1, batch_size=16,
+                              context_size=CTX)
+        assert all(torch.equal(p0, p)
+                   for p0, p in zip(e0, teach.encoder.parameters())),             "the encoder stepped off its interval"
+        st = teach.update(treplay, meta_batch=1, batch_size=16, context_size=CTX)
+        assert not all(torch.equal(p0, p)
+                       for p0, p in zip(e0, teach.encoder.parameters()))
+        assert np.isfinite(st["actor_loss"]) and st["fault_cls_loss"] > 0.0
+        tp = os.path.join(d, "open_gate.pth")
+        teach.save(tp)
+        t2 = _ctx_agent(adapt_gate=True, train_gate_open=True,
+                        fault_cls_weight=1.0)
+        t2.load(tp)
+        for t_a, t_b in zip(teach.fault_head.state_dict().values(),
+                            t2.fault_head.state_dict().values()):
+            assert torch.equal(t_a.cpu(), t_b.cpu()), "fault head"
         # Checkpoints and rollout weights carry the base and the gate.
         p = os.path.join(d, "gated.pth")
         agent.save(p)
@@ -889,8 +939,10 @@ def check_warm_start_and_gate():
         else:
             raise AssertionError("warm start across architectures accepted")
     print("  warm start and adaptation gate OK (source policy and critics for "
-          "every z; shut gate = source, open = actor; held actor; gated "
-          "checkpoints and rollout weights)")
+          "every z; shut gate = source, open = actor; held actor; training "
+          "rollouts act through the actor, deterministic ones through the "
+          "gate; fault-kind head; encoder step interval; gated checkpoints "
+          "and rollout weights)")
 
 
 def check_shield():

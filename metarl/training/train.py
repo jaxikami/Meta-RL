@@ -22,6 +22,7 @@ from metarl.agent.common import LATENT_DIM, device
 from metarl.agent.replay import MultiTaskReplayBuffer
 from metarl.training.config import (SEED, N_TRAIN_TASKS, META_ITERATIONS,
                                     COLLECT_EPISODES_PER_ITER,
+                                    META_COLLECT_EPISODES_PER_ITER,
                                     UPDATES_PER_ITER, META_BATCH, BATCH_SIZE,
                                     MIN_BUFFER, CONTEXT_SIZE,
                                     WARMUP_EPISODES_PER_TASK,
@@ -73,6 +74,8 @@ def _train(arm):
     """
     spec = get_arm(arm)
     label, use_context = spec.label, spec.use_context
+    n_collect = (META_COLLECT_EPISODES_PER_ITER if spec.multitask
+                 else COLLECT_EPISODES_PER_ITER)
     seed_everything(SEED)
     env = make_env(lagrangian=spec.lagrangian,
                    sensor_model=(spec.train_sensor_noise
@@ -185,7 +188,16 @@ def _train(arm):
             print(f"  adaptation gate: {spec.warm_start}'s policy acts until "
                   f"a detector on z (fitted to the privileged fault flag, "
                   f"weight {GATE_LOSS_WEIGHT:g}) opens it; sharpness "
-                  f"{GATE_SHARPNESS:g}")
+                  f"{GATE_SHARPNESS:g}"
+                  + ("; training rollouts act through the actor everywhere "
+                     "(gate open)" if agent.train_gate_open else ""))
+        if agent.fault_head is not None:
+            print(f"  fault-kind classifier on z: class-balanced, weight "
+                  f"{agent.fault_cls_weight:g} (privileged target, training "
+                  f"only)")
+        if spec.use_context:
+            print(f"  {n_collect} episodes per iteration; encoder steps on "
+                  f"1 update in {agent.encoder_update_every}")
 
     no_regress = bool(spec.warm_start)
     ref_score = None
@@ -220,7 +232,8 @@ def _train(arm):
                   + "; judged there against it by NO_REGRESS instead")
 
     log_keys = ("iter", "avg_reward", "avg_violations", "critic_loss",
-                "actor_loss", "kl", "aux_loss", "map_loss", "anchor_loss",
+                "actor_loss", "kl", "aux_loss", "fault_cls_loss", "map_loss",
+                "anchor_loss",
                 "alpha", "anchor_gap_nominal", "anchor_gap_fault",
                 "gate_loss", "gate_nominal", "gate_fault", "hold_loss", "stall_frac",
                 "z_norm", "proj_noop_frac", "proj_mean_steps",
@@ -345,7 +358,7 @@ def _train(arm):
         # updates (in the workers, concurrently with them) and enter the
         # replay after them.
         started = start_collection([int(np.random.randint(len(pool)))
-                                    for _ in range(COLLECT_EPISODES_PER_ITER)])
+                                    for _ in range(n_collect)])
         if started[1] is None:
             for r, v in finish_collection(*started):
                 reward_hist.append(r)
@@ -458,6 +471,7 @@ def _train(arm):
                           ("critic_loss", stats["critic_loss"]),
                           ("actor_loss", stats["actor_loss"]),
                           ("kl", stats["kl"]), ("aux_loss", stats["aux_loss"]),
+                          ("fault_cls_loss", stats.get("fault_cls_loss", 0.0)),
                           ("map_loss", stats.get("map_loss", 0.0)),
                           ("anchor_loss", stats.get("anchor_loss", 0.0)),
                           ("anchor_gap_nominal",

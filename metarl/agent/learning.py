@@ -210,6 +210,9 @@ class LearningMixin:
         ready = [t for t in replay.task_ids() if replay.size(t) >= thresh]
         if not ready:
             return None
+        self._n_updates += 1
+        step_encoder = (self.use_context
+                        and self._n_updates % self.encoder_update_every == 0)
         tasks = np.random.choice(ready, size=min(meta_batch, len(ready)),
                                  replace=False)
 
@@ -225,7 +228,11 @@ class LearningMixin:
                               for i in range(4))
             lo = _as_long(np.concatenate([p[2] for p in parts]))
             hi = _as_long(np.concatenate([p[3] for p in parts]))
-            mu, sigma_sq = self._window_posterior(rows, lo, hi)
+            # The encoder steps on one update in ``encoder_update_every``;
+            # between, its posterior is read without a graph (the heads still
+            # train on it).
+            with torch.set_grad_enabled(step_encoder):
+                mu, sigma_sq = self._window_posterior(rows, lo, hi)
             std = torch.sqrt(torch.clamp(sigma_sq, min=1e-8))
             z = mu + std * torch.randn_like(std)
             kl = 0.5 * torch.sum(
@@ -247,20 +254,25 @@ class LearningMixin:
             r = r / self.ret_rms.std
         r = r * self.reward_scale
 
-        gate_open = None
+        # gate_open: the learned detector's opening (what deployment acts
+        # through); gate_act: the opening the training rollouts acted through
+        # (fully open under train_gate_open).
+        gate_open = gate_act = None
         if self.adapt_gate:
             with torch.no_grad():
                 gate_open = self._gate_open(self.gate, z.detach())
+                gate_act = (torch.ones_like(gate_open) if self.train_gate_open
+                            else gate_open)
 
         # ── 1. Critic (+ encoder + KL + auxiliary + gate detector) ───────────
         with torch.no_grad():
-            a2, logp2, _ = self._safe_sample(o2, z.detach(), gate=gate_open)
+            a2, logp2, _ = self._safe_sample(o2, z.detach(), gate=gate_act)
             q1_t, q2_t = self.critic_target(
                 o2, a2, self._critic_cond(z.detach(), ctx_true, priv2))
             entropy_term = torch.clamp(self.alpha.detach() * logp2,
                                        -ENTROPY_TERM_CLIP, ENTROPY_TERM_CLIP)
-            if gate_open is not None:
-                entropy_term = gate_open * entropy_term
+            if gate_act is not None:
+                entropy_term = gate_act * entropy_term
             target = r + (1.0 - d) * self.gamma * (
                 torch.min(q1_t, q2_t) - entropy_term)
         # z is NOT detached here: this is the encoder's Bellman gradient.
@@ -304,6 +316,20 @@ class LearningMixin:
             gate_loss = F.binary_cross_entropy_with_logits(self.gate(mu),
                                                            gate_target)
 
+        # Which fault kind acts (0: none), from the posterior mean. Each class
+        # present in the batch weighs the same, so the rare kinds shape the
+        # encoder as much as the undisturbed majority.
+        fault_cls_loss = torch.zeros((), device=device)
+        if self.fault_head is not None:
+            k = self.fault_head.net[-1].out_features
+            tgt = fault_code.long().clamp(0, k - 1)
+            ce = F.cross_entropy(self.fault_head(mu), tgt, reduction="none")
+            onehot = F.one_hot(tgt, k).to(ce.dtype)
+            count = onehot.sum(dim=0)
+            per_class = (onehot * ce.unsqueeze(-1)).sum(dim=0) / count.clamp(min=1.0)
+            present = (count > 0).to(ce.dtype)
+            fault_cls_loss = (per_class * present).sum() / present.sum()
+
         critic_obj = critic_loss
         if self.use_context:
             critic_obj = critic_obj + self.kl_lambda * kl
@@ -313,13 +339,16 @@ class LearningMixin:
         if self.adapt_gate:
             critic_obj = critic_obj + self.gate_weight * gate_loss
             self.gate_opt.zero_grad()
+        if self.fault_head is not None:
+            critic_obj = critic_obj + self.fault_cls_weight * fault_cls_loss
+            self.fault_head_opt.zero_grad()
         self.critic_opt.zero_grad()
-        if self.use_context:
+        if step_encoder:
             self.encoder_opt.zero_grad()
         critic_obj.backward()
         nn.utils.clip_grad_norm_(self.critic.parameters(), 5.0)
         self.critic_opt.step()
-        if self.use_context:
+        if step_encoder:
             nn.utils.clip_grad_norm_(self.encoder.parameters(), 5.0)
             self.encoder_opt.step()
         if self.aux is not None:
@@ -328,6 +357,9 @@ class LearningMixin:
         if self.adapt_gate:
             nn.utils.clip_grad_norm_(self.gate.parameters(), 5.0)
             self.gate_opt.step()
+        if self.fault_head is not None:
+            nn.utils.clip_grad_norm_(self.fault_head.parameters(), 5.0)
+            self.fault_head_opt.step()
 
         actor_loss = torch.full((), float("nan"), device=device)
         alpha_loss = torch.zeros((), device=device)
@@ -339,13 +371,13 @@ class LearningMixin:
         if train_actor:
             # ── 2. Actor (z detached; the actor does not shape inference) ─────
             zd = z.detach()
-            w_gate = (None if gate_open is None
-                      else gate_open / gate_open.sum().clamp(min=1.0))
+            w_gate = (None if gate_act is None
+                      else gate_act / gate_act.sum().clamp(min=1.0))
 
             def batch_mean(x):
                 return x.mean() if w_gate is None else (w_gate * x).sum()
 
-            a_pi, logp_pi, n_active = self._safe_sample(o, zd, gate=gate_open)
+            a_pi, logp_pi, n_active = self._safe_sample(o, zd, gate=gate_act)
             q1_pi, q2_pi = self.critic(o, a_pi,
                                        self._critic_cond(zd, ctx_true, priv))
             actor_loss = batch_mean(self.alpha.detach() * logp_pi
@@ -369,7 +401,7 @@ class LearningMixin:
             # ── 2c. Anchor to the warm-start policy ──────────────────────────
             if self.anchor_actor is not None and self._anchor_active():
                 anchor_pen, gap_nominal, gap_fault = self._anchor_terms(
-                    o, zd, fault_code, gate=gate_open, weight=w_gate,
+                    o, zd, fault_code, gate=gate_act, weight=w_gate,
                     stall=stall_any if self.hold_penalty_weight > 0.0 else None)
                 actor_loss = actor_loss + anchor_pen
 
@@ -434,6 +466,7 @@ class LearningMixin:
             "alpha_loss": float(alpha_loss.detach()),
             "kl": float(kl.detach()),
             "aux_loss": float(aux_loss.detach()),
+            "fault_cls_loss": float(fault_cls_loss.detach()),
             "map_loss": float(map_pen.detach()),
             "anchor_loss": float(anchor_pen.detach()),
             "hold_loss": float(hold_pen.detach()),

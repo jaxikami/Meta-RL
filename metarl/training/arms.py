@@ -19,7 +19,9 @@ from metarl.training.config import (APN_PENALTY_WEIGHT, SEED, INCLUDE_BASELINE,
                                     POLICY_DIR, ALPHA_MIN, META_KL_LAMBDA,
                                     META_ENCODER_LR, GATE_LOSS_WEIGHT,
                                     GATE_SHARPNESS, GATE_INIT_BIAS,
-                                    META_EXPLORE_NOISE_BETA)
+                                    META_EXPLORE_NOISE_BETA,
+                                    META_TRAIN_GATE_OPEN, META_FAULT_CLS_WEIGHT,
+                                    META_ENCODER_UPDATE_EVERY)
 
 
 class ArmSpec:
@@ -173,7 +175,12 @@ def _build_agent(env, arm, train_apn_if_missing=False):
                       gate_init_bias=GATE_INIT_BIAS,
                       explore_noise_beta=META_EXPLORE_NOISE_BETA,
                       aux_state_targets=(META_AUX_STATE_TARGETS
-                                         if AUX_MODE == "task" else None))
+                                         if AUX_MODE == "task" else None),
+                      fault_cls_weight=(META_FAULT_CLS_WEIGHT if spec.multitask
+                                        else 0.0),
+                      train_gate_open=META_TRAIN_GATE_OPEN,
+                      encoder_update_every=(META_ENCODER_UPDATE_EVERY
+                                            if spec.multitask else 1))
     return PEARLAgent(env.stateDim, env.actionDim,
                       use_context=spec.use_context, **kwargs)
 

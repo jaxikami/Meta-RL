@@ -42,28 +42,36 @@ def collect_rollout(env, agent, replay, task_id, task, add_to_replay=True,
                   and getattr(replay, "priv_dim", 0) > 0)
     priv = env.privileged_state() if store_priv else None
     done = False
-    while not done:
-        acted_on.append(state)
-        # Privileged: whether (and which) fault had acted before this action.
-        fault = env.fault_kind()
-        safe_a, _ = agent.select_action(state, deterministic=False)
-        next_state, r, done, info = env.step(safe_a)
-        if add_to_replay and replay is not None:
-            # The EFFECTIVE context after this step, clipped (a fired leak is
-            # many prior SDs away).
-            ctx_true = np.clip(
-                standardize_context(env.get_effective_context()), -6.0, 6.0)
-            next_priv = env.privileged_state() if store_priv else None
-            replay.add(task_id, state, safe_a, r, next_state, done, ctx_true,
-                       fault=fault, priv=priv, next_priv=next_priv)
-            priv = next_priv
-        agent.update_context(state, safe_a, r, next_state)
-        led_to.append(next_state)
-        state = next_state
-        total_r += r
-        total_v += int(info["violation_count"])
-        step_rewards.append(r)
-        steps += 1
+    # Training rollouts of train_gate_open act through the actor everywhere.
+    if getattr(agent, "train_gate_open", False):
+        agent.gate_floor = 1.0
+    try:
+        while not done:
+            acted_on.append(state)
+            # Privileged: whether (and which) fault had acted before this
+            # action.
+            fault = env.fault_kind()
+            safe_a, _ = agent.select_action(state, deterministic=False)
+            next_state, r, done, info = env.step(safe_a)
+            if add_to_replay and replay is not None:
+                # The EFFECTIVE context after this step, clipped (a fired leak
+                # is many prior SDs away).
+                ctx_true = np.clip(
+                    standardize_context(env.get_effective_context()), -6.0, 6.0)
+                next_priv = env.privileged_state() if store_priv else None
+                replay.add(task_id, state, safe_a, r, next_state, done,
+                           ctx_true, fault=fault, priv=priv,
+                           next_priv=next_priv)
+                priv = next_priv
+            agent.update_context(state, safe_a, r, next_state)
+            led_to.append(next_state)
+            state = next_state
+            total_r += r
+            total_v += int(info["violation_count"])
+            step_rewards.append(r)
+            steps += 1
+    finally:
+        agent.gate_floor = None
     agent.observe_rewards(step_rewards)
     agent.observe_obs(np.stack(acted_on), next_observations=np.stack(led_to))
     return total_r, total_v, steps
@@ -154,6 +162,7 @@ CONSTRAINT_IDS = tuple(CONSTRAINT_NAMES)
 
 def _start_episode(env, agent, task, disturbance, stream_key, index=0):
     """Install a task and its faults, reset the plant and the posterior."""
+    agent.gate_floor = None
     apply_fault_schedule(env, disturbance, index)
     env.set_task(task)
     env.sensor_stream_key = stream_key

@@ -232,6 +232,8 @@ class ActingMixin:
                                           with_logprob=False, noise=noise)
             if self.adapt_gate:
                 g = self._gate_open(self._gate_r, z)
+                if self.gate_floor is not None:
+                    g = torch.clamp(g, min=float(self.gate_floor))
                 raw = self._gated(self._base_action(self._base_r, obs, z),
                                   raw, g)
                 self.last_gate = float(g)

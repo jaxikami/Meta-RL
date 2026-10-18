@@ -340,6 +340,50 @@ with these plant-specific settings:
   `turnaround_delay@3.5` and `storage_capacity@0.88`) and the latent gate
   still use step faults.
 
+### Why `meta` tied `saferl`, and the training fixes
+
+The first run on the 38-scenario grid had `meta` beat `saferl` on 6
+scenarios, lose on 2 and tie the rest; its held-out panel hardly moved over
+1170 iterations. Probes on its checkpoint traced this to the latent, not the
+actor's capacity:
+
+- **z did not register most faults.** 200 h after onset the aux head decoded
+  kinetic activity 0.95 (true 0.2), storage capacity 0.997 (true 0.90) and
+  feed concentration 0.92 (true 0.56), so the gate stayed shut and `saferl`
+  acted. Forcing the gate open at onset changed nothing but leak.
+- **The encoder memorised the replay.** At 3 episodes per iteration and an
+  encoder step on every update, each stored transition fed ~140 encoder
+  steps. On its own batches the gate opened on 85–90% of faulted steps; on
+  fresh episodes of the same distribution, 1–50% by kind.
+- **The executed action told the encoder whether the gate was open**
+  (exploration noise passes only an open gate), so detection fed on the gate
+  itself. A gate opened on the privileged fault flag leaks that flag the
+  same way.
+
+The fixes (`config.py`; `meta` only, `saferl` is untouched):
+
+| setting | value | effect |
+|---|---|---|
+| `META_TRAIN_GATE_OPEN` | True | training rollouts and the update act through the actor on every step; held-out checks and evaluation through the learned gate |
+| `META_FAULT_CLS_WEIGHT` | 1.0 | class-balanced fault-kind head on z (privileged target, training only) |
+| `META_DISTURB_PROB` | 0.45 → 0.7 | ~2% → ~4% of the replay per fault kind |
+| `META_COLLECT_EPISODES_PER_ITER` | 9 | collected in parallel in the worker pool |
+| `META_ENCODER_UPDATE_EVERY` | 3 | with the above, ~15 encoder steps per stored transition |
+
+Retrained against the same `saferl` (run tags `v2`, selected check, and
+`v2final`, final checkpoint at early stop), 100 paired tasks per scenario:
+the final checkpoint beats `saferl` on 7 of 38 scenarios and loses none,
+with no output cost anywhere. Violations per episode, `saferl` → `meta`:
+`leak_step` 4.07 → 2.21, `leak_recurrent` 4.41 → 2.97 (+1.8% on-spec
+ethanol), `dilution_step` 66.1 → 55.6, `dilution_recurrent` 34.4 → 32.0,
+`toxin_step` 9.18 → 6.89, `downstream_rate_recurrent` 11.4 → 9.27,
+`turnaround_delay_recurrent` 1.31 → 0.97 (+2.3%). The `storage_capacity`
+rows stay tied (~100–117 overflow hours): the lowered wall shows only
+through the overflow penalty, and the gate opens 0.05–0.2 there. Selection
+picked iteration 590 on one high 10-task undisturbed ethanol reading, which
+also stopped training early; the final checkpoint (≈1090) is better on the
+faults (5 wins at 590).
+
 Figures (`results/plot/[tag]/`) are the lean set (`compare_safety`,
 `compare_episodes_violated`, `compare_production`, `compare_quality`,
 `compare_adapt`, `violation_mix_*`, `violation_severity`, `distributions`,

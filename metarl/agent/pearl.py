@@ -86,7 +86,9 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
                  adapt_gate=False, gate_weight=1.0, gate_sharpness=2.0,
                  gate_init_bias=-4.0, explore_noise_beta=0.0,
                  aux_state_targets=None, critic_token_hidden=256,
-                 mixer_layers=2, mixer_heads=4, encoder_hidden=256):
+                 mixer_layers=2, mixer_heads=4, encoder_hidden=256,
+                 fault_cls_weight=0.0, train_gate_open=False,
+                 encoder_update_every=1):
         """Initialise the agent.
 
         Arguments are the lean agent's, plus the token networks' shape:
@@ -96,6 +98,19 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         ``mixer_heads`` the self-attention blocks across reactors, and
         ``encoder_hidden`` the GRU width. See ``MetaRL_Lean/agent_pearl.py``
         for every other argument.
+
+        Two training-only aids for the gated arm: ``fault_cls_weight`` > 0
+        adds a head that classifies the acting fault kind from the posterior
+        mean (class-balanced cross-entropy, privileged like the aux task
+        target), whose gradient trains the encoder to tell the kinds apart;
+        ``train_gate_open`` acts through the actor on every step of a training
+        rollout and of the update (the gate fully open), so the actor explores
+        and learns on every faulted step, not only where the detector already
+        fires, and the executed actions carry nothing about the gate for the
+        encoder to read. Deterministic rollouts (held-out checks, evaluation)
+        always act through the learned gate. ``encoder_update_every`` steps
+        the encoder on one update in that many (the heads and critics on
+        every one), so it revisits each stored episode fewer times.
         """
         if float(explore_noise_beta) < 0.0:
             raise ValueError(f"explore_noise_beta must be >= 0, got "
@@ -135,6 +150,10 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         self.gate_weight = float(gate_weight)
         self.gate_sharpness = float(gate_sharpness)
         self.gate_override = None
+        self.train_gate_open = bool(train_gate_open) and self.adapt_gate
+        # Lower bound on the gate in a training rollout (1.0 under
+        # ``train_gate_open``); None in every other rollout.
+        self.gate_floor = None
         # Hold rule (training only): penalty weight on opening the outlet of a
         # below-spec batch, its margin, and whether stalls also train the gate.
         self.hold_penalty_weight = 0.0
@@ -242,7 +261,13 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
                                + len(self.aux_state_targets),
                                mode="task").to(device)
 
-        # The encoder and aux head stay on plain Adam: the KL bottleneck
+        # Fault-kind classifier on z: logits over "no fault" and every kind.
+        self.fault_cls_weight = float(fault_cls_weight) if use_context else 0.0
+        self.fault_head = (AuxHead(self._z_dim, N_DISTURBANCE_KINDS + 1,
+                                   mode="task").to(device)
+                           if self.fault_cls_weight > 0.0 else None)
+
+        # The encoder and aux heads stay on plain Adam: the KL bottleneck
         # already regularises the encoder.
         self.weight_decay = float(weight_decay)
         self.actor_opt = _adamw(self.actor, lr, self.weight_decay)
@@ -251,6 +276,14 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
             self.encoder.parameters(), lr=encoder_lr if encoder_lr else lr)
         self.aux_opt = (torch.optim.Adam(self.aux.parameters(), lr=lr)
                         if self.aux is not None else None)
+        self.fault_head_opt = (torch.optim.Adam(self.fault_head.parameters(),
+                                                lr=lr)
+                               if self.fault_head is not None else None)
+        if int(encoder_update_every) < 1:
+            raise ValueError(f"encoder_update_every must be >= 1, got "
+                             f"{encoder_update_every}")
+        self.encoder_update_every = int(encoder_update_every)
+        self._n_updates = 0
 
         # Set by warm_start_from (see the lean agent).
         self.anchor_actor = None

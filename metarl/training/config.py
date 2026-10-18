@@ -22,6 +22,16 @@ INCLUDE_BASELINE = False
 N_TRAIN_TASKS = 12
 META_ITERATIONS = int(os.environ.get("PLANT_META_ITERS", 4000))
 COLLECT_EPISODES_PER_ITER = 3
+# The meta arm's episodes per iteration and how often its encoder steps.
+# At 3 episodes and an encoder step on every update, each stored transition
+# fed ~140 encoder steps and the encoder memorised the replay: on its own
+# batches it named the fault kind almost perfectly (class-balanced loss 0.08,
+# gate open on 88% of faulted steps), on fresh episodes of the same
+# distribution it detected little (gate 0.01-0.5 by kind). 9 episodes run in
+# parallel in the worker pool during the updates, and an encoder step on one
+# update in 3 brings that to ~15.
+META_COLLECT_EPISODES_PER_ITER = 9
+META_ENCODER_UPDATE_EVERY = 3
 UPDATES_PER_ITER = 25
 META_BATCH = 4
 BATCH_SIZE = 512
@@ -102,7 +112,13 @@ NET_ENCODER_HIDDEN = 256
 NET_WEIGHT_DECAY = 1e-2
 
 # ─── Disturbances in the META-TRAINING task distribution ─────────────────────
-META_DISTURB_PROB = 0.45
+# Share of training episodes with a fault. At 0.45, with ten kinds and five
+# patterns, each kind's faulted steps were ~2% of the replay and the encoder
+# never learned the biochemical and storage kinds (its decoded kinetic
+# activity read 0.95 against a true 0.2). The gate keeps saferl acting on
+# undisturbed steps, and every faulted episode is undisturbed up to its onset,
+# so ~60% of the steps stay undisturbed at 0.7.
+META_DISTURB_PROB = 0.7
 META_DISTURB_KINDS = (
     "leak", "feed_gain", "feed_conc", "disturb_kinetics_decay",
     "toxin_spike", "cell_viability", "contamination", "downstream_rate",
@@ -313,6 +329,22 @@ META_ANCHOR_FAULT_DIMS = (1.0,) * ACTION_DIM
 GATE_LOSS_WEIGHT = 1.0
 GATE_SHARPNESS = 4.0
 GATE_INIT_BIAS = -4.0
+# Training rollouts and the update act through the actor on every step (the
+# gate fully open); held-out checks and evaluation act through the learned
+# gate. Acting through the learned gate in training, the actor explored and
+# learned only where the detector already fired, so where it stayed shut
+# saferl acted and meta learned nothing new (forcing the gate open at onset
+# changed nothing on any fault but leak). And the executed action told the
+# encoder whether the gate was open (exploration noise passes only through an
+# open gate), so it learned to read the gate rather than the plant: the gate
+# opened on 85-91% of faulted training steps and stayed shut on the held-out
+# ones. Opening it on the privileged fault flag alone leaked that flag the
+# same way. With the actor acting everywhere the actions carry neither, and
+# the anchor holds it on saferl's policy before a fault.
+META_TRAIN_GATE_OPEN = True
+# Class-balanced fault-kind classifier on z (privileged target, training
+# only), giving the encoder a gradient per kind; 0 disables it.
+META_FAULT_CLS_WEIGHT = 1.0
 META_ANCHOR_UP = 2.0
 META_ANCHOR_DOWN = 0.85
 META_ANCHOR_MIN = 0.5

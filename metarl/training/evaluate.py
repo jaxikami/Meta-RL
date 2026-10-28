@@ -20,7 +20,7 @@ from metarl.training.config import (SEED, EVAL_EPISODES, EVAL_Z_MODE,
 from metarl.training.arms import (ARMS, ARM_ORDER, CONTRASTS, active_arms,
                                   arm_paths, _build_agent,
                                   _load_preferring_best)
-from metarl.training.tasks import (seed_everything, make_env, make_task_pool,
+from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool,
                                    as_fault_schedule, pattern_schedule)
 from metarl.training.rollouts import rollout_deterministic
 from metarl.training.metrics import (latent_separability, gate_opening,
@@ -254,7 +254,7 @@ def evaluate():
     envs, agents = {}, {}
     for name in arms:
         spec = ARMS[name]
-        envs[name] = make_env(lagrangian=spec.lagrangian)
+        envs[name] = make_arm_env(spec)
         agents[name] = _build_agent(envs[name], spec)
         final_path, best_path = arm_paths(spec)
         _load_preferring_best(agents[name], best_path, final_path, name)

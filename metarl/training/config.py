@@ -8,7 +8,10 @@ evaluation scenarios, checkpoint selection, warm start and output paths.
 import os
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.layout import ETHANOL_CHANNELS, ACTION_DIM
+from metarl.env.layout import LOT_TITER_PRIV_CHANNELS, ACTION_DIM
+from metarl.env.disturbances import (EVAL_DISTURBANCES, EVAL_ONSET,
+                                     EVAL_SPIKE_H, EVAL_GRADUAL_H,
+                                     EVAL_RECURRENT_WINDOWS, FAULT_PATTERNS)
 
 MODE = "all"
 SEED = int(os.environ.get("PLANT_SEED", 0))
@@ -36,12 +39,12 @@ UPDATES_PER_ITER = 25
 META_BATCH = 4
 BATCH_SIZE = 512
 MIN_BUFFER = 256
-# Training window of the recurrent encoder: at least the longest episode, so
-# every context reaches back to its episode start. An episode is 120 control
-# steps plus one short step per batch boundary of ANY reactor: at most four
-# batches per reactor even at the fastest clock (4 x 131 h < 600 h), so 132.
-# the agent refuses a context that fills it; smoke_test checks the bound.
-CONTEXT_SIZE = 160
+# Training window of the recurrent encoder: longer than any episode, so every
+# context reaches back to its episode start. An episode is 120 control steps
+# (600 h at 5 h; the environment does not end a step early at a batch
+# boundary) or fewer when the integrator fails; the agent refuses a context
+# that fills the window, and smoke_test checks the bound.
+CONTEXT_SIZE = 128
 WARMUP_EPISODES_PER_TASK = 3
 # Evaluation tasks per scenario. The pool is drawn in order from one seed, so
 # a larger value extends it. Each plant episode costs ~3x a lean one.
@@ -86,29 +89,46 @@ AUX_MODE = "task"
 AUX_WEIGHT = 10.0
 AUX_SAMPLE_FRAC = 0.1
 # Privileged-state channels the aux head also regresses from z: each
-# reactor's broth ethanol titer (C / 150 g/L; ~0.35 mid-batch, ~0.55 at spec).
-META_AUX_STATE_TARGETS = tuple((c, 0.35, 0.2) for c in ETHANOL_CHANNELS)
+# reactor's lot mean titer (/ 150 g/L; 0.5 at the purity spec), the quality
+# state the observation does not carry.
+META_AUX_STATE_TARGETS = tuple((c, 0.35, 0.2) for c in LOT_TITER_PRIV_CHANNELS)
 
 # ─── Networks (SHARED by every arm) ──────────────────────────────────────────
-# Token networks (agent.networks): each reactor is a token of its 24 process
-# channels, its CO2 rate and the 3 plant-wide channels, mixed by
-# MIXER_LAYERS pre-LN self-attention blocks. The actor runs one FiLM residual
-# trunk shared by the three tokens; each critic flattens its mixed tokens
-# into a wide FiLM residual trunk. Compared with the lean study (actor
-# 3 x 256 ~151k, critics 2 x 3 x 512 ~1.1M, GRU 128 ~108k): actor ~1.3M,
-# critics ~7.9M (9.2M with meta's privileged conditioning), GRU 256 ~0.44M.
-# Changing any of these invalidates every checkpoint.
+# Token networks (agent.networks): each reactor is a token of its observation
+# row (25 process and capacity channels, 3 plant-wide), folded into a GRU per
+# reactor with cross-reactor attention over its outputs (NET_HISTORY_*). The
+# actor runs one FiLM residual trunk shared by the three reactors; each
+# critic mixes the reactors' (history, action) tokens (NET_MIXER_*) and
+# flattens them into a wide FiLM residual trunk. Changing any of these
+# invalidates every checkpoint.
 NET_ACTOR_HIDDEN = 256          # actor token width and shared-trunk width
 NET_CRITIC_HIDDEN = 1024        # each critic's flattened trunk width
 NET_CRITIC_TOKEN_HIDDEN = 256   # each critic's token width
 NET_MIXER_LAYERS = 2
 NET_MIXER_HEADS = 4
+# The policy's per-reactor history (the Fermentation-PPO policy's encoder): a
+# 2-layer GRU of width 256 shared by the reactors (each keeps its own state),
+# cross-reactor attention over its outputs in a 64-wide Q/K/V space with 4
+# heads, and a 128-wide skip embedding of the current reading. The actor and
+# both critics read it; the critics' mixer (NET_MIXER_*) then mixes those
+# features with each reactor's action.
+NET_HISTORY_HIDDEN = 256
+NET_HISTORY_LAYERS = 2
+NET_HISTORY_ATTN_DIM = 64
+NET_HISTORY_ATTN_HEADS = 4
+NET_HISTORY_SKIP = 128
 NET_DEPTH = 3
 NET_LAYER_NORM = True
 NET_RESIDUAL = True
 NET_OBS_NORM = True
 NET_ENCODER_LAYER_NORM = True
-NET_ENCODER_HIDDEN = 256
+# Meta's inference module is kept small so the arms match in size: with every
+# arm's critics on the same conditioning (z, task, privileged state) and the
+# same latent width, the context encoder and the aux / fault-kind heads are
+# all meta adds (~2% of its parameters; see README "Networks"). 128 is the
+# lean study's encoder width.
+NET_ENCODER_HIDDEN = 128
+NET_HEAD_HIDDEN = 128
 NET_WEIGHT_DECAY = 1e-2
 
 # ─── Disturbances in the META-TRAINING task distribution ─────────────────────
@@ -122,10 +142,10 @@ META_DISTURB_PROB = 0.7
 META_DISTURB_KINDS = (
     "leak", "feed_gain", "feed_conc", "disturb_kinetics_decay",
     "toxin_spike", "cell_viability", "contamination", "downstream_rate",
-    "turnaround_delay", "storage_capacity",
+    "turnaround_delay", "storage_capacity", "cooling_capacity",
 )
 
-# A per-reactor fault (every kind but feed_conc and downstream_rate) acts on
+# A per-reactor fault (every kind but the plant-wide ones) acts on
 # one uniformly drawn reactor, or with this probability on all three at once.
 META_PLANTWIDE_FRAC = 0.2
 
@@ -140,20 +160,21 @@ META_DISTURB_MAG_RANGES = {
     "disturb_kinetics_decay": (0.15, 0.70),  # eval: 0.20
     "toxin_spike": (2.0, 8.0),               # eval: 6.50
     "cell_viability": (0.30, 0.70),          # eval: 0.50
-    "contamination": (0.0005, 0.004),        # not evaluated (lean: plant-bound)
+    "contamination": (0.0005, 0.004),        # eval: 0.002 (Fermentation-PPO's)
     "downstream_rate": (0.40, 1.60),         # eval: 0.50  (NEW, uncalibrated)
-    # Calibrated on the plant's saferl: 4.0 triples its turnaround
-    # conflicts; a 0.90 tank (360 t) sits above any level it holds at
-    # mid-episode, so its overflows are avoidable, yet it overflows ~140 h.
+    # Calibrated on the previous plant's saferl: a 0.90 tank (360 t) sat
+    # above any level it held at mid-episode, so its overflows are
+    # avoidable, yet it overflowed ~140 h.
     "turnaround_delay": (1.5, 5.0),          # eval: 4.0
     "storage_capacity": (0.75, 0.97),        # eval: 0.90
+    # The heat-load cap (Fermentation-PPO's constraint 9), uncalibrated.
+    "cooling_capacity": (0.65, 0.95),        # eval: 0.80
 }
 META_DISTURB_STRATA = 5
 META_DISTURB_TAIL_WEIGHT = 2.0
 # Every kind's four temporal patterns (FAULT_PATTERNS, built by
 # tasks.pattern_schedule), plus training-only "compound": two kinds stepping
 # at one onset.
-FAULT_PATTERNS = ("step", "spike", "gradual", "recurrent")
 META_FAULT_PATTERNS = {
     "step": 0.35,
     "spike": 0.15,
@@ -176,38 +197,14 @@ META_COMPOUND_PAIRS = (("leak", "feed_conc"), ("feed_gain", "feed_conc"),
 META_COMPOUND_PAIR_FRAC = 0.5
 
 # ─── Evaluation disturbance scenarios ────────────────────────────────────────
-# Every evaluated kind under every FAULT_PATTERNS entry: scenario
-# "<label>_<pattern>" (e.g. "dilution_recurrent"). A per-reactor fault
-# ROTATES over the reactors with the episode index (episode k faults reactor
-# k % 3), so every reactor is faulted on a third of the (paired) tasks.
-# Contamination is not evaluated (plant-bound in the lean study).
-EVAL_DISTURBANCES = {
-    "leak": {"kind": "leak", "magnitude": 0.010, "reactor": "rotate"},
-    "feed_gain": {"kind": "feed_gain", "magnitude": 1.30, "reactor": "rotate"},
-    # Both feed tanks' composition at 55%: a dilute feedstock lot.
-    "dilution": {"kind": "feed_conc", "magnitude": 0.55, "reactor": None},
-    "kinetics_decay": {"kind": "disturb_kinetics_decay", "magnitude": 0.20,
-                       "reactor": "rotate"},
-    "toxin": {"kind": "toxin_spike", "magnitude": 6.50, "reactor": "rotate"},
-    "cell_viability": {"kind": "cell_viability", "magnitude": 0.50,
-                       "reactor": "rotate"},
-    # Downstream distillation at half rate: the tank fills ~0.75 t/h slower.
-    "downstream_rate": {"kind": "downstream_rate", "magnitude": 0.50,
-                        "reactor": None},
-    # Scheduling: every turnaround (cleanup + charge, ~12 h) 4x as long.
-    "turnaround_delay": {"kind": "turnaround_delay", "magnitude": 4.0,
-                         "reactor": None},
-    # Storage volume: the tank holds 90% of S_MAX (360 t).
-    "storage_capacity": {"kind": "storage_capacity", "magnitude": 0.90,
-                         "reactor": None},
-}
-# Fixed evaluation timings (inner steps = hours of the 600 h episode). step,
-# spike and gradual start at mid-episode (evaluate's onset); the spike clears
-# after EVAL_SPIKE_H, the ramp reaches full strength after EVAL_GRADUAL_H; the
-# recurrent fault is on in each EVAL_RECURRENT_WINDOWS window and off between.
-EVAL_SPIKE_H = 24
-EVAL_GRADUAL_H = 180
-EVAL_RECURRENT_WINDOWS = ((150, 230), (310, 390), (470, 550))
+# Fermentation-PPO's (metarl.env.disturbances): every evaluated kind under
+# every FAULT_PATTERNS entry, scenario "<label>_<pattern>" (e.g.
+# "dilution_recurrent"), at its fixed timings (EVAL_ONSET for step, spike and
+# gradual, EVAL_SPIKE_H, EVAL_GRADUAL_H, EVAL_RECURRENT_WINDOWS). A
+# per-reactor fault ROTATES over the reactors with the episode index (episode
+# k faults reactor k % 3), so every reactor is faulted on a third of the
+# (paired) tasks. Imported above: EVAL_DISTURBANCES, EVAL_ONSET, EVAL_SPIKE_H,
+# EVAL_GRADUAL_H, EVAL_RECURRENT_WINDOWS.
 # Kind label -> (disturbance_probe key, label, actuator index within a
 # reactor): the quantity the fault acts on and the actuator that answers it,
 # traced on the label's "step" scenario. For a per-reactor fault both are the
@@ -221,24 +218,27 @@ DISTURB_PROBES = {
                        "faulted reactor's kinetic activity", 0),
     "toxin": ("inhibitors", "faulted reactor's inhibitors (g/L)", 0),
     "cell_viability": ("cells", "faulted reactor's cells (g/L)", 0),
+    "contamination": ("ethanol", "faulted reactor's ethanol (g/L)", 3),
     "downstream_rate": ("storage", "storage mass (kg)", 3),
     "turnaround_delay": ("turnaround", "turnaround time (x nominal)", 0),
     "storage_capacity": ("storage", "storage mass (kg)", 3),
+    "cooling_capacity": ("heat_load", "plant heat load (kg CO2/h)", 1),
 }
 
 # ─── Constraint identities (per-constraint violation accounting) ─────────────
+# The environment's ids (metarl.env.safe).
 CONSTRAINT_NAMES = {
     1: "overflow",
     2: "underflow",
-    3: "harvest_titer",
-    4: "product_purity",
+    3: "storage_overflow",
+    4: "storage_underflow",
     5: "instability",
     6: "mass_balance",
-    7: "storage_overflow",
-    8: "storage_underflow",
-    9: "turnaround_conflict",
+    7: "harvest_titer",
+    8: "product_purity",
+    9: "heat_load",
 }
-DEPTH_CONSTRAINTS = (1, 2, 3, 4, 7, 8)
+DEPTH_CONSTRAINTS = (1, 2, 3, 4, 7, 8, 9)
 
 # ─── Latent-informativeness gate ─────────────────────────────────────────────
 Z_INFORM_MIN_SNR = 1.0
@@ -255,6 +255,7 @@ Z_INFORM_DISTURBANCES = (
     ("toxin_spike", 6.50, "rotate"),
     ("feed_conc", 0.40, None),
     ("storage_capacity", 0.90, None),
+    ("cooling_capacity", 0.80, None),
 )
 
 # ─── Output paths ─────────────────────────────────────────────────────────────
@@ -304,6 +305,7 @@ HELDOUT_DISTURBANCES = (
     ("downstream_rate", 0.60, None),
     ("turnaround_delay", 3.5, None),
     ("storage_capacity", 0.88, None),
+    ("cooling_capacity", 0.82, None),
 )
 HELDOUT_DISTURB_WEIGHT = 0.5
 EARLY_STOP_DIVERGE_FACTOR = 5.0

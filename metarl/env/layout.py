@@ -1,42 +1,28 @@
 """Observation and action layout of the plant, and the structural stage mask.
 
-Channel indices of the ``(STATE_DIM,)`` observation (each reactor's block is
-laid out in ``metarl.env.config``) and of the ``(ACTION_DIM,)`` action, four
-actuators per reactor.
+The agent reads the environment's observation flattened: ``get_state_norm()``
+is ``(N_REACTORS, REACTOR_OBS_DIM)``, one row per reactor (laid out in
+``metarl.env.config``), and the flat ``(STATE_DIM,)`` vector is the rows in
+order. The action is ``(ACTION_DIM,)``, four actuators per reactor, the
+environment's flattened action.
 """
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
 import numpy as np
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.config import (N_REACTORS, I_ETH, R_STAGE, REACTOR_OBS_DIM,
-                               G_STORAGE, G_LF, G_C5, GLOBAL_OBS_DIM)
+from metarl.env.config import (N_REACTORS, N_SPECIES, I_ETH, R_STAGE,
+                               R_STORAGE, R_LF, R_C5, REACTOR_OBS_DIM)
 
 # ─── Observation layout (see config) ──────────────────────────────────────────
-GLOBAL_START = N_REACTORS * REACTOR_OBS_DIM            # 72
-CER_START = GLOBAL_START + GLOBAL_OBS_DIM              # 75
-STATE_DIM = CER_START + N_REACTORS                     # 78
+STATE_DIM = N_REACTORS * REACTOR_OBS_DIM               # 84
 ACTION_DIM_PER_REACTOR = 4
 ACTION_DIM = N_REACTORS * ACTION_DIM_PER_REACTOR       # 12
 # Bumped when a channel's meaning changes at the same width, so checkpoints
 # trained on the old meaning are refused.
-OBS_LAYOUT_VERSION = 1
-
-STORAGE_CHANNEL = GLOBAL_START + G_STORAGE
-LF_CHANNEL = GLOBAL_START + G_LF
-C5_CHANNEL = GLOBAL_START + G_C5
-
-# The action projection network reads channels [0, SHIELD_OBS_DIM): every
-# reactor block and the plant-wide channels, not the CO2 rates.
-SHIELD_OBS_DIM = CER_START
-
-# Width of PlantFermentationEnv.privileged_state(): the exact observation with
-# the species channels unmasked, then the elapsed share of the episode.
-PRIVILEGED_STATE_DIM = STATE_DIM + 1
-PRIVILEGED_SPECIES_CLIP = 5.0
-
-# Action dimensions the projection never moves: each reactor's stage clock.
-TIME_ACTION_DIMS = tuple(i * ACTION_DIM_PER_REACTOR for i in range(N_REACTORS))
+# v2: the Fermentation-PPO observation (rows of 28, species observed, no lot
+# or off-gas channels).
+OBS_LAYOUT_VERSION = 2
 
 
 def reactor_channel(i, offset):
@@ -44,9 +30,26 @@ def reactor_channel(i, offset):
     return i * REACTOR_OBS_DIM + offset
 
 
-def cer_channel(i):
-    """Observation index of reactor ``i``'s off-gas CO2 rate."""
-    return CER_START + i
+# The plant-wide channels are repeated in every row; reactor 0's copy is read.
+STORAGE_CHANNEL = reactor_channel(0, R_STORAGE)
+LF_CHANNEL = reactor_channel(0, R_LF)
+C5_CHANNEL = reactor_channel(0, R_C5)
+
+# The action projection network reads the whole observation but for the
+# species channels: none of its margins depends on them.
+SHIELD_OBS_DIM = STATE_DIM
+SHIELD_IGNORED_CHANNELS = tuple(reactor_channel(i, c) for i in range(N_REACTORS)
+                                for c in range(N_SPECIES))
+
+# Width of PlantFermentationEnv.privileged_state(): the observation, then
+# each reactor's lot in progress (mass, mean titer: the observation has no
+# lot channel), then the elapsed share of the episode.
+PRIVILEGED_STATE_DIM = STATE_DIM + 2 * N_REACTORS + 1
+PRIV_LOT_MASS = STATE_DIM
+PRIV_LOT_TITER = STATE_DIM + N_REACTORS
+
+# Action dimensions the projection never moves: each reactor's stage clock.
+TIME_ACTION_DIMS = tuple(i * ACTION_DIM_PER_REACTOR for i in range(N_REACTORS))
 
 
 def reactor_action(i, k):
@@ -57,13 +60,15 @@ def reactor_action(i, k):
 # Per reactor, the observation channels of its stage one-hot, shape (N, 5).
 STAGE_CHANNELS = np.array([[reactor_channel(i, R_STAGE + s) for s in range(5)]
                            for i in range(N_REACTORS)], dtype=np.intp)
-# Each reactor's broth ethanol channel (meaningful in privileged_state, and in
-# the observation only when concentrations are not masked).
+# Each reactor's broth ethanol channel.
 ETHANOL_CHANNELS = tuple(reactor_channel(i, I_ETH) for i in range(N_REACTORS))
+# Each reactor's lot mean titer in the privileged state.
+LOT_TITER_PRIV_CHANNELS = tuple(PRIV_LOT_TITER + i for i in range(N_REACTORS))
 
 # Action values for structurally locked dimensions, matching the agent's
-# ``_default_a``: tanh(-0.34657359) maps to a time multiplier of exactly 1.0,
-# and -1 maps to zero flow. One row of four per reactor.
+# ``_default_a`` and Fermentation-PPO's default intent: tanh(-0.34657359)
+# maps to a time multiplier of exactly 1.0, and -1 maps to zero flow. One row
+# of four per reactor.
 DEFAULT_MASKED_ACTION = np.tile(
     np.array([np.tanh(-0.34657359), -1.0, -1.0, -1.0]), N_REACTORS)
 

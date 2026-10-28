@@ -13,7 +13,6 @@ import numpy as np
 import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.config import SENSOR_MODEL_ENABLED
 from metarl.env.faults import (DISTURBANCE_ALIASES, DISTURBANCE_KIND_INDEX,
                                DISTURBANCE_INDEX_MAP)
 from metarl.training.config import (SELECT_MAX_WORST_VIOL, SELECT_VIOL_WEIGHT,
@@ -26,7 +25,7 @@ from metarl.training.config import (SELECT_MAX_WORST_VIOL, SELECT_VIOL_WEIGHT,
                                     NO_REGRESS_ETH_REL_CLEAN,
                                     NO_REGRESS_CLEAN_VIOL)
 from metarl.training.arms import ARMS, get_arm, _build_agent
-from metarl.training.tasks import make_env
+from metarl.training.tasks import make_arm_env
 from metarl.training.rollouts import (branched_rollouts,
                                       collect_episode_record)
 from metarl.training.metrics import (latent_separability, gate_opening,
@@ -221,29 +220,27 @@ def _rollout_worker_init():
     torch.set_num_threads(1)
 
 
-def _worker_agent(arm, sensor_model, weights):
+def _worker_agent(arm, weights):
     """This worker's environment and agent for ``arm``, with ``weights`` installed."""
-    key = (arm, sensor_model)
-    if key not in _WORKER_AGENTS:
-        env = make_env(lagrangian=ARMS[arm].lagrangian,
-                       sensor_model=sensor_model)
-        _WORKER_AGENTS[key] = (env, _build_agent(env, arm))
-    env, agent = _WORKER_AGENTS[key]
+    if arm not in _WORKER_AGENTS:
+        env = make_arm_env(ARMS[arm])
+        _WORKER_AGENTS[arm] = (env, _build_agent(env, arm))
+    env, agent = _WORKER_AGENTS[arm]
     agent.load_rollout_weights(weights)
     return env, agent
 
 
 def _collect_job(job):
     """Run one stochastic training episode inside a worker process."""
-    arm, sensor_model, weights, task_id, task, schedule, seed = job
-    env, agent = _worker_agent(arm, sensor_model, weights)
+    arm, weights, task_id, task, schedule, seed = job
+    env, agent = _worker_agent(arm, weights)
     return collect_episode_record(env, agent, task_id, task, schedule, seed)
 
 
 def _rollout_job(job):
     """Run ``branched_rollouts`` for one task inside a worker process."""
-    arm, sensor_model, weights, task, faults, onset, z_mode, index = job
-    env, agent = _worker_agent(arm, sensor_model, weights)
+    arm, weights, task, faults, onset, z_mode, index = job
+    env, agent = _worker_agent(arm, weights)
     return branched_rollouts(env, agent, task, faults, onset, z_mode,
                              index=index)
 
@@ -259,12 +256,10 @@ class RolloutPool:
     episodes).
     """
 
-    def __init__(self, arm, workers, sensor_model=None):
+    def __init__(self, arm, workers):
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
         self.arm = get_arm(arm).name
-        self.sensor_model = bool(SENSOR_MODEL_ENABLED if sensor_model is None
-                                 else sensor_model)
         self._prev_device = os.environ.get("PLANT_DEVICE")
         os.environ["PLANT_DEVICE"] = "cpu"
         self._ex = ProcessPoolExecutor(
@@ -274,7 +269,7 @@ class RolloutPool:
     def run(self, agent, tasks, faults, onset, z_mode):
         """Run ``branched_rollouts`` for every task with ``agent``'s weights."""
         weights = agent.rollout_weights()
-        jobs = [(self.arm, self.sensor_model, weights, t, tuple(faults),
+        jobs = [(self.arm, weights, t, tuple(faults),
                  onset, z_mode, i) for i, t in enumerate(tasks)]
         return list(self._ex.map(_rollout_job, jobs))
 
@@ -289,8 +284,7 @@ class RolloutPool:
             Futures of ``collect_episode_record`` results, in job order.
         """
         weights = agent.rollout_weights()
-        return [self._ex.submit(_collect_job, (self.arm, self.sensor_model,
-                                               weights) + tuple(j))
+        return [self._ex.submit(_collect_job, (self.arm, weights) + tuple(j))
                 for j in jobs]
 
     def close(self):

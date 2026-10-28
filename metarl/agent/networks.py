@@ -1,7 +1,9 @@
 """The agent's networks.
 
-Token actor and critics with cross-reactor attention, the GRU context encoder,
-the auxiliary head and the adaptation gate's detector.
+The per-reactor history (a GRU per reactor, then cross-reactor attention over
+the GRU outputs: the Fermentation-PPO policy), the token actor and critics
+that read it, the GRU context encoder, the auxiliary head and the adaptation
+gate's detector.
 """
 
 # ─── Standard Library ─────────────────────────────────────────────────────────
@@ -15,8 +17,7 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.config import N_REACTORS, REACTOR_OBS_DIM, GLOBAL_OBS_DIM
-from metarl.env.layout import GLOBAL_START, CER_START
+from metarl.env.config import N_REACTORS, REACTOR_OBS_DIM
 from metarl.agent.common import (LATENT_DIM, LOG_STD_MAX, LOG_STD_MIN,
                                  PRE_TANH_CLIP, MU_CLAMP)
 
@@ -43,18 +44,16 @@ class FiLM(nn.Module):
 def token_index():
     """Observation channels of each reactor's token, shape (N_REACTORS, 28).
 
-    A reactor's token is its own 24-channel block, its off-gas CO2 rate (from
-    the observation's tail) and the three plant-wide channels.
+    A reactor's token is its row of the environment's observation: its own
+    25 channels and the three plant-wide ones, the per-reactor input of the
+    Fermentation-PPO policy.
     """
-    rows = []
-    for i in range(N_REACTORS):
-        rows.append(list(range(i * REACTOR_OBS_DIM, (i + 1) * REACTOR_OBS_DIM))
-                    + [CER_START + i]
-                    + list(range(GLOBAL_START, GLOBAL_START + GLOBAL_OBS_DIM)))
+    rows = [list(range(i * REACTOR_OBS_DIM, (i + 1) * REACTOR_OBS_DIM))
+            for i in range(N_REACTORS)]
     return torch.tensor(rows, dtype=torch.long)
 
 
-TOKEN_DIM = REACTOR_OBS_DIM + 1 + GLOBAL_OBS_DIM
+TOKEN_DIM = REACTOR_OBS_DIM
 
 
 class _MixerBlock(nn.Module):
@@ -106,6 +105,156 @@ class TokenMixer(nn.Module):
         for b in self.blocks:
             h = b(h)
         return self.norm(h)
+
+
+class CrossReactorAttention(nn.Module):
+    """Scaled dot-product self-attention across the reactors (Fermentation-PPO).
+
+    Each reactor attends to every reactor's history features, so it sees where
+    its siblings are heading, not just their instantaneous readings. Q/K/V
+    are projected down to ``attn_dim`` (three tokens need few dimensions); the
+    output projection starts at zero, so the residual block starts as the
+    identity. ``last_attn_weights`` keeps the latest [B, heads, N, N] weights.
+    """
+
+    def __init__(self, feature_dim, n_heads=4, attn_dim=64):
+        super().__init__()
+        if attn_dim % n_heads:
+            raise ValueError(f"attn_dim {attn_dim} is not divisible by "
+                             f"{n_heads} heads")
+        self.n_heads = int(n_heads)
+        self.attn_dim = int(attn_dim)
+        self.head_dim = self.attn_dim // self.n_heads
+        self.q_proj = nn.Linear(feature_dim, attn_dim)
+        self.k_proj = nn.Linear(feature_dim, attn_dim)
+        self.v_proj = nn.Linear(feature_dim, attn_dim)
+        self.out_proj = nn.Linear(attn_dim, feature_dim)
+        self.norm = nn.LayerNorm(feature_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        self.last_attn_weights = None
+
+    def forward(self, x):
+        """Mix reactor features ``x`` [B, N, D]; returns [B, N, D]."""
+        B, N, _ = x.shape
+        H, d = self.n_heads, self.head_dim
+        q = self.q_proj(x).view(B, N, H, d).transpose(1, 2)
+        k = self.k_proj(x).view(B, N, H, d).transpose(1, 2)
+        v = self.v_proj(x).view(B, N, H, d).transpose(1, 2)
+        att = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(d), dim=-1)
+        self.last_attn_weights = att.detach()
+        o = (att @ v).transpose(1, 2).reshape(B, N, self.attn_dim)
+        return self.norm(x + self.out_proj(o))
+
+
+class ReactorHistory(nn.Module):
+    """Each reactor's history, then cross-reactor attention over it.
+
+    The Fermentation-PPO policy's encoder: a reactor's token (``token_index``)
+    is embedded (Linear -> LayerNorm -> ELU, plus a learned slot for the
+    vessel's identity, which its capacity channels also carry) and folded
+    into a GRU whose
+    weights every reactor shares and whose state each keeps on its own; the
+    GRU output is layer-normalised and the reactors attend to each other's
+    (``CrossReactorAttention``). A skip embedding of the current token is
+    appended, so each reactor's feature is [history (``hidden``), now
+    (``skip``)].
+
+    ``step`` folds one token per reactor into the state [layers, B * N,
+    hidden]; ``window`` runs causal windows of replay rows for the update.
+    """
+
+    def __init__(self, hidden=256, layers=2, attn_dim=64, heads=4, skip=128):
+        super().__init__()
+        self.hidden = int(hidden)
+        self.layers = int(layers)
+        self.n_reactors = N_REACTORS
+        self.out_dim = self.hidden + int(skip)
+        self.register_buffer("tok_index", token_index(), persistent=False)
+        self.embed = nn.Sequential(nn.Linear(TOKEN_DIM, self.hidden),
+                                   nn.LayerNorm(self.hidden), nn.ELU())
+        self.slot = nn.Parameter(0.02 * torch.randn(N_REACTORS, self.hidden))
+        self.cells = nn.ModuleList(nn.GRUCell(self.hidden, self.hidden)
+                                   for _ in range(self.layers))
+        for cell in self.cells:
+            nn.init.orthogonal_(cell.weight_hh)
+            nn.init.xavier_uniform_(cell.weight_ih)
+            nn.init.zeros_(cell.bias_hh)
+            nn.init.zeros_(cell.bias_ih)
+        self.gru_ln = nn.LayerNorm(self.hidden)
+        self.attn = CrossReactorAttention(self.hidden, heads, attn_dim)
+        self.skip = nn.Sequential(nn.Linear(TOKEN_DIM, int(skip)),
+                                  nn.LayerNorm(int(skip)), nn.ELU())
+
+    def initial_state(self, batch, device=None):
+        """The zero state for ``batch`` episodes, [layers, batch * N, hidden]."""
+        return torch.zeros(self.layers, batch * self.n_reactors, self.hidden,
+                           device=device)
+
+    def tokens(self, obs_n):
+        """Reactor tokens of normalised observations [..., obs_dim] -> [..., N, T]."""
+        return obs_n[..., self.tok_index]
+
+    def _fold(self, x, h):
+        """One GRU step of embedded inputs x [M, hidden] from h [layers, M, H]."""
+        out = []
+        for layer, cell in enumerate(self.cells):
+            x = cell(x, h[layer])
+            out.append(x)
+        return torch.stack(out)
+
+    def _read(self, top, tok):
+        """Features of top-layer states [B, N, H] and tokens [B, N, T]."""
+        return torch.cat([self.attn(self.gru_ln(top)), self.skip(tok)], dim=-1)
+
+    def step(self, tok, h):
+        """Fold tokens [B, N, T] into h; returns (features [B, N, out_dim], h)."""
+        B = tok.shape[0]
+        x = (self.embed(tok) + self.slot).reshape(B * self.n_reactors, -1)
+        h = self._fold(x, h)
+        return self._read(h[-1].reshape(B, self.n_reactors, -1), tok), h
+
+    def window(self, tok, reset, hi, empty, tok_now, tok_next):
+        """Features of replay transitions from their causal windows.
+
+        Each transition's state is the GRU's after the previous transition of
+        its episode (row ``hi - 1`` of its window, or zero for an episode's
+        first step); its own observation and then the next one are folded
+        from there, so both reads are exact at any episode boundary.
+
+        Args:
+            tok: Tokens [K, R, N, T] of K windows of R consecutive rows.
+            reset: Bool [K, R]: the state is zeroed before folding that row
+                (an episode's first row in the window).
+            hi: Long [K, L]: each transition's row (its context is the rows
+                before it).
+            empty: Bool [K, L]: the transition starts its episode.
+            tok_now: Tokens [K * L, N, T] of each transition's observation.
+            tok_next: Tokens [K * L, N, T] of each transition's next one.
+
+        Returns:
+            Tuple (features at the observation, at the next one), each
+            [K * L, N, out_dim].
+        """
+        K, R, N, _ = tok.shape
+        x = (self.embed(tok) + self.slot).reshape(K, R, N * self.hidden)
+        h = self.initial_state(K, tok.device)
+        states = []
+        for q in range(R):
+            keep = (~reset[:, q]).to(h.dtype).repeat_interleave(N)
+            h = h * keep.view(1, -1, 1)
+            h = self._fold(x[:, q].reshape(K * N, self.hidden), h)
+            states.append(h.view(self.layers, K, N, self.hidden))
+        states = torch.stack(states)                  # [R, layers, K, N, H]
+        L = hi.shape[1]
+        rows_k = torch.arange(K, device=tok.device).repeat_interleave(L)
+        prev = states[(hi - 1).clamp(min=0).reshape(-1), :, rows_k]
+        prev = prev * (~empty).reshape(-1, 1, 1, 1).to(prev.dtype)
+        h0 = prev.permute(1, 0, 2, 3).reshape(self.layers, K * L * N,
+                                              self.hidden)
+        feat_now, h1 = self.step(tok_now, h0)
+        feat_next, _ = self.step(tok_next, h1)
+        return feat_now, feat_next
 
 
 def _encoder_inputs(context, obs_dim, obs_norm, delta_norm):
@@ -221,22 +370,26 @@ class MLPTrunk(nn.Module):
 
 
 class TanhGaussianActor(nn.Module):
-    """Squashed-Gaussian plant policy over per-reactor tokens.
+    """Squashed-Gaussian plant policy over per-reactor history features.
 
-    Tokens (``token_index``) are embedded with a learned per-reactor slot,
-    mixed across reactors (``TokenMixer``), then each token runs the SAME
-    FiLM-conditioned trunk and emits its reactor's four actions. z modulates
-    every trunk layer of every token.
+    Each reactor's history (``ReactorHistory``: its GRU, then attention across
+    the reactors) runs the SAME FiLM-conditioned trunk and emits its
+    reactor's four actions. z modulates every trunk layer of every reactor.
+    The policy is recurrent: ``forward`` / ``sample`` read history features
+    [B, N, feature_dim] made by ``history_step`` (acting) or
+    ``history_window`` (the update).
 
     Attributes:
         latent_dim: Width of the latent conditioning variable.
         use_film: Whether z modulates hidden features or is concatenated.
         n_reactors: Number of reactor tokens.
+        history: The per-reactor history module.
     """
 
     def __init__(self, obs_dim, action_dim, latent_dim, hidden=256, depth=3,
                  use_film=True, layer_norm=True, residual=False,
-                 obs_norm=None, mixer_layers=2, mixer_heads=4):
+                 obs_norm=None, history_hidden=256, history_layers=2,
+                 attn_dim=64, attn_heads=4, skip_dim=128):
         super().__init__()
         self.latent_dim = latent_dim
         self.use_film = use_film
@@ -249,41 +402,61 @@ class TanhGaussianActor(nn.Module):
                              f"of actions per reactor")
         if obs_norm is None:
             self.in_norm = nn.LayerNorm(obs_dim)
-        self.register_buffer("tok_index", token_index(), persistent=False)
-        self.embed = nn.Linear(TOKEN_DIM, hidden)
-        self.slot = nn.Parameter(0.02 * torch.randn(N_REACTORS, hidden))
-        self.mixer = TokenMixer(hidden, mixer_layers, mixer_heads)
-        self.trunk = MLPTrunk(hidden, hidden, depth, latent_dim,
+        self.history = ReactorHistory(history_hidden, history_layers,
+                                      attn_dim, attn_heads, skip_dim)
+        self.trunk = MLPTrunk(self.history.out_dim, hidden, depth, latent_dim,
                               use_film=use_film, layer_norm=layer_norm,
                               residual=residual)
         self.mean_head = nn.Linear(hidden, self.per)
         self.log_std_head = nn.Linear(hidden, self.per)
 
-    def _features(self, obs, z):
+    def _norm(self, obs):
+        return self.in_norm(obs) if self.obs_norm is None else self.obs_norm(obs)
+
+    def initial_state(self, batch, device=None):
+        """The history state at an episode start."""
+        return self.history.initial_state(batch, device)
+
+    def history_step(self, obs, h):
+        """Fold observations [B, obs_dim]; returns (features, new state)."""
+        return self.history.step(self.history.tokens(self._norm(obs)), h)
+
+    def history_window(self, obs_rows, reset, hi, empty, obs, next_obs):
+        """``ReactorHistory.window`` over observation rows [K, R, obs_dim]."""
+        tok = lambda o: self.history.tokens(self._norm(o))   # noqa: E731
+        return self.history.window(tok(obs_rows), reset, hi, empty, tok(obs),
+                                   tok(next_obs))
+
+    def single_step_features(self, obs):
+        """Features of observations read with no history (a fresh episode)."""
+        return self.history_step(
+            obs, self.initial_state(obs.shape[0], obs.device))[0]
+
+    def _features(self, feat, z):
         """Per-token conditioned features, shape [B * N, hidden]."""
-        x = self.in_norm(obs) if self.obs_norm is None else self.obs_norm(obs)
-        B = x.shape[0]
-        h = self.embed(x[:, self.tok_index]) + self.slot       # [B, N, H]
-        h = self.mixer(h)
+        B = feat.shape[0]
         zt = z.unsqueeze(1).expand(B, self.n_reactors, z.shape[-1])
-        return self.trunk(h.reshape(B * self.n_reactors, -1),
+        return self.trunk(feat.reshape(B * self.n_reactors, -1),
                           zt.reshape(B * self.n_reactors, -1))
 
-    def forward(self, obs, z):
-        """Pre-squash Gaussian parameters (mean, log_std), each [B, action_dim]."""
-        B = obs.shape[0]
-        h = self._features(obs, z)
+    def forward(self, feat, z):
+        """Pre-squash Gaussian parameters (mean, log_std), each [B, action_dim].
+
+        ``feat`` are history features [B, N, feature_dim].
+        """
+        B = feat.shape[0]
+        h = self._features(feat, z)
         mean = self.mean_head(h).reshape(B, -1)
         log_std = torch.clamp(self.log_std_head(h).reshape(B, -1),
                               LOG_STD_MIN, LOG_STD_MAX)
         return mean, log_std
 
-    def sample(self, obs, z, deterministic=False, with_logprob=True, mask=None,
+    def sample(self, feat, z, deterministic=False, with_logprob=True, mask=None,
                noise=None):
         """Sample a squashed action and its log-probability.
 
         Args:
-            obs: Observations, shape [B, obs_dim].
+            feat: History features, shape [B, N, feature_dim].
             z: Latent, shape [B, latent_dim].
             deterministic: Return the distribution mean instead of a sample.
             with_logprob: Whether to compute the log-probability.
@@ -296,7 +469,7 @@ class TanhGaussianActor(nn.Module):
             Tuple (action, logp); action [B, action_dim] in [-1, 1], logp [B]
             or None.
         """
-        mean, log_std = self.forward(obs, z)
+        mean, log_std = self.forward(feat, z)
         std = log_std.exp()
         if deterministic:
             u = mean
@@ -316,15 +489,15 @@ class TanhGaussianActor(nn.Module):
 
 
 class _TokenQ(nn.Module):
-    """One Q network: mixed (obs, action) reactor tokens into a wide trunk."""
+    """One Q network: (history feature, action) reactor tokens into a wide trunk."""
 
     def __init__(self, action_dim, cond_dim, hidden, depth, use_film,
-                 layer_norm, residual, token_hidden, mixer_layers, mixer_heads):
+                 layer_norm, residual, token_hidden, mixer_layers, mixer_heads,
+                 feature_dim):
         super().__init__()
         self.n_reactors = N_REACTORS
         self.per = int(action_dim) // N_REACTORS
-        self.register_buffer("tok_index", token_index(), persistent=False)
-        self.embed = nn.Linear(TOKEN_DIM + self.per, token_hidden)
+        self.embed = nn.Linear(int(feature_dim) + self.per, token_hidden)
         self.slot = nn.Parameter(0.02 * torch.randn(N_REACTORS, token_hidden))
         self.mixer = TokenMixer(token_hidden, mixer_layers, mixer_heads)
         self.trunk = MLPTrunk(N_REACTORS * token_hidden, hidden, depth,
@@ -332,41 +505,40 @@ class _TokenQ(nn.Module):
                               layer_norm=layer_norm, residual=residual)
         self.head = nn.Linear(hidden, 1)
 
-    def forward(self, obs, action, cond):
-        B = obs.shape[0]
-        tok = torch.cat([obs[:, self.tok_index],
-                         action.reshape(B, self.n_reactors, self.per)], dim=-1)
+    def forward(self, feat, action, cond):
+        B = feat.shape[0]
+        tok = torch.cat([feat, action.reshape(B, self.n_reactors, self.per)],
+                        dim=-1)
         h = self.mixer(self.embed(tok) + self.slot)
         return self.head(self.trunk(h.reshape(B, -1), cond)).squeeze(-1)
 
 
 class Critic(nn.Module):
-    """Twin token Q networks conditioned on z (and, for meta, more).
+    """Twin token Q networks over the actor's history features.
 
-    The conditioning vector is z, with the task descriptor and then the
-    plant's privileged state appended when the agent's critics see them
-    (``PEARLAgent._critic_cond``). The shared observation normaliser holds
-    only buffers, so the Polyak update never touches it.
+    Each reactor's token is its history feature (``ReactorHistory``, already
+    attended across the reactors) and its action; the tokens are mixed (the
+    joint action couples the reactors through the tank) and flattened into a
+    FiLM trunk conditioned on z, with the task descriptor and then the plant's
+    privileged state appended when the agent's critics see them
+    (``PEARLAgent._critic_cond``).
     """
 
     def __init__(self, obs_dim, action_dim, latent_dim, hidden=1024, depth=3,
                  use_film=True, layer_norm=True, residual=False,
-                 obs_norm=None, token_hidden=256, mixer_layers=2,
-                 mixer_heads=4):
+                 token_hidden=256, mixer_layers=2, mixer_heads=4,
+                 feature_dim=384):
         super().__init__()
         self.use_film = use_film
-        self.obs_norm = obs_norm
         make = lambda: _TokenQ(action_dim, latent_dim, hidden, depth,  # noqa: E731
                                use_film, layer_norm, residual, token_hidden,
-                               mixer_layers, mixer_heads)
+                               mixer_layers, mixer_heads, feature_dim)
         self.q1 = make()
         self.q2 = make()
 
-    def forward(self, obs, action, z):
-        """Evaluate both Q functions; each output has shape [B]."""
-        if self.obs_norm is not None:
-            obs = self.obs_norm(obs)
-        return self.q1(obs, action, z), self.q2(obs, action, z)
+    def forward(self, feat, action, z):
+        """Evaluate both Q functions on history features; each output is [B]."""
+        return self.q1(feat, action, z), self.q2(feat, action, z)
 
 
 class AuxHead(nn.Module):

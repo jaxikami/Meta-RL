@@ -1,86 +1,58 @@
-"""Static configuration for the three-reactor plant with central storage.
+"""Static configuration of the plant, and the meta-RL task distribution.
 
-The plant is the multi-reactor study's: three heterogeneous fed-batch reactors
-(feed pumps sized 1x, 4x and 0.5x) sharing one LF / C5 feedstock pool and
-discharging into one central storage tank that feeds downstream at a fixed
-rate. The constraints, quality specs, instrument model and flow-only task
-distribution are the lean single-reactor study's (``MetaRL_Lean``), extended
-to three vessels; the storage tank adds two inventory constraints of its own.
+The first half is Fermentation-PPO's ``envs/config.py`` verbatim: three
+heterogeneous fed-batch reactors (feed pumps 1x, 4x and 0.5x) sharing one LF /
+C5 feedstock pool and discharging into one central storage tank, the species,
+feeds, stage credits, the two titer specs and the plant heat-removal cap. The
+environment (``metarl.env.safe`` / ``metarl.env.bench``) is that project's,
+so Safe PPO and the arms here are benchmarked on one plant;
+``tests/smoke_test.py`` steps both side by side.
 
-Only FLOW quantities are randomized across tasks (feed concentration, each
-reactor's feed-pump gain and vessel leak). The chemistry -- pH, kinetic
-modifiers, enzyme adsorption, toxin tolerance -- is pinned at the
-Fermentation-PPO project's values on every task and in every reactor.
+The second half is this project's: the observation's per-reactor layout
+offsets and the meta-RL task distribution. Only FLOW quantities are
+randomized across tasks (feed concentration, each reactor's feed-pump gain and
+vessel leak); the chemistry is pinned at the nominal values on every task and
+in every reactor. The nominal task is the Fermentation-PPO plant exactly.
 """
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
 import numpy as np
 
-# ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.core import (kinetics_from_pH, PARAM_DIM, NOMINAL_MAX_ADS,
-                             NOMINAL_K_ADS, _PH as NOMINAL_PH)
-
 
 # ─── Reactor Configuration ────────────────────────────────────────────────────
-N_REACTORS = 3
-
-# Feed pump capacity of the 1x reactor, kg/s. Full-throttle feeding through
-# stages 0-1 delivers ~212,000 kg into it on top of the 10,000 kg charge, so
-# its overflow is reachable only at maximum feed (or a slowed clock). The 4x
-# reactor overflows at ~25% feed; the 0.5x reactor cannot fill in one co-feed
-# at a unit clock.
-BASE_FLOW_LF = 2487.0 / 3600.0
-BASE_FLOW_C5 = 628.0 / 3600.0
-REACTOR_FLOW_SCALE = (1.0, 4.0, 0.5)
-
-
-def get_reactor_config():
+def get_main_reactor_config():
     """Define structural capacities for the heterogeneous 3-reactor setup.
 
     Returns:
-        Dictionary containing length-``N_REACTORS`` arrays for:
-            - Mmax: Maximum reactor mass limits (kg).
-            - max_flow_LF: Maximum LF feed flow rates (kg/s).
-            - max_flow_C5: Maximum C5 feed flow rates (kg/s).
+        Dictionary containing arrays for:
+            - Mmax: Maximum reactor mass limits.
+            - max_flow_LF: Maximum LF feed flow rates.
+            - max_flow_C5: Maximum C5 feed flow rates.
     """
-    scale = np.asarray(REACTOR_FLOW_SCALE, dtype=np.float64)
     return {
-        'Mmax': np.full(N_REACTORS, 220000.0, dtype=np.float64),
-        'max_flow_LF': BASE_FLOW_LF * scale,
-        'max_flow_C5': BASE_FLOW_C5 * scale,
+        'Mmax': np.array([220000.0, 220000.0, 220000.0], dtype=np.float64),
+        'max_flow_LF': np.array(
+            [(2487/3600), (2487/3600) * 4, (2487/3600) / 2], dtype=np.float64),
+        'max_flow_C5': np.array(
+            [(628/3600), (628/3600) * 4, (628/3600) / 2], dtype=np.float64),
     }
 
-
-# ─── Global Resource Pool ─────────────────────────────────────────────────────
-# Shared by all three reactors and drawn in reactor order (0, 1, 2) each hour.
-# Ordinary operation (~2.3 batches per vessel) draws ~1.2e6 kg LF and ~0.3e6
-# kg C5; every pump at full throttle could draw ~2.2e6 kg LF, so depletion is
-# reachable under greedy feeding but not under ordinary operation.
+# ─── Global Resource Pool ────────────────────────────────────────────────────
 INITIAL_LF = 2000000.0
 INITIAL_C5 = 600000.0
 
-# ─── Central Storage Tank ─────────────────────────────────────────────────────
-# Every reactor discharges into this tank, which feeds downstream at a fixed
-# S_OUT_RATE (900,000 kg over a 600 h episode). It starts 87.5% full and runs
-# dry by ~230 h without inflow, so the first unload must come before then
-# (storage underflow), and it holds only S_MAX, so the plant can ship at most
-# S_MAX - S_INITIAL + 900,000 = 950,000 kg in an episode without overflowing
-# it -- about 4.5 full batches against the ~7 three free-running vessels would
-# make. The tank is therefore the plant's bottleneck and couples the reactors:
-# their unloads must be staggered, and a finished batch sometimes held.
+# ─── Central Storage Hardware Specifications ─────────────────────────────────
 S_MAX = 400000.0
 S_MIN = 5000.0
 S_OUT_RATE = 1500.0 / 3600.0
 S_INITIAL = 350000.0
 
 # ─── Tracked Species Definition ───────────────────────────────────────────────
-SPECIES_NAMES = ['CS', 'XS', 'LS', 'C', 'G', 'X', 'F', 'E', 'AC', 'Cell',
-                 'Eth', 'CO2', 'ACT', 'HMF', 'Base']
+SPECIES_NAMES = ['CS', 'XS', 'LS', 'C', 'G', 'X', 'F', 'E', 'AC', 'Cell', 'Eth', 'CO2', 'ACT', 'HMF', 'Base']
 SPECIES_IDX = {name: i for i, name in enumerate(SPECIES_NAMES)}
-N_SPECIES = len(SPECIES_NAMES)
 
-# Per-species normalization ceilings (g/L), chosen so trace species are not
-# crushed to zero in the observation.
+# Defines the physical maximum concentration (kg/L) realistically achievable for each specific species.
+# Used to statically normalize signals perfectly into the [0, 1] neural network range without crushing trace elements.
 C_MAX_LIMITS = np.array([
     100.0,  # CS
     5.0,    # XS
@@ -99,177 +71,114 @@ C_MAX_LIMITS = np.array([
     20.0    # Base
 ], dtype=np.float32)
 
-I_ETH = SPECIES_IDX['Eth']
-
-
-# =============================================================================
-# OBSERVATION LAYOUT
-# =============================================================================
-# One block per reactor, then the plant-wide channels, then each reactor's
-# off-gas CO2 rate. The CO2 rates come last so the action projection network
-# can read a PREFIX of the observation (SHIELD_OBS_DIM channels): the rate is
-# an activity measurement, not a constrained quantity, and must never enter
-# the shield.
-#
-#   per-reactor block (REACTOR_OBS_DIM = 24), reactor i at i * 24:
-#     0-14  species concentrations / C_MAX_LIMITS     (zeroed when masked)
-#     15    M / Mmax
-#     16-20 stage one-hot (5)
-#     21    stage credit remaining / base_credits[stage]
-#     22    lot-in-progress mass / PRODUCT_MASS_SCALE
-#     23    lot-in-progress mass-weighted mean titer / TITER_SCALE
-#   plant-wide block (GLOBAL_OBS_DIM = 3), at N_REACTORS * 24:
-#     0     central storage mass / S_MAX
-#     1     LF feedstock remaining / INITIAL_LF
-#     2     C5 feedstock remaining / INITIAL_C5
-#   CO2 tail (N_REACTORS), one per reactor:
-#     i     reactor i's off-gas CO2 evolution rate / CER_SCALE (zeroed when
-#           not observed)
-R_MASS = 15
-R_STAGE = 16
-R_CREDIT = 21
-R_LOT_MASS = 22
-R_LOT_TITER = 23
-REACTOR_OBS_DIM = 24
-G_STORAGE = 0
-G_LF = 1
-G_C5 = 2
-GLOBAL_OBS_DIM = 3
-
-
-# =============================================================================
-# PRODUCT QUALITY SPECIFICATION
-# =============================================================================
-# The lean study's two titer specs, applied to every reactor:
-#
-#   HARVEST TITER FLOOR (violation id 3, per inner step while a reactor drains)
-#     Outlet ethanol must be >= MIN_HARVEST_TITER.
-#
-#   PRODUCT PURITY SPEC (violation id 4, per lot)
-#     Each batch's discharge is one lot, released when that reactor's batch
-#     completes if its mass-weighted mean titer is >= MIN_PRODUCT_TITER. Only
-#     released lots count as on-spec product; a rejected lot is worth nothing.
-#     Lots are per reactor batch, not the storage tank's contents, so a single
-#     diluted batch does not void the good batches the other vessels shipped
-#     (the reason the lean study moved from one product tank to lots). The tank
-#     is a physical buffer only: its constraints are inventory constraints.
-#
-# Both values shape the TRAINING reward. Changing either one invalidates every
-# trained checkpoint, and -- when concentrations are observable -- the APN.
-MIN_HARVEST_TITER = 65.0    # g/L in the outlet stream while draining
-MIN_PRODUCT_TITER = 75.0    # g/L, mass-weighted mean over a lot
-
-# Normalises a reactor's lot mass. One batch's lot is at most a vessel
-# (~0.55); without the stage mask a batch may never complete, and its lot can
-# grow past it.
-PRODUCT_MASS_SCALE = 400000.0
-
-# Shares the ethanol C_MAX so the lot titer and the in-reactor ethanol channel
-# are on one scale.
-TITER_SCALE = float(C_MAX_LIMITS[I_ETH])
-
-
 # ─── Feed Flow Properties ─────────────────────────────────────────────────────
 def get_C_C5():
-    """Build the baseline C5 feed composition vector.
+    """Build baseline C5 feed composition vector across tracked species.
 
     Returns:
         NumPy array of length 15 containing species concentrations for C5 feed.
     """
     arr = np.zeros(15)
-    vals = {'CS': 1.2, 'XS': 0.5, 'LS': 0.7, 'G': 10.0, 'X': 29.7, 'F': 0.5,
-            'AC': 4.1, 'ACT': 0.1, 'HMF': 0.3}
+    vals = {'CS': 1.2, 'XS': 0.5, 'LS': 0.7, 'G': 10.0, 'X': 29.7, 'F': 0.5, 'AC': 4.1, 'ACT': 0.1, 'HMF': 0.3}
     for k, v in vals.items():
         arr[SPECIES_IDX[k]] = v
     return arr
 
 
 def get_C_LF():
-    """Build the baseline LF feed composition vector.
+    """Build baseline LF feed composition vector across tracked species.
 
     Returns:
         NumPy array of length 15 containing species concentrations for LF feed.
     """
     arr = np.zeros(15)
-    vals = {'CS': 50.0, 'XS': 1.0, 'LS': 78.0, 'G': 98.0, 'X': 59.0, 'F': 0.2,
-            'E': 4.9, 'AC': 16.0, 'ACT': 0.1, 'HMF': 0.1, 'Base': 8.6}
+    vals = {'CS': 50.0, 'XS': 1.0, 'LS': 78.0, 'G': 98.0, 'X': 59.0, 'F': 0.2, 'E': 4.9, 'AC': 16.0, 'ACT': 0.1, 'HMF': 0.1, 'Base': 8.6}
     for k, v in vals.items():
         arr[SPECIES_IDX[k]] = v
     return arr
 
-
 C_C5_BASE = get_C_C5()
 C_LF_BASE = get_C_LF()
 
-# ─── Time Credit and Flow Integration ─────────────────────────────────────────
-# Stage credits in hours: [0] charge, [1] co-feed, [2] ferment, [3] unload,
-# [4] clean. One nominal batch is 262 h, so a 600 h episode at unit time
-# multiplier completes ~2.3 batches per reactor.
+# ─── Time Credit and Flow Integration ────────────────────────────────────────
 BASE_CREDITS = np.array([10.0, 60.0, 120.0, 70.0, 2.0])
 TIME_STEP_DURATION = 3600.0
 MAX_FLOW_OUT_REAC = 5000.0 / 3600.0
 
+# ─── Product Quality Specification ───────────────────────────────────────────
+# The Meta-RL plant's concentration constraints (same chemistry and units as
+# C[Eth]).  The harvest titer floor acts on the outlet stream of every
+# draining reactor at every step; the purity spec acts on each batch's lot,
+# the mass-weighted mean titer of everything that batch discharged, judged
+# when the batch completes (and at episode end).
+MIN_HARVEST_TITER = 65.0    # g/L in the outlet stream while draining
+MIN_PRODUCT_TITER = 75.0    # g/L, mass-weighted mean over a lot
 
-# =============================================================================
-# INSTRUMENTATION / SENSOR MODEL
-# =============================================================================
-# The lean study's instruments, on every reactor:
-#
-#   ONLINE (continuous, 0.5% error)    reactor masses, lot masses, storage
-#                                      mass, feedstock tanks
-#   AT-LINE (3% RSD, no delay)         every dissolved species and each lot's
-#                                      mean titer (HPLC assay)
-#   OFF-GAS (3% error)                 each reactor's CO2 evolution rate
-#   NOT MEASURED                       delivered feed strength, each pump's
-#                                      gain, each vessel's leak rate -- the
-#                                      latent theta
-#   EXACT                              recipe stage and credit
-#
-# Constraints, reward and every reported metric are computed from TRUE state.
-# baseline and saferl TRAIN on exact observation (ArmSpec.train_sensor_noise =
-# False); meta trains with the noise; every arm is EVALUATED with it.
-SENSOR_MODEL_ENABLED = True
-
-# Grab-sample period and draw-to-result lag, in inner steps (1 h): every
-# channel is freshly assayed each hour and reported at once (the lean study's
-# setting since 2026-09-28).
-ANALYZER_SAMPLE_PERIOD_H = 1
-ANALYZER_REPORT_LAG_H = 0
-
-# Analyzer error in normalized units: relative SD plus an absolute floor so a
-# near-zero reading still carries error.
-ANALYZER_NOISE_RSD = 0.03
-ANALYZER_NOISE_FLOOR = 0.002
-
-ONLINE_NOISE_RSD = 0.005
-
-# Base seed for the per-episode sensor RNG, separate from any shared RNG so
-# deterministic evaluation passes stay reproducible.
-SENSOR_SEED = 20261016
-
-# In-situ assays of a lignocellulosic slurry are not available in practice.
-# When True every reactor's species channels are zeroed, leaving the gauges,
-# the lot titers and the CO2 rates as the only composition signals. This also
-# reduces the APN to the inventory constraints (see apn.data.safety_margins).
-MASK_INTERNAL_CONCENTRATIONS = True
-
-# ─── Off-gas CO2 evolution rate (online, the observation's tail) ──────────────
-# The RATE, not the dissolved CO2 level (which env.core forms by the same term
-# as ethanol, so it would be a live titer meter). It reveals titer only once
-# integrated over time, i.e. to an agent that keeps a history. False zeroes
-# the channels without changing the observation width.
-OBSERVE_CO2_RATE = True
-CER_SCALE = 20.0
-CER_NOISE_RSD = 0.03
+# ─── Plant Heat Removal ───────────────────────────────────────────────────────
+# One cooling loop removes every reactor's fermentation heat and one scrubber
+# its CO2, so their capacity caps the plant's total CO2 evolution rate (CER),
+# the heat-load proxy.  A reactor's CER is its broth's CO2 production rate
+# times its mass, R[CO2] x M (g/s with concentrations in g/kg), times
+# HEAT_LOAD_SCALE for kg/h.  The cap sits just below what the three reactors
+# release when all feed at half rate in phase (~580 kg/h; ~1,100 kg/h at full
+# rate), so they share the budget: feeding fast in one reactor leaves less for
+# the others, and a high-titer batch must be fed slowly over a longer fed-batch.
+HEAT_LOAD_SCALE = 3.6
+MAX_HEAT_LOAD = 540.0       # kg CO2/h, plant-wide
 
 
 # =============================================================================
-# UNCERTAINTY / DOMAIN-RANDOMIZATION TASK DISTRIBUTION
+# META-RL: OBSERVATION LAYOUT AND TASK DISTRIBUTION (not in Fermentation-PPO)
 # =============================================================================
+N_REACTORS = 3
+N_SPECIES = len(SPECIES_NAMES)
+I_ETH = SPECIES_IDX['Eth']
+
+
+def get_reactor_config():
+    """The plant's reactor capacities (``get_main_reactor_config``)."""
+    return get_main_reactor_config()
+
+
+# Each reactor's feed pumps as a multiple of the 1x reactor's (2487 kg/h LF,
+# 628 kg/h C5), as in get_main_reactor_config.
+REACTOR_FLOW_SCALE = (1.0, 4.0, 0.5)
+
+
+# One observation row per reactor, the environment's get_state_norm() row
+# (REACTOR_OBS_DIM = 28; the flat observation is the three rows in order):
+#     0-14  species concentrations / C_MAX_LIMITS
+#     15    M / Mmax
+#     16-20 stage one-hot (5)
+#     21    stage credit remaining / base_credits[stage]
+#     22    Mmax / 220,000 kg
+#     23    LF pump capacity / (4x the 1x reactor's)
+#     24    C5 pump capacity / (4x the 1x reactor's)
+#     25    central storage mass / S_MAX         (plant-wide, in every row)
+#     26    LF feedstock remaining / INITIAL_LF  (plant-wide, in every row)
+#     27    C5 feedstock remaining / INITIAL_C5  (plant-wide, in every row)
+R_MASS = 15
+R_STAGE = 16
+R_CREDIT = 21
+R_MMAX = 22
+R_FMAX_LF = 23
+R_FMAX_C5 = 24
+R_STORAGE = 25
+R_LF = 26
+R_C5 = 27
+REACTOR_OBS_DIM = 28
+
+# Normalise each reactor's lot in the privileged state (the observation has
+# no lot channel). One batch's lot is at most a vessel (~0.55).
+PRODUCT_MASS_SCALE = 400000.0
+# The ethanol C_MAX, so the lot titer and the broth ethanol share one scale.
+TITER_SCALE = float(C_MAX_LIMITS[I_ETH])
+
+
+# ─── Uncertainty / domain-randomization task distribution ─────────────────────
 # A task fixes one realization of the latent theta, sampled once per episode
 # and never observed by the agent. NOT randomized: the chemistry, held at the
-# PPO values on every task and in every reactor (see MetaRL_Lean/env_config
-# for why: scope, and the pH bumps' dead tasks).
+# nominal values on every task and in every reactor.
 #
 # Randomized: flow quantities only, each the persistent counterpart of a
 # mid-episode disturbance kind:
@@ -280,7 +189,6 @@ CER_NOISE_RSD = 0.03
 #      reactor (counterparts of `feed_gain` and `leak`): a plant has a pump
 #      and a vessel per reactor, so the encoder must also infer WHICH vessel
 #      is off.
-
 TASK_PRIORS = {
     "feed_solids_scale": (0.8, 1.2),   # correlated CS/XS/LS scaling, both feeds
     "feed_gx_ratio": (0.8, 1.2),       # glucose up / xylose down (and vice-versa)
@@ -298,19 +206,19 @@ def _per_reactor(name):
 
 
 # Latent descriptor layout, used for diagnostics, the auxiliary "task" head and
-# the meta arm's task-aware critics. kinetic_activity is 1.0 and contam_rate 0
-# in the prior; they move only when a biochemical fault or a contamination
-# fires in that reactor. downstream_rate is the storage tank's outflow as a
-# multiple of S_OUT_RATE, turnaround_mult the turnaround time and
-# storage_capacity the tank's usable volume as multiples of nominal, all 1.0
-# in the prior; the fault of the same name moves each.
+# the critics' task conditioning. kinetic_activity is 1.0 and contam_rate 0 in
+# the prior; they move only when a biochemical fault or a contamination fires
+# in that reactor. downstream_rate is the storage tank's outflow as a multiple
+# of S_OUT_RATE, turnaround_mult the turnaround time, storage_capacity the
+# tank's usable volume and cooling_capacity the heat-load cap as multiples of
+# nominal, all 1.0 in the prior; the fault of the same name moves each.
 TASK_CONTEXT_NAMES = (["feed_solids", "feed_gx"]
                       + _per_reactor("feed_gain")
                       + _per_reactor("leak_frac")
                       + _per_reactor("kinetic_activity")
                       + _per_reactor("contam_rate")
                       + ["downstream_rate", "turnaround_mult",
-                         "storage_capacity"])
+                         "storage_capacity", "cooling_capacity"])
 TASK_CONTEXT_DIM = len(TASK_CONTEXT_NAMES)
 # Offsets of each group in the descriptor.
 CTX_SOLIDS, CTX_GX = 0, 1
@@ -321,16 +229,17 @@ CTX_CONTAM = CTX_KIN + N_REACTORS
 CTX_DOWNSTREAM = CTX_CONTAM + N_REACTORS
 CTX_TURNAROUND = CTX_DOWNSTREAM + 1
 CTX_STORAGE_CAP = CTX_TURNAROUND + 1
+CTX_COOLING_CAP = CTX_STORAGE_CAP + 1
 
-# Standardization for the auxiliary regression target (the lean study's
-# per-quantity centers and scales, repeated per reactor).
+# Standardization for the auxiliary regression target (per-quantity centers
+# and scales, repeated per reactor).
 TASK_CONTEXT_CENTER = np.array(
     [1.00, 1.00] + [1.00] * N_REACTORS + [0.00075] * N_REACTORS
-    + [1.00] * N_REACTORS + [0.0] * N_REACTORS + [1.00, 1.00, 1.00],
+    + [1.00] * N_REACTORS + [0.0] * N_REACTORS + [1.00, 1.00, 1.00, 1.00],
     dtype=np.float64)
 TASK_CONTEXT_SCALE = np.array(
     [0.12, 0.12] + [0.09] * N_REACTORS + [0.00045] * N_REACTORS
-    + [0.20] * N_REACTORS + [0.001] * N_REACTORS + [0.20, 0.50, 0.10],
+    + [0.20] * N_REACTORS + [0.001] * N_REACTORS + [0.20, 0.50, 0.10, 0.10],
     dtype=np.float64)
 
 
@@ -354,45 +263,15 @@ def _u(rng, lohi, size=None):
     return rng.uniform(lohi[0], lohi[1], size=size).astype(np.float64)
 
 
-def build_param_vector(eta, ph_g, ph_x, max_ads, k_ads, tox):
-    """Assemble the length-``PARAM_DIM`` kinetic vector for the rate kernel.
-
-    Args:
-        eta: Overall hydrolysis modifier.
-        ph_g: Glucose-uptake pH modifier.
-        ph_x: Xylose-uptake pH modifier.
-        max_ads: Length-3 enzyme adsorption capacities.
-        k_ads: Length-3 enzyme adsorption affinities.
-        tox: Length-3 toxin tolerance multipliers [F, ACT, HMF].
-
-    Returns:
-        NumPy float64 array of length PARAM_DIM.
-    """
-    p = np.empty(PARAM_DIM, dtype=np.float64)
-    p[0], p[1], p[2] = eta, ph_g, ph_x
-    p[3:6] = np.asarray(max_ads, dtype=np.float64)
-    p[6:9] = np.asarray(k_ads, dtype=np.float64)
-    p[9:12] = np.asarray(tox, dtype=np.float64)
-    return p
-
-
-# The one kinetic parameter vector every task and every reactor uses.
-NOMINAL_ETA, NOMINAL_PH_G, NOMINAL_PH_X = kinetics_from_pH(NOMINAL_PH)
-NOMINAL_PARAMS = build_param_vector(
-    NOMINAL_ETA, NOMINAL_PH_G, NOMINAL_PH_X,
-    NOMINAL_MAX_ADS, NOMINAL_K_ADS, np.ones(3))
-NOMINAL_PARAMS.flags.writeable = False
-
-
 def _context(solids, gx, gains, leaks):
     """A prior task's descriptor: no fault has acted yet."""
     return np.concatenate([[solids, gx], gains, leaks,
                            np.ones(N_REACTORS), np.zeros(N_REACTORS),
-                           [1.0, 1.0, 1.0]])
+                           [1.0, 1.0, 1.0, 1.0]])
 
 
 def nominal_task():
-    """Return the nominal task theta_0 (no randomization).
+    """Return the nominal task theta_0: the Fermentation-PPO plant exactly.
 
     The sole training task for the single-regime arms (``baseline``,
     ``saferl``). Its flow is ideal -- every pump gain 1.0, no leak, unscaled
@@ -400,12 +279,11 @@ def nominal_task():
     off-spec feedstock until evaluation.
 
     Returns:
-        Task dict with keys: params, C_C5, C_LF, flow, context, meta.
+        Task dict with keys: C_C5, C_LF, flow, context, meta.
     """
     gains = np.ones(N_REACTORS)
     leaks = np.zeros(N_REACTORS)
     return {
-        "params": np.array(NOMINAL_PARAMS, dtype=np.float64),
         "C_C5": C_C5_BASE.copy(),
         "C_LF": C_LF_BASE.copy(),
         "flow": {"feed_gain": gains.copy(), "leak_frac": leaks.copy()},
@@ -432,9 +310,8 @@ def _widen(lohi, factor):
 def sample_task(rng=None, ood=False):
     """Sample one task theta ~ p(theta).
 
-    Only flow quantities vary; ``params`` is always ``NOMINAL_PARAMS``. The
-    feed concentration is one draw for the plant; each reactor's pump gain
-    and leak are independent draws.
+    Only flow quantities vary. The feed concentration is one draw for the
+    plant; each reactor's pump gain and leak are independent draws.
 
     Args:
         rng: Optional ``numpy.random.Generator``; a fresh one when None.
@@ -442,7 +319,6 @@ def sample_task(rng=None, ood=False):
 
     Returns:
         Task dict with keys:
-            - params: length-PARAM_DIM kinetic vector (always NOMINAL_PARAMS).
             - C_C5, C_LF: randomized feed composition vectors (length 15).
             - flow: dict with per-reactor ``feed_gain`` and ``leak_frac``.
             - context: the true latent descriptor (TASK_CONTEXT_NAMES).
@@ -471,7 +347,6 @@ def sample_task(rng=None, ood=False):
     meta = {"feed_solids": solids, "feed_gx": gx,
             "feed_gain": gains.tolist(), "leak_frac": leaks.tolist(),
             "nominal": False, "ood": ood}
-    return {"params": np.array(NOMINAL_PARAMS, dtype=np.float64),
-            "C_C5": C_C5, "C_LF": C_LF,
+    return {"C_C5": C_C5, "C_LF": C_LF,
             "flow": {"feed_gain": gains, "leak_frac": leaks},
             "context": _context(solids, gx, gains, leaks), "meta": meta}

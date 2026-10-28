@@ -29,9 +29,9 @@ from metarl.apn.network import (APN_PATH, ActionProjectionNetwork,
                                 PROJ_REPAIR_THRESHOLD, PROJ_TARGET_MARGIN,
                                 PROJ_THRESHOLD, load_apn, project_to_safe,
                                 save_apn)
-from metarl.env.config import MASK_INTERNAL_CONCENTRATIONS
-from metarl.env.layout import SHIELD_OBS_DIM, ACTION_DIM, TIME_ACTION_DIMS
-from metarl.env.plant import PlantFermentationEnv
+from metarl.env.layout import (SHIELD_OBS_DIM, ACTION_DIM, TIME_ACTION_DIMS,
+                               SHIELD_IGNORED_CHANNELS)
+from metarl.env.adapter import PlantFermentationEnv
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
@@ -41,7 +41,7 @@ device = torch.device(os.environ.get("PLANT_DEVICE")
 # ─── Schedule ─────────────────────────────────────────────────────────────────
 SEED = int(os.environ.get("PLANT_SEED", 0))
 # Longer than the lean study's 6000: seven margins over three reactors and the
-# tank, on 87 inputs instead of 30.
+# tank, on 96 inputs instead of 30.
 EPOCHS = 12000
 BATCH_SIZE = 4096
 BUFFER_SIZE = 400000
@@ -53,13 +53,17 @@ APN_LATENT_DIM = 128
 APN_ENCODER_DIM = 128
 
 # ─── Early stop ───────────────────────────────────────────────────────────────
-TARGET_SIGN_ACC = 0.965 if MASK_INTERNAL_CONCENTRATIONS else 0.985
+TARGET_SIGN_ACC = 0.965
 MIN_EPOCHS = 2000
 VALIDATE_EVERY = 500
-PATIENCE = 3000
+# Longer than the cosine schedule's last cycle (epochs 4000-12000), so a
+# stop never catches the shield at a high learning rate: at 3000 the plant's
+# shield stopped at epoch 6500 with repair 0.87; run through, it reached sign
+# 0.992 / boundary 0.971 / repair 0.90 (0.97 on the hard constraints).
+PATIENCE = 9000
 
 # ─── Validation gates (the lean study's) ─────────────────────────────────────
-VAL_MIN_SIGN_ACC = 0.95 if MASK_INTERNAL_CONCENTRATIONS else 0.97
+VAL_MIN_SIGN_ACC = 0.95
 VAL_MIN_BOUNDARY_ACC = 0.85
 VAL_MIN_REPAIR_RATE = 0.90
 VAL_MIN_NOOP_RATE = 0.85
@@ -89,7 +93,8 @@ def new_apn():
     return ActionProjectionNetwork(SHIELD_OBS_DIM, ACTION_DIM,
                                    latent_dim=APN_LATENT_DIM,
                                    encoder_dim=APN_ENCODER_DIM,
-                                   inert_dims=TIME_ACTION_DIMS)
+                                   inert_dims=TIME_ACTION_DIMS,
+                                   ignored_obs=SHIELD_IGNORED_CHANNELS)
 
 
 # =============================================================================
@@ -120,8 +125,7 @@ def validate(net, rng, const, n=20000, verbose=True):
     near = m.abs() < 0.05
     res["boundary_acc"] = float(correct[near].float().mean()) if near.any() else 1.0
 
-    mask_conc = const.get("mask_internal_concentrations") if const else None
-    o2 = torch.from_numpy(sample_states(n, rng, mask_concentrations=mask_conc)).to(dev)
+    o2 = torch.from_numpy(sample_states(n, rng)).to(dev)
     a2 = torch.from_numpy(sample_actions(n, rng)).to(dev)
     shut = shut_action(n, device=dev)
     with torch.no_grad():
@@ -211,12 +215,7 @@ def train(epochs=EPOCHS, batch_size=BATCH_SIZE, buffer_size=BUFFER_SIZE,
 
     print(f"\n{'=' * 78}\nTRAIN ACTION PROJECTION NETWORK  "
           f"(obs={SHIELD_OBS_DIM}, act={ACTION_DIM}, device={device})\n{'=' * 78}")
-    if const["mask_internal_concentrations"]:
-        print("  observability: concentrations MASKED -> reactor overflow / "
-              "underflow (x3) and storage overflow")
-    else:
-        print("  observability: FULL -> also each reactor's harvest titer and "
-              "lot purity")
+    print("  margins: reactor overflow / underflow (x3) and storage overflow")
     print(f"  epochs<={epochs}  batch={batch_size}  buffer={buffer_size}  seed={seed}")
 
     buf_o, buf_a, buf_m = _refresh_buffer(buffer_size, rng, const)

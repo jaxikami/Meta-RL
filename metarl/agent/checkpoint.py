@@ -41,12 +41,14 @@ def _net_mismatch(stored, mine, compare_encoder):
     return sorted(k for k in keys if have.get(k) != mine.get(k))
 
 
-def _film_padded(src, dst, where):
+def _film_padded(src, dst, where, z_dim):
     """Fit a source state dict to ``dst``'s shapes for a warm start.
 
-    The one mismatch allowed is a FiLM projection WEIGHT, whose input width
-    is the conditioning width; those come back as zeros, which keeps every
-    layer on the source's modulation for any z and any task.
+    A FiLM projection WEIGHT reads the conditioning vector, whose first
+    ``z_dim`` entries are the latent: those columns come back as zeros, so
+    every layer keeps the source's modulation for any z, and the rest (the
+    critics' task descriptor and privileged state) is copied. A FiLM weight of
+    another conditioning width comes back all zeros.
 
     Raises:
         ValueError: On a missing key or any other shape mismatch.
@@ -56,9 +58,13 @@ def _film_padded(src, dst, where):
         if k not in src:
             raise ValueError(f"{where}: no tensor {k!r}")
         s = src[k]
+        film = ".films." in f".{k}" and k.endswith(".proj.weight")
         if s.shape == v.shape:
             out[k] = s
-        elif ".films." in f".{k}" and k.endswith(".proj.weight"):
+            if film:
+                out[k] = s.clone()
+                out[k][:, :z_dim] = 0.0
+        elif film:
             out[k] = torch.zeros_like(v)
         else:
             raise ValueError(f"{where}: {k!r} has shape {tuple(s.shape)}, "
@@ -240,7 +246,8 @@ class CheckpointMixin:
         for key, module in (("actor", self.actor), ("critic", self.critic),
                             ("critic_target", self.critic_target)):
             module.load_state_dict(_film_padded(
-                ckpt[key], module.state_dict(), f"{path} [{key}]"))
+                ckpt[key], module.state_dict(), f"{path} [{key}]",
+                self._z_dim))
         with torch.no_grad():
             self.log_alpha.copy_(ckpt["log_alpha"].to(device))
         if "ret_rms" in ckpt and self.ret_rms is not None:
@@ -261,6 +268,12 @@ class CheckpointMixin:
         self._actor_decay_ref = (
             {id(p): p.detach().clone() for p in self.actor.parameters()}
             if decay_to_source else None)
+        # The source's per-reactor history stays as it was trained: the base
+        # policy and the anchor read the same features, and this arm adapts
+        # through z.
+        self.history_frozen = True
+        for p in self.actor.history.parameters():
+            p.requires_grad_(False)
         if self.adapt_gate:
             self.base_actor.load_state_dict(self.actor.state_dict())
             self._mark_base_stale()

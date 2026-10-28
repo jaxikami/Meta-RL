@@ -4,23 +4,39 @@ The lean study's question (`../MetaRL_Lean`), asked of the full plant:
 
 > Can a meta-RL agent that infers the operating regime online hold **production
 > and product quality** while staying inside safety constraints, under flow,
-> biochemical and storage faults a conventional safe-RL policy was never
-> trained for?
+> biochemical, storage and cooling faults a conventional safe-RL policy was
+> never trained for?
 
-Everything the lean study settled is kept: the constraints and quality
-criteria, the instrument model (POMDP), the flow-only task distribution, the
-fault kinds, the three arms, the warm-started and gated meta agent, and the
-selection and evaluation protocol. What changes is the plant: **three
-heterogeneous reactors and one central storage tank**, the multi-reactor
-study's setup, with the storage tank's two inventory constraints added to the
-lean study's six. The agent's networks are rebuilt for it (reactor tokens with
-cross-reactor attention) and enlarged.
+**The environment is Fermentation-PPO's** (`../Fermentation-PPO/envs/`), so
+this study's arms and Safe PPO are benchmarked on one plant. Its five modules
+are ported into `metarl/env/` with only their import paths changed
+(`kinetics`, `disturbances`, `plant`, `safe`, `bench`, and its constants at
+the top of `config.py`). `tests/smoke_test.py` checks that they still equal
+Fermentation-PPO's sources, and steps both environments side by side under
+every evaluation fault with bit-identical observations, rewards and violation
+counts. It skips the check when `../Fermentation-PPO` is absent;
+`FERMENTATION_PPO_ROOT` points it elsewhere. `saferl` and `meta` run on Safe
+PPO's `FermentationEnv`; `baseline` runs on Standard PPO's
+`FermentationEnvBench`.
 
-The chemistry is the Fermentation-PPO project's, pinned on every task and in
-every reactor. The fast integrator now reads one kinetic-parameter row per
-reactor, so a biochemical fault can act on one vessel alone; with identical
-rows it matches the reference integrator to 1.8e-16 relative error
-(`tests/smoke_test.py`).
+What stays this study's own: the flow-only task distribution, the three arms,
+the warm-started and gated meta agent, the action projection network, and
+the selection and evaluation protocol. `metarl/env/adapter.py` puts the
+environment behind the agent's interface without changing its plant, reward
+or constraints. It flattens the per-reactor observation and sums the
+per-reactor rewards, installs a task's feeds, pump gains and leaks as the
+plant's nominal values, and exposes the privileged views training reads (the
+effective task descriptor, the fault flag, the privileged state) plus a
+per-reactor ledger for the evaluation. The nominal task is the
+Fermentation-PPO plant exactly.
+
+Before the port, this study ran its own plant: the lean instrument model
+(masked concentrations, noisy assays, an off-gas CO₂ channel, a POMDP), a
+turnaround-conflict constraint as id 9, early-ending steps at batch
+boundaries, and its own reward scale. That plant and the results trained on
+it are in git history (commit `bc502ee` and before). The checkpoints in
+`policy/` and the figures in `results/` predate the port. They do not load
+against the current environment (observation layout v2), so retrain.
 
 The previous multi-reactor implementation (product-of-Gaussians PEARL,
 inventory-only constraints) is in git history (commit `88452a4` and before).
@@ -33,11 +49,11 @@ superseded and do not import against the `metarl` package.
 
 ## The three arms
 
-| arm | training tasks | latent z | Lagrangian duals | stage mask | action projection (APN) |
-|---|---|---|---|---|---|
-| `baseline` | nominal only | no | no | no | no |
-| `saferl` | nominal only | no | yes | yes | **hard**: reactor overflow / underflow, storage overflow |
-| `meta` | fresh prior task per episode + mid-episode faults, from `saferl`'s policy, which acts until z detects a fault | yes | yes | yes | **hard**: the same shield |
+| arm | environment | training tasks | latent z | Lagrangian duals | stage mask | action projection (APN) |
+|---|---|---|---|---|---|---|
+| `baseline` | Standard PPO's (`FermentationEnvBench`) | nominal only | no | no (static spikes) | no (the environment enforces the stages) | no |
+| `saferl` | Safe PPO's (`FermentationEnv`) | nominal only | no | yes | yes | **hard**: reactor overflow / underflow, storage overflow |
+| `meta` | Safe PPO's | fresh prior task per episode + mid-episode faults, from `saferl`'s policy, which acts until z detects a fault | yes | yes | yes | **hard**: the same shield |
 
 - `SAFETY = saferl − baseline`, `ADAPT = meta − saferl`, both paired.
 - `INCLUDE_BASELINE = False` by default (as in the lean study), so `all` trains
@@ -48,6 +64,14 @@ superseded and do not import against the `metarl` package.
   base(s))`, the per-fault-kind anchor, L2-SP decay toward `saferl`, pink
   exploration noise, no-regression selection against `saferl` as it runs. See
   the lean README for the reasons behind each.
+- `lagrangian=False` on a Safe PPO environment (the ablation's `lagrangian`
+  component) is Fermentation-PPO's no-Lagrangian case study: every
+  multiplier at zero and frozen, fixed per-violation penalties instead.
+- The duals are reset every episode (`RESET_LAMBDAS_PER_EPISODE = True`, a
+  setting of this study; the environment's default, and Safe PPO's training,
+  carry them across episodes). An off-policy replay stores rewards priced by
+  the duals of the episode they came from, so carrying them over would make
+  the stored rewards stale.
 
 ---
 
@@ -55,108 +79,104 @@ superseded and do not import against the `metarl` package.
 
 | unit | spec |
 |---|---|
-| reactors R0 / R1 / R2 | 220 t each; feed pumps 1× / **4×** / 0.5× the lean vessel's (LF 2487 kg/h, C5 628 kg/h at 1×) |
+| reactors R0 / R1 / R2 | 220 t each; feed pumps 1× / **4×** / 0.5× (LF 2487 kg/h, C5 628 kg/h at 1×) |
 | feedstock pool | 2,000 t LF and 600 t C5, shared, drawn in reactor order each hour |
 | central storage | 400 t (`S_MAX`), floor 5 t (`S_MIN`), starts at 350 t, feeds downstream at 1.5 t/h |
+| cooling loop | one, shared: the plant's CO₂ evolution rate (the heat-load proxy) ≤ 540 kg/h |
 
-Each reactor runs the lean recipe (charge, co-feed, ferment, unload, clean;
-262 h at a unit clock); an episode is 600 h, acted on every 5 h.
+Each reactor runs the recipe charge, co-feed, ferment, unload, clean (262 h
+at a unit clock); an episode is 600 h, acted on every 5 h: exactly 120
+control steps (`CONTEXT_SIZE = 128`).
 
-**The storage tank is the bottleneck, and it couples the reactors.**
-Downstream takes 900 t over an episode, the tank holds 400 t and starts at
-350 t, so the plant can discharge at most ~950 t (~4.5 full batches) without
-overflowing it, against ~7 batches three free-running vessels would make. It
-also runs dry by ~230 h without inflow. So unloads have to be staggered, a
-finished batch sometimes held, and a batch started early enough to keep
-downstream fed. A scripted scheduler shows both sides
-(`tests/smoke_test.py`, nominal plant, exact instruments):
+**The storage tank is the bottleneck, and it couples the reactors**; so does
+the cooling loop. Downstream takes 900 t over an episode, the tank holds
+400 t and starts at 350 t, so the plant can discharge at most ~950 t (~4.5
+full batches) without overflowing it, against ~7 batches three free-running
+vessels would make. It also runs dry by ~230 h without inflow. So unloads
+have to be staggered, a finished batch sometimes held, and a batch started
+early enough to keep downstream fed. The heat cap sits just below what the
+three vessels release feeding at half rate in phase, so fast feeding in one
+leaves less for the others. Scripted policies (`tests/smoke_test.py`, nominal
+plant):
 
-| scripted policy | violations | lots released | on-spec ethanol | reward |
+| scripted policy | violation events | lots released | on-spec ethanol | reward |
 |---|---|---|---|---|
-| idle | 370 h storage underflow + purity (nothing shipped) | 0 | 0 | −3816 |
-| clocks in lockstep, drain whenever unloading | 160 h storage overflow | — | — | — |
-| clocks staggered 1.0 / 0.8 / 0.6× in charge and co-feed, drain only below 85% storage | **none** | 6 / 6 | 6.8e7 | +55.8 |
+| idle | 370 storage underflow + 1 purity (nothing shipped) | 0 | 0 | −368.9 |
+| clocks in lockstep, drain whenever unloading | 161 storage overflow + 2 purity | — | — | −26.7 |
+| clocks staggered 1.0 / 0.8 / 0.6×, closed-loop feed toward 80% Mmax, drain below 85% storage | 1 purity (the lot open at episode end) | 5 / 6 | 6.61e7 | +1.86 |
+| the same recipe at fixed feed rates | **none** (heat peak 432 kg/h) | 5 / 5 | 6.68e7 | +1.82 |
 
 - **Action** `(12,)` in `[-1, 1]`, four per reactor: time multiplier
   (0.5–2×), LF feed, C5 feed, discharge.
-- **Stage mask** per reactor (the lean mask): clock free except cleaning; LF in
-  charge and co-feed; C5 in co-feed; discharge in unload.
-- **Observation** `(78,)`:
+- **Stage mask** per reactor (the environment's `get_action_mask`): clock
+  free except cleaning; LF in charge and co-feed; C5 in co-feed; discharge in
+  unload.
+- **Observation** `(84,)`: the environment's `get_state_norm()`, one row of
+  28 per reactor, flattened. It is exact: no instrument noise, every species
+  observed.
 
-  | channels | content |
+  | channels of row i (at `28·i`) | content |
   |---|---|
-  | `24·i + 0..14` | reactor i species (zeroed when `MASK_INTERNAL_CONCENTRATIONS`) |
-  | `24·i + 15` | reactor i mass / Mmax |
-  | `24·i + 16..20` | reactor i stage one-hot |
-  | `24·i + 21` | reactor i stage credit remaining |
-  | `24·i + 22..23` | reactor i lot in progress: mass, mass-weighted mean titer |
-  | `72` | storage mass / S_MAX |
-  | `73..74` | LF / C5 pool remaining |
-  | `75..77` | each reactor's off-gas CO₂ evolution rate |
+  | `0..14` | reactor i species / `C_MAX_LIMITS` |
+  | `15` | reactor i mass / Mmax |
+  | `16..20` | reactor i stage one-hot |
+  | `21` | reactor i stage credit remaining |
+  | `22..24` | reactor i capacities: Mmax, LF pump, C5 pump (normalised) |
+  | `25..27` | plant: storage mass / S_MAX, LF and C5 pools remaining (the same in every row) |
 
-  The CO₂ rates sit at the tail so the shield reads a prefix (`SHIELD_OBS_DIM
-  = 75`) that never contains them, as in the lean study.
+  Nothing in it shows a lot in progress (its mass and mean titer), a pump's
+  gain, a leak, the storage or cooling capacity, or the heat load itself.
 - **Lots** are per reactor batch, released or rejected when that reactor's
-  batch completes (and at episode end). A rejected lot earns nothing; the
-  others' released lots still count. The tank is a physical buffer only: lots
-  are judged before they reach it.
-- **Discharge cutoff** (2% of max outflow), the **unload-until-empty rule** and
-  the **batch-boundary interlock** are the lean rules, per reactor. A batch
-  boundary in any reactor ends the outer step, so the policy re-decides for
-  every reactor; the longest episode is then 124 control steps
-  (`CONTEXT_SIZE = 160`).
+  cleanup ends (and at episode end). A rejected lot's production reward is
+  withdrawn; the others' released lots still count.
+- **Discharge cutoff** (2% of max outflow), the **unload-until-empty rule**
+  and the **batch-boundary interlock** (the valve opens only in unload) are
+  per reactor. An outer step always runs its five hours.
 
 ### Constraints
 
-| id | constraint | scope | magnitude |
+The environment's ids (`metarl/env/safe.py`):
+
+| id | constraint | scope | depth past the limit |
 |---|---|---|---|
 | 1 | reactor overflow | per reactor, per step | `M/Mmax − 1` |
 | 2 | reactor underflow | per reactor, per step | `(DRY_FLOOR − M)/DRY_FLOOR` |
-| 3 | harvest titer floor, 65 g/L | per draining reactor, per step | `(spec − titer)/spec` |
-| 4 | product purity spec, 75 g/L | per lot (and once if the plant shipped nothing) | `(spec − lot mean)/spec` |
-| 5 | numerical instability | per reactor | integrator severity |
-| 6 | mass-balance drift | plant, episode end | residual / tolerance |
-| 7 | **storage overflow** | plant, per step | `(S − S_MAX)/S_MAX` |
-| 8 | **storage underflow** | plant, per step | `(S_MIN − S)/S_MIN` |
-| 9 | **turnaround conflict** (scheduling) | plant, per step, one event per extra vessel | count |
+| 3 | storage overflow | plant, per step | `(S − cap)/cap`, cap = S_MAX × storage capacity |
+| 4 | storage underflow | plant, per step | `(S_MIN − S)/S_MIN` |
+| 5 | numerical instability | plant (ends the episode) | — |
+| 6 | mass-balance drift | plant, episode end | — |
+| 7 | harvest titer floor, 65 g/L | per draining reactor, per step | `(spec − titer)/spec` |
+| 8 | product purity spec, 75 g/L | per lot (and once if the plant shipped nothing) | `(spec − lot mean)/spec` |
+| 9 | **heat-removal capacity** | plant, per step | `(heat load − cap)/cap`, cap = 540 kg CO₂/h × cooling capacity |
 
-The headline count is violation **events**: every (hour, constraint, instance)
-triple, the instance being the reactor for 1–5 and the plant for 6–9.
+The headline count is violation **events** (`info["violation_events"]`):
+every (hour, constraint, instance) triple, the instance being the reactor
+for 1, 2 and 7, the lot for 8 and the plant otherwise; `violation_counts`
+sums to it exactly. The adapter attributes ids 1, 2, 7 and 8 to their
+reactors (`reactor_violation_events`).
 
-- **9, turnaround conflict.** One clean-in-place skid and one inoculum line
-  serve the plant, so only one vessel may be in turnaround (cleanup, or
-  charging a fresh batch) at a time. Every vessel starts the episode
-  charging, so a first batch is exempt. It is a scheduling constraint: the
-  stage clocks must stagger the batches. The trained `saferl` and `meta`
-  overlap ~2 vessel-hours per undisturbed episode (30% of episodes). It is
-  priced like 7–8 (`BASE_SPIKE` per event plus a dual) and needs no new
-  observation channel: every vessel's stage is visible. Policies trained
-  before it existed never saw it in the reward. Two
-vessels overflowing in the same hour are two events; `violation_counts` sums
-to the headline exactly.
+Constraint 9 couples scheduling and control: how fast each reactor is fed,
+and when the batches' fed-batch phases overlap, decide together whether the
+plant stays under the cap, and it trades off against purity (a high-titer
+batch must be fed slowly over a longer fed-batch).
 
 ### Reward
 
-The lean terms, per reactor where they are local (`metarl/env/plant.py`):
+Safe PPO's (`metarl/env/safe.py`), per reactor; the agent gets their sum:
 
 | term | value |
 |---|---|
-| production | `+10 × harvested ethanol / 1e7`, withdrawn in full if the lot is rejected |
-| raw material | `−5.0 × fraction of each pool consumed` (the lean 1.5 rescaled to the larger pools, so a kilogram of feed costs what it cost there) |
-| violation spike | `−0.3 × (1 + magnitude)` per event (ids 1–3, 7, 8) |
-| Lagrangian | `−λ × violation`; duals per reactor for 1–4, and one each for 7 and 8 (off for `baseline`) |
-| soft walls | quadratic up to `−0.02`: each reactor near overflow (90%), underflow (< 100 kg) and the harvest spec; storage above 90% of S_MAX and below 60 t (≥ 37 h of downstream draw above S_MIN) |
-| purity shaping, lot release, instability, mass balance, smoothing, trickle, feedstock barrier | the lean terms, per reactor where local |
+| production | `+0.5 × harvested ethanol / 1e7`, withdrawn in full if the lot is rejected |
+| raw material | `−10 × fraction of each pool consumed` |
+| violation price | `−λ × d / (1 + d)` at depth `d`; duals per reactor for 1, 2, 7, 8 and one each for 3, 4, 9, grown by `0.5 × d` per violated step, decayed by `0.5/600` otherwise, at most 2. The heat dual's cost is split over the reactors by their share of the load. No fixed spike unless `lagrangian=False` |
+| soft walls | quadratic up to `−0.005`: each reactor above 90% Mmax, below 100 kg and draining within 15% of the harvest spec; storage above 90% of its volume and below 8 × S_MIN; heat load above 90% of the cap |
+| barriers | storage log-barrier below 16 × S_MIN; feedstock below 2% |
+| purity shaping | `−0.002` quadratic on each lot below 1.15 × spec |
+| smoothing, trickle | `0.005 ×` mean squared change of the flow commands; `0.0005` per reactor in unload |
 
-### Instrument model
-
-The lean model on every reactor: online gauges (masses, lot masses, storage,
-feed pools) at 0.5% noise; hourly at-line assays (species, lot titers) at 3%
-RSD with no delay; each reactor's off-gas CO₂ rate at 3%; stage and credit
-exact; pump gains, leaks and delivered feed strength unmeasured.
-`MASK_INTERNAL_CONCENTRATIONS = True` zeroes every reactor's species
-channels. `baseline` and `saferl` train on exact observation; `meta` trains
-with the noise; every arm is evaluated with it.
+`baseline`'s `FermentationEnvBench` prices every constraint with a static
+spike of `0.1 × (1 + 4 d / (1 + d))` instead, with log barriers on 1–4 and no
+dual or soft wall.
 
 ---
 
@@ -171,11 +191,17 @@ with the noise; every arm is evaluated with it.
 | `leak_frac_r{0,1,2}` | U(0, 0.0015) per h | **per reactor**, independent |
 
 So the encoder must also infer *which* vessel is off. OOD tasks widen every
-half-width 1.8×. The task descriptor (aux target, privileged critic input) has
-15 entries: feed, three gains, three leaks, three kinetic activities, three
-contamination rates and the downstream rate.
+half-width 1.8×. A task's values are installed as the plant's nominal ones
+before every reset: a `feed_conc` fault scales the task's feed, a
+`feed_gain` fault multiplies the task's gain, a fault leak adds to the
+task's. The task descriptor (aux target, privileged critic input) has 18
+entries: feed, three gains, three leaks, three kinetic activities, three
+contamination rates, the downstream rate, turnaround time, storage volume
+and cooling capacity.
 
 ### Mid-episode faults
+
+Fermentation-PPO's kinds and evaluation scenarios (`metarl/env/disturbances.py`):
 
 | kind | target | effect | meta-training range | eval |
 |---|---|---|---|---|
@@ -185,13 +211,15 @@ contamination rates and the downstream rate.
 | `disturb_kinetics_decay` | one reactor or all | hydrolysis and uptake × magnitude | 0.15–0.70 | 0.20 |
 | `toxin_spike` | one reactor or all | its feed-line inhibitors, a broth pulse, uptake × 1/magnitude | 2.0–8.0 | 6.50 |
 | `cell_viability` | one reactor or all | viable cells × magnitude | 0.30–0.70 | 0.50 |
-| `contamination` | one reactor or all | its broth ethanol oxidised per hour | 0.0005–0.004 | — |
-| **`downstream_rate`** | the storage tank | downstream draw × magnitude | 0.40–1.60 | 0.50 |
-| **`turnaround_delay`** | the shared turnaround equipment | every cleanup and re-charge that starts after onset × magnitude long | 1.5–5.0 | 4.0 |
-| **`storage_capacity`** | the storage tank | usable volume × magnitude (the overflow wall moves, the level reading does not) | 0.75–0.97 | 0.90 |
+| `contamination` | one reactor or all | its broth ethanol oxidised per hour | 0.0005–0.004 | 0.002 |
+| `downstream_rate` | the storage tank | downstream draw × magnitude | 0.40–1.60 | 0.50 |
+| `turnaround_delay` | the shared turnaround equipment | every cleanup and re-charge that starts after onset × magnitude long | 1.5–5.0 | 4.0 |
+| `storage_capacity` | the storage tank | usable volume × magnitude (the overflow wall moves, the level reading does not) | 0.75–0.97 | 0.90 |
+| **`cooling_capacity`** | the cooling loop | heat-load cap × magnitude (nothing observed moves) | 0.65–0.95 | 0.80 |
 
 - Every kind has four temporal **patterns** (`FAULT_PATTERNS`, built by
-  `tasks.pattern_schedule`):
+  `tasks.pattern_schedule`; the evaluation schedules equal
+  Fermentation-PPO's `eval_schedule`, checked by the smoke test):
 
   | pattern | profile | evaluation timing (h of 600) |
   |---|---|---|
@@ -212,60 +240,54 @@ contamination rates and the downstream rate.
   (step 0.35, spike 0.15, gradual 0.15, recurrent 0.20, plus training-only
   compound 0.15: two kinds stepping together), with spike lengths, ramp
   length and on / off windows drawn per episode (`META_SPIKE_H`,
-  `META_GRADUAL_FRAC`, `META_RECURRENT_*`). The compound pairs add
-  `downstream_rate + feed_gain`.
+  `META_GRADUAL_FRAC`, `META_RECURRENT_*`).
 - In evaluation and in the held-out panel, a per-reactor fault **rotates**:
   episode k faults reactor `k mod 3`, identically for every arm, so the
   comparison stays paired and every vessel is faulted on a third of the tasks.
-- `turnaround_delay` is the scheduling fault: the clean-in-place skid and
-  inoculum line run slow, so turnarounds overlap (constraint 9) unless the
-  stage clocks re-stagger the batches. It costs `saferl` no output (the tank
-  bottleneck leaves vessels idle anyway) but triples its conflicts at 4×; a
-  fixed-rate recipe also overfills, since its charge feeds for longer. The
-  stretched stage clock is visible in each vessel's credit channel.
-- `storage_capacity` is the storage-volume fault (a heel, fouling, or a
-  lowered high-level trip). The policies hold the tank near 330 t (max 350 t)
-  at mid-episode, so a 0.90 tank (360 t) forces no overflow at onset, yet
-  `saferl`, which keeps filling as before, overflows ~140 h per episode. The
-  new limit is not observed: it shows only through the overflow penalty.
-- Both are plant-wide and in the descriptor (`turnaround_mult`,
-  `storage_capacity`: `TASK_CONTEXT_DIM` 15 → 17), so a `meta` checkpoint
-  from before them no longer loads; retrain it.
-- `downstream_rate` is new: a distillation slowdown fills the tank (overflow,
-  or batches held back); a surge empties it. The storage mass is online, so it
-  is inferable, and it sits in `GATE_FAULT_KINDS` with the leak and pump
-  faults.
-- The magnitudes are the lean study's, which were calibrated against the lean
-  `saferl`. Recalibrate them against the plant's `saferl` before trusting a
-  row. Against the scripted scheduler every kind hurts on at least one axis
-  except `cell_viability`, which costs nothing at any magnitude (the lean
-  study's finding: the yeast regrows within the batch), and stays a row
-  where a tie is expected.
+- `cooling_capacity` and `storage_capacity` move a limit the observation
+  does not show: they reveal themselves only through the reward. The
+  `cooling_capacity` range is new and uncalibrated, and the other ranges were
+  calibrated against the previous plant's `saferl`. Recalibrate them against
+  the retrained `saferl` before trusting a row.
+- Against the scripted policies every kind hurts on at least one axis except
+  `cell_viability`, which costs nothing at any magnitude (the lean study's
+  finding: the yeast regrows within the batch), and stays a row where a tie
+  is expected.
 
 ---
 
 ## The action projection network (APN)
 
-`metarl/apn/` (`network.py`, `data.py`, `train.py`): the lean shield, widened. With
-concentrations masked it covers **each reactor's overflow and underflow and
-the storage overflow** (seven margins, smooth minimum) under a one-interval
-lookahead that reproduces the discharge cap, the shared feed pool drawn in
-reactor order and the tank's inflow and draw. The projection never moves a
-reactor's stage clock or a locked dimension; mask > projection > actor.
+`metarl/apn/` (`network.py`, `data.py`, `train.py`): the lean shield, widened. It
+covers **each reactor's overflow and underflow and the storage overflow**
+(seven margins, smooth minimum) under a one-interval lookahead that
+reproduces the discharge cap, the shared feed pool drawn in reactor order and
+the tank's inflow and draw. The projection never moves a reactor's stage
+clock or a locked dimension; mask > projection > actor. The species channels
+are zeroed at its input (`SHIELD_IGNORED_CHANNELS`): no shielded margin
+depends on them, and reading them as noise cost the repair rate.
 
 **Storage underflow is not shielded.** Within one interval the only way to
 raise the tank is to drain a reactor already in unload. When none is, every
 action is equally unsafe, and the shield would "repair" it by shutting every
 feed, costing production for nothing. Keeping the tank supplied is decided
-tens of hours earlier, so it is left to the policy and the reward, like
-harvest titer and purity.
+tens of hours earlier, so it is left to the policy and the reward. So are
+harvest titer and purity (the observation carries no lot) and the heat load
+(it needs the kinetics; Safe PPO learns that head, `safety/kinetic.py`).
 
-The network is twice the lean width (128) for its 87 inputs. Validation on 50k
-fresh samples: sign accuracy 0.973, boundary accuracy 0.895, repair rate
-0.942, no-op rate 0.996, safe preserved 1.000, mask drift 0 (all gates pass).
-`metarl/apn/train.py` ranks validation checks on (passed every gate, score): the
-lean trainer ranked on score alone and, after an early stop on a passing
-check, restored an earlier check that failed the repair gate.
+The network is twice the lean width (128) for its 96 inputs. Validation of
+`policy/apn_ppo_plant.pth` on 50k fresh samples: sign accuracy 0.992,
+boundary accuracy 0.971, no-op rate 1.000, safe preserved 1.000, mask drift 0;
+repair rate 0.897-0.906 across validation seeds, against a gate of 0.90.
+The repair test counts a projection as repaired only when the *smooth*
+minimum margin turns positive; on the hard constraints it repairs 97.4%, and
+the misses end within 0.3% of a limit. The shield was trained through the
+whole cosine schedule (`PATIENCE = 9000`): stopped mid-cycle, as the old
+patience did, it reached repair 0.87. `policy/apn_plant.pth` is the previous
+plant's shield and is not loaded. `metarl/apn/train.py` ranks validation
+checks on (passed every gate, score): the lean trainer ranked on score alone
+and, after an early stop on a passing check, restored an earlier check that
+failed the repair gate.
 
 ---
 
@@ -273,29 +295,86 @@ check, restored an earlier check that failed the repair gate.
 
 Every arm uses the same architecture (`NET_*` in `metarl/training/config.py`).
 
-- **Reactor tokens.** A reactor's token is its 24 process channels, its CO₂
-  rate and the 3 plant-wide channels, embedded with a learned slot embedding
-  (the three vessels' pumps differ). Two pre-LN self-attention blocks
-  (`TokenMixer`, 4 heads) mix the tokens; this is where the reactors
-  coordinate over the shared tank and feed pool. Each block's output
-  projections start at zero, so the mixer starts as the identity.
-- **Actor.** One FiLM-conditioned residual trunk shared by the three tokens
-  emits each reactor's four actions from its own token, so every reactor's
-  experience trains the same weights; z modulates every trunk layer.
-- **Critics.** Each Q network mixes (observation, that reactor's action)
-  tokens and flattens them into a wide FiLM residual trunk: the plant's value
-  is not a sum over reactors, because the tank couples them. `meta`'s critics
-  are conditioned on z, the true task descriptor and the plant's privileged
-  state (79 channels), as in the lean study.
-- **Encoder.** The lean GRU posterior, at width 256, over transitions read as
-  (obs, action, reward, obs change). Latent dimension 8 (lean: 5).
+- **Reactor history** (`ReactorHistory`, the Fermentation-PPO policy's
+  encoder; `NET_HISTORY_*`). A reactor's token is its observation row, the
+  28 channels Safe PPO's policy reads per reactor. It is embedded (Linear →
+  LayerNorm → ELU, plus a learned slot embedding for the vessel) and folded
+  into a 2-layer GRU of width 256 whose weights the reactors share and whose
+  state each keeps on its own. The reactors then attend to each other's
+  layer-normalised GRU outputs (`CrossReactorAttention`, 4 heads in a 64-wide
+  Q/K/V space, residual + LayerNorm, output projection starting at zero), so
+  a reactor sees its siblings' history summaries rather than their
+  single-step readings. A 128-wide skip embedding of the current token is
+  appended: each reactor's feature is 384 wide.
+- **Actor.** One FiLM-conditioned residual trunk shared by the three
+  reactors' features emits each reactor's four actions, so every reactor's
+  experience trains the same weights; z modulates every trunk layer. The
+  policy is recurrent: acting carries the history state from step to step
+  and resets it at an episode start; the update rebuilds each sampled
+  transition's state from its episode's previous transitions (the same
+  causal windows the encoder reads), exactly as online (`tests/smoke_test.py`).
+- **Critics.** Each Q network reads the actor's history features with that
+  reactor's action, mixes the three tokens (two pre-LN attention blocks,
+  `NET_MIXER_*`: the joint action couples the reactors through the tank and
+  the cooling loop) and flattens them into a wide FiLM residual trunk. The
+  critic's loss trains the history module (the actor reads it detached, as
+  in SAC with a shared encoder); `meta` keeps `saferl`'s history module
+  frozen, so its actor, the gate's base policy and the anchor read the same
+  features and it adapts through z. Every arm's critics are conditioned on z
+  (zeros without context), the true task descriptor (18) and the plant's
+  privileged state (91 channels: the observation, each reactor's lot mass and
+  mean titer, the clock): training-only inputs, the same for both arms, so
+  the critics are the same networks and a warm start copies them whole (the
+  latent's FiLM columns start at zero).
+- **Encoder.** The lean GRU posterior, at the lean width 128, over
+  transitions read as (obs, action, reward, obs change), 181 inputs. Latent
+  dimension 8 (lean: 5); the aux and fault-kind heads are 128 wide. The aux
+  head regresses the task descriptor and each reactor's lot mean titer (the
+  quality state the observation lacks).
 
-| network | lean | plant |
-|---|---|---|
-| actor | 3 × 256 MLP, ~151k | tokens 256, 2 attention blocks, shared 3 × 256 trunk, ~1.27M |
-| critics (pair) | 2 × 3 × 512, ~1.13M | tokens 256, 2 attention blocks, 3 × 1024 trunk each, ~7.9M (`saferl`), ~9.2M (`meta`) |
-| encoder | GRU 128, ~108k | GRU 256, ~0.44M |
+Against Safe PPO (`../Fermentation-PPO/agents/networks.py`), parameters:
 
+| network | Safe PPO | `saferl` | `meta` |
+|---|---|---|---|
+| per-reactor history (GRU 2 × 256, attention 64 × 4, skip 128) | 0.869M | 0.869M | 0.869M (frozen) |
+| policy head | 384 → 128 → 4: 0.050M | 3 × 256 FiLM residual trunk: 0.248M | 0.248M |
+| value | 384 → 128 → 1 per reactor: 0.050M | twin token-mixer Q, 3 × 1024 trunks: 9.548M | 9.548M |
+| learned shield | KineticNet (purity, heat heads): 0.144M | APN (inventory): 0.063M | the same APN |
+| inference | — | — | encoder 0.125M, gate 0.018M, aux and fault-kind heads 0.040M |
+| acting (policy + inference) | 0.919M | 1.117M | 1.259M |
+| trained, in all | 1.112M | 10.728M | 10.910M |
+
+The policy side matches Safe PPO's: the same history module on the same
+28-channel rows, with a wider head because z modulates it. The token width
+did not change with the port (the old token was also 28 wide, with the
+species zeroed and an off-gas rate), so no `NET_*` size changes; only the
+inputs that scale with the observation grew (the encoder's, 169 → 181, and
+the critics' conditioning, 104 → 117). The critics are SAC's twin Q
+functions over the joint action; they are ~10× Safe PPO's whole network,
+which a PPO critic does not need (its value function sees no action).
+
+A capacity probe on this plant (300 episodes of perturbed scripted
+policies on random tasks with meta-training faults, 600 updates per width)
+trained `ReactorHistory` plus a linear head to track two quantities the
+policy needs: each lot's mean titer (hidden; needs memory) and the next
+step's plant heat load (constraint 9: nonlinear in the species, summed over
+the reactors). Held-out normalised MSE:
+
+| history width | parameters | lot titer | heat load |
+|---|---|---|---|
+| 64 | 0.07M | 0.043 | 0.062 |
+| 128 | 0.24M | 0.042 | 0.064 |
+| **256** (used) | 0.87M | 0.043 | 0.070 |
+| 384 | 1.89M | 0.044 | 0.068 |
+
+Flat from 64 to 384: the new observation and the heat constraint do not
+make width a bottleneck, so a wider history would buy nothing. A narrower
+one would fit these targets too. The width stays at 256 so the policy's
+encoder is Safe PPO's, size for size, and the benchmark compares methods,
+not network sizes. Whether a smaller history trains as well under RL is
+untested.
+
+`meta`'s frozen copy of `saferl`'s actor (the gate's base) adds no capacity.
 The observation normaliser, AdamW (FiLM exempt), LayerNorm and every
 posterior-collapse countermeasure are the lean ones. Batch-1 CPU acting costs
 ~3 ms per control step.
@@ -324,23 +403,25 @@ with these plant-specific settings:
   before its updates and enter the replay after them. The task and fault
   draws are the in-process ones, in the same order. Profiled, collection was
   ~25% of an iteration and the updates ~65%.
-- Constraint 9 adds ~2.5 events per undisturbed episode to the policies
-  trained before it, so `SELECT_MAX_VIOL = 3` may admit no `saferl` check
-  until it has learned to stagger turnarounds: check the retrained
-  `saferl`'s held-out violations before trusting the selection.
-- The held-out panel adds `downstream_rate@0.6`; per-reactor branches rotate.
+- The selection thresholds were set on the previous plant (its constraint
+  set and reward); check the retrained `saferl`'s held-out violations on this
+  one before trusting the selection.
+- The held-out panel adds `downstream_rate@0.6` and `cooling_capacity@0.82`;
+  per-reactor branches rotate.
 - `EVAL_EPISODES = 100` (lean 200; a plant episode costs ~3×;
   `PLANT_EVAL_EPISODES` overrides it for a quick run).
 - Evaluation scenarios: in-distribution, OOD, then every
-  `EVAL_DISTURBANCES` kind under every pattern, named `<kind>_<pattern>`
-  (`leak`, `feed_gain`, `dilution`, `kinetics_decay`, `toxin`,
-  `cell_viability`, `downstream_rate`, `turnaround_delay`,
-  `storage_capacity` × `step`, `spike`, `gradual`, `recurrent`): 38
-  scenarios, ~4× the old nine. The held-out panel (now with
-  `turnaround_delay@3.5` and `storage_capacity@0.88`) and the latent gate
-  still use step faults.
+  `EVAL_DISTURBANCES` kind (Fermentation-PPO's) under every pattern, named
+  `<kind>_<pattern>` (`leak`, `feed_gain`, `dilution`, `kinetics_decay`,
+  `toxin`, `cell_viability`, `contamination`, `downstream_rate`,
+  `turnaround_delay`, `storage_capacity`, `cooling_capacity` × `step`,
+  `spike`, `gradual`, `recurrent`): 46 scenarios. The held-out panel and the
+  latent gate use step faults.
 
 ### Why `meta` tied `saferl`, and the training fixes
+
+*On the previous plant (before the port to Fermentation-PPO's environment).
+The fixes stay; the numbers need re-measuring on this plant.*
 
 The first run on the 38-scenario grid had `meta` beat `saferl` on 6
 scenarios, lose on 2 and tie the rest; its held-out panel hardly moved over
@@ -435,11 +516,10 @@ into mixins, one module per concern.
 
 | module | role |
 |---|---|
-| `metarl/env/core.py` | Numba kinetics and RK4 integrator, per-reactor parameter rows |
-| `metarl/env/config.py` | reactors, feed pool, storage tank, quality specs, observation layout, instrument model, task distribution |
-| `metarl/env/layout.py` | observation and action indices, the stage mask |
-| `metarl/env/plant.py` | `PlantFermentationEnv`: 3 reactors + storage, the step, reward, constraints 1–8 |
-| `metarl/env/faults.py` / `instruments.py` / `ledger.py` | its mixins: the eight fault kinds, the instrument model, lots, duals and terminal accounting |
+| `metarl/env/kinetics.py` / `disturbances.py` / `plant.py` / `safe.py` / `bench.py` | Fermentation-PPO's environment, ported with only the imports changed: kinetics and RK4, the eleven fault kinds and evaluation scenarios, the shared plant, Safe PPO's `FermentationEnv`, Standard PPO's `FermentationEnvBench` |
+| `metarl/env/config.py` | Fermentation-PPO's constants, then the observation offsets and the task distribution |
+| `metarl/env/adapter.py` | `PlantFermentationEnv` / `BenchPlantFermentationEnv`: the two environments behind the agent's interface (flat views, tasks, fault tracking, privileged state, per-reactor ledger) |
+| `metarl/env/layout.py` / `faults.py` | observation and action indices and the stage mask; fault kind codes, aliases and presets |
 | `metarl/agent/pearl.py` | `PEARLAgent`: the PEARL/SAC agent and its rollout copies |
 | `metarl/agent/acting.py` / `learning.py` / `checkpoint.py` | its mixins: posterior and action selection (adaptation gate, APN hooks), the update, save / load / warm start |
 | `metarl/agent/networks.py` / `replay.py` / `common.py` | token actor and critics, GRU encoder, gate; per-task replay; devices and utilities |
@@ -456,8 +536,9 @@ into mixins, one module per concern.
 
 ## How to run
 
-Run from this folder (the repository root). First the smoke test (~15 s; it
-prints `ALL SMOKE CHECKS PASSED`):
+Run from this folder (the repository root). First the smoke test (~40 s; it
+prints `ALL SMOKE CHECKS PASSED`, and checks parity with
+`../Fermentation-PPO` when that checkout is there):
 
 ```bash
 python tests/smoke_test.py
@@ -495,7 +576,8 @@ $env:PLANT_SEED=1; $env:PLANT_RUN_TAG="seed1"; python -m metarl all
 |---|---|
 | `PLANT_SEED` | training and evaluation seed (default 0) |
 | `PLANT_RUN_TAG` | subfolder for checkpoints, logs and figures |
-| `PLANT_APN_PATH` | APN checkpoint path (default `policy/apn_plant.pth`) |
+| `PLANT_APN_PATH` | APN checkpoint path (default `policy/apn_ppo_plant.pth`; `policy/apn_plant.pth` is the previous plant's) |
+| `FERMENTATION_PPO_ROOT` | Fermentation-PPO checkout for the smoke test's parity check (default `../Fermentation-PPO`) |
 | `PLANT_HELDOUT_WORKERS` | held-out worker processes; `0` or `1` runs in-process |
 | `PLANT_COLLECT_WORKERS` | `0` collects training episodes in-process instead of in the worker pool |
 | `PLANT_EVAL_EPISODES` | evaluation tasks per scenario (default 100) |
@@ -510,6 +592,6 @@ Outputs: `policy/[tag]/<arm>.pth` and `<arm>_best.pth`; `results/log/[tag]/`
 ## Requirements
 
 `numpy`, `numba`, `torch`, `matplotlib`, `tqdm` (optional). Gradient updates
-use a CUDA/ROCm GPU when available (the critics are ~8–9M parameters);
+use a CUDA/ROCm GPU when available (the critics are ~9.5M parameters);
 rollouts always run on the CPU, held-out checks and training episodes in
 worker processes.

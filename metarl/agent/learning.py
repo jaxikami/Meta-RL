@@ -1,7 +1,9 @@
 """The meta-gradient update (``LearningMixin``).
 
-Critics, encoder, auxiliary head and gate detector, then the actor (with the
-APN mapping penalty and the warm-start anchor), then the temperature.
+The actor's per-reactor history features, then the critics (whose loss also
+trains the history module unless it is frozen), encoder, auxiliary head and
+gate detector, then the actor (with the APN mapping penalty and the
+warm-start anchor; it reads the history detached), then the temperature.
 """
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
@@ -74,6 +76,28 @@ class LearningMixin:
         sigma_sq = torch.where(empty, torch.ones_like(sigma_sq), sigma_sq)
         return mu, sigma_sq
 
+    def _history_features(self, rows, lo, hi, o, o2):
+        """The actor's history features at each transition and its successor.
+
+        Rows of the sampled windows give each transition's GRU state after
+        the previous transition of its episode; its observation and the next
+        one are folded from there (``ReactorHistory.window``). With a graph
+        unless the history module is frozen.
+
+        Returns:
+            Tuple (features at o, features at o2), each [B, N, feature_dim].
+        """
+        obs_rows = rows[0].float()
+        K, R = obs_rows.shape[:2]
+        reset = torch.zeros(K, R, dtype=torch.bool, device=obs_rows.device)
+        rows_k = torch.arange(K, device=obs_rows.device)
+        for p in range(lo.shape[1]):
+            inside = lo[:, p] < R
+            reset[rows_k[inside], lo[inside, p]] = True
+        with torch.set_grad_enabled(not self.history_frozen):
+            return self.actor.history_window(obs_rows, reset, hi, hi <= lo,
+                                             o, o2)
+
     def _stall_flags(self, o, priv):
         """[B, N] 1.0 where a reactor is unloading a batch below the harvest spec.
 
@@ -144,7 +168,8 @@ class LearningMixin:
                 if ref is not None and p.grad is not None:
                     p.add_(ref, alpha=step)
 
-    def _anchor_terms(self, o, zd, fault, gate=None, weight=None, stall=None):
+    def _anchor_terms(self, o, feat, zd, fault, gate=None, weight=None,
+                      stall=None):
         """The warm-start anchor's penalty and its diagnostics.
 
         The squared gap between this actor's and the loaded policy's mean
@@ -153,15 +178,17 @@ class LearningMixin:
         acting kind's weight after one (each dimension scaled by
         ``anchor_fault_dim_scale``).
 
+        ``feat`` are the (frozen) history features both policies read.
+
         Returns:
             Tuple (penalty, gap_nominal, gap_fault).
         """
         with torch.no_grad():
-            ref_mean, _ = self.anchor_actor(o, zd)
+            ref_mean, _ = self.anchor_actor(feat, zd)
             ref_a = torch.tanh(ref_mean)
             mask_free = self._stage_mask(o)
 
-        g_dims = (torch.tanh(self.actor(o, zd)[0]) - ref_a).pow(2)
+        g_dims = (torch.tanh(self.actor(feat, zd)[0]) - ref_a).pow(2)
         if mask_free is not None:
             g_dims = g_dims * mask_free
         gap = g_dims.sum(dim=-1)
@@ -216,18 +243,19 @@ class LearningMixin:
         tasks = np.random.choice(ready, size=min(meta_batch, len(ready)),
                                  replace=False)
 
+        # Causal windows for every arm: the policy is recurrent.
+        chunk = max(1, min([WINDOW_CHUNK_LEN]
+                           + [replay.size(t) for t in tasks]))
+        parts = [replay.sample_windows_np(t, batch_size, context_size,
+                                          chunk_len=chunk)
+                 for t in tasks]
+        batch = _to_device(np.concatenate([p[0][i] for p in parts])
+                           for i in range(len(parts[0][0])))
+        rows = _to_device(np.concatenate([p[1][i] for p in parts])
+                          for i in range(4))
+        lo = _as_long(np.concatenate([p[2] for p in parts]))
+        hi = _as_long(np.concatenate([p[3] for p in parts]))
         if self.use_context:
-            chunk = max(1, min([WINDOW_CHUNK_LEN]
-                               + [replay.size(t) for t in tasks]))
-            parts = [replay.sample_windows_np(t, batch_size, context_size,
-                                              chunk_len=chunk)
-                     for t in tasks]
-            batch = _to_device(np.concatenate([p[0][i] for p in parts])
-                               for i in range(len(parts[0][0])))
-            rows = _to_device(np.concatenate([p[1][i] for p in parts])
-                              for i in range(4))
-            lo = _as_long(np.concatenate([p[2] for p in parts]))
-            hi = _as_long(np.concatenate([p[3] for p in parts]))
             # The encoder steps on one update in ``encoder_update_every``;
             # between, its posterior is read without a graph (the heads still
             # train on it).
@@ -239,13 +267,17 @@ class LearningMixin:
                 sigma_sq + mu.pow(2) - 1.0 - torch.log(sigma_sq + 1e-8),
                 dim=-1).mean()
         else:
-            parts = [replay.sample_batch_np(t, batch_size) for t in tasks]
-            batch = _to_device(np.concatenate([p[i] for p in parts])
-                               for i in range(len(parts[0])))
             z = mu = torch.zeros(batch[0].shape[0], self._z_dim, device=device)
             kl = torch.zeros((), device=device)
         o, a, r, o2, d, ctx_true, fault_code, priv, priv2 = batch
         o, a, o2, d = o.float(), a.float(), o2.float(), d.float()
+        if self.adapt_gate and not self.history_frozen:
+            raise ValueError("the gate's base policy reads the actor's history "
+                             "features: freeze the history module (a warm "
+                             "start does)")
+        feat, feat2 = self._history_features(rows, lo, hi, o, o2)
+        feat2 = feat2.detach()
+        feat_d = feat.detach()
         priv, priv2 = priv.float(), priv2.float()
         fault_code = fault_code.float()
         ctx_true, fault = ctx_true.float(), (fault_code > 0).float()
@@ -266,17 +298,19 @@ class LearningMixin:
 
         # ── 1. Critic (+ encoder + KL + auxiliary + gate detector) ───────────
         with torch.no_grad():
-            a2, logp2, _ = self._safe_sample(o2, z.detach(), gate=gate_act)
+            a2, logp2, _ = self._safe_sample(o2, feat2, z.detach(),
+                                             gate=gate_act)
             q1_t, q2_t = self.critic_target(
-                o2, a2, self._critic_cond(z.detach(), ctx_true, priv2))
+                feat2, a2, self._critic_cond(z.detach(), ctx_true, priv2))
             entropy_term = torch.clamp(self.alpha.detach() * logp2,
                                        -ENTROPY_TERM_CLIP, ENTROPY_TERM_CLIP)
             if gate_act is not None:
                 entropy_term = gate_act * entropy_term
             target = r + (1.0 - d) * self.gamma * (
                 torch.min(q1_t, q2_t) - entropy_term)
-        # z is NOT detached here: this is the encoder's Bellman gradient.
-        q1, q2 = self.critic(o, a, self._critic_cond(z, ctx_true, priv))
+        # z is NOT detached here: this is the encoder's Bellman gradient; nor
+        # are the history features, unless the history module is frozen.
+        q1, q2 = self.critic(feat, a, self._critic_cond(z, ctx_true, priv))
         critic_loss = (F.smooth_l1_loss(q1, target, beta=1.0)
                        + F.smooth_l1_loss(q2, target, beta=1.0))
 
@@ -343,11 +377,16 @@ class LearningMixin:
             critic_obj = critic_obj + self.fault_cls_weight * fault_cls_loss
             self.fault_head_opt.zero_grad()
         self.critic_opt.zero_grad()
+        if not self.history_frozen:
+            self.history_opt.zero_grad()
         if step_encoder:
             self.encoder_opt.zero_grad()
         critic_obj.backward()
         nn.utils.clip_grad_norm_(self.critic.parameters(), 5.0)
         self.critic_opt.step()
+        if not self.history_frozen:
+            nn.utils.clip_grad_norm_(self.actor.history.parameters(), 5.0)
+            self.history_opt.step()
         if step_encoder:
             nn.utils.clip_grad_norm_(self.encoder.parameters(), 5.0)
             self.encoder_opt.step()
@@ -377,8 +416,9 @@ class LearningMixin:
             def batch_mean(x):
                 return x.mean() if w_gate is None else (w_gate * x).sum()
 
-            a_pi, logp_pi, n_active = self._safe_sample(o, zd, gate=gate_act)
-            q1_pi, q2_pi = self.critic(o, a_pi,
+            a_pi, logp_pi, n_active = self._safe_sample(o, feat_d, zd,
+                                                        gate=gate_act)
+            q1_pi, q2_pi = self.critic(feat_d, a_pi,
                                        self._critic_cond(zd, ctx_true, priv))
             actor_loss = batch_mean(self.alpha.detach() * logp_pi
                                     - torch.min(q1_pi, q2_pi))
@@ -401,7 +441,7 @@ class LearningMixin:
             # ── 2c. Anchor to the warm-start policy ──────────────────────────
             if self.anchor_actor is not None and self._anchor_active():
                 anchor_pen, gap_nominal, gap_fault = self._anchor_terms(
-                    o, zd, fault_code, gate=gate_act, weight=w_gate,
+                    o, feat_d, zd, fault_code, gate=gate_act, weight=w_gate,
                     stall=stall_any if self.hold_penalty_weight > 0.0 else None)
                 actor_loss = actor_loss + anchor_pen
 
@@ -412,7 +452,7 @@ class LearningMixin:
             # is below half the cutoff, averaged over the stalled entries only.
             if self.hold_penalty_weight > 0.0:
                 out_dims = [reactor_action(i, 3) for i in range(stalled.shape[1])]
-                pre = self.actor(o, zd)[0][:, out_dims]
+                pre = self.actor(feat_d, zd)[0][:, out_dims]
                 excess = F.relu(pre - HOLD_PRE_TANH_TARGET)
                 hold_pen = (stalled * excess).sum() / stalled.sum().clamp(min=1.0)
                 actor_loss = actor_loss + self.hold_penalty_weight * hold_pen

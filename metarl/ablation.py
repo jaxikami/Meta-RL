@@ -20,15 +20,16 @@ Components (all on in ``full``, which is ``ARMS["meta"]``):
                 held-out selection runs the undisturbed checks only, as
                 saferl's does.
     lagrangian  Adaptive dual multipliers. Ablated by ``lagrangian=False``:
-                the duals stay at 0. The static shaping (violation spike, soft
-                walls, purity and lot terms) is kept, as for baseline.
-    mask        Structural stage mask. Ablated by ``action_mask=False``. The
-                plant has no interlock (baseline runs the same way), so the
-                unmasked action reaches the shield and the plant: the variant
-                can open a discharge valve mid-ferment. The shield was trained
-                on stage-masked flows and meets off-distribution actions here.
-                (The PPO study kept a plant-side interlock; this plant has none
-                to keep.)
+                Fermentation-PPO's no-Lagrangian case study, the duals frozen
+                at 0 and fixed per-violation penalties instead. The soft walls
+                and barriers are kept.
+    mask        Structural stage mask. Ablated by ``action_mask=False``. Safe
+                PPO's environment keeps only its batch-boundary interlock (no
+                discharge outside unload), so the rest of the unmasked action
+                reaches the shield and the plant: the variant can feed during
+                ferment or unload, or race a cleanup's clock. The shield was
+                trained on stage-masked flows and meets off-distribution
+                actions here.
     apn         The hard inventory shield. Ablated by ``apn=False``: no
                 projection and no mapping penalty. No-regression selection
                 still compares against saferl as it runs, shield included.
@@ -63,8 +64,8 @@ Protocol:
     PPO study does; saferl keeps the study's protocol either way.
 
     Every variant and the seed's saferl are evaluated on ``evaluate``'s
-    scenarios and task pools (their first ``--eval-episodes`` tasks), with
-    the instrument noise, so within a seed every result is paired per task.
+    scenarios and task pools (their first ``--eval-episodes`` tasks), so
+    within a seed every result is paired per task.
     Violations are events (see the README); severity is the worst exceedance
     of each depth constraint over every scenario and episode, as a percentage
     of its limit. Each delta against full is paired within a seed; a seed
@@ -215,7 +216,7 @@ class AblationConfig:
             apn=meta.apn and self.apn,
             apn_soft=meta.apn_soft and self.apn,
             warm_start=meta.warm_start if self.warmstart else None,
-            train_sensor_noise=meta.train_sensor_noise,
+            bench_env=meta.bench_env,
             blurb=f"ablation of meta: {self.label}")
 
 
@@ -321,11 +322,11 @@ def evaluate_run(spec, n_episodes):
     Returns:
         Dict scenario name -> compact results.
     """
-    from metarl.training.tasks import seed_everything, make_env, make_task_pool
+    from metarl.training.tasks import seed_everything, make_arm_env, make_task_pool
     from metarl.training.evaluate import (_eval_agent_on_tasks,
                                           eval_fault_scenarios)
     seed_everything(SEED)
-    env = make_env(lagrangian=spec.lagrangian)
+    env = make_arm_env(spec)
     agent = _build_agent(env, spec)
     final_path, best_path = arm_paths(spec)
     _load_preferring_best(agent, best_path, final_path, spec.name, strict=True)

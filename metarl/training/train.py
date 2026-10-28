@@ -14,10 +14,7 @@ except ImportError:                                    # pragma: no cover
     _trange = range
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.config import (nominal_task, sample_task, N_REACTORS,
-                               SENSOR_MODEL_ENABLED, ANALYZER_SAMPLE_PERIOD_H,
-                               ANALYZER_REPORT_LAG_H, ANALYZER_NOISE_RSD,
-                               ONLINE_NOISE_RSD)
+from metarl.env.config import nominal_task, sample_task, N_REACTORS
 from metarl.agent.common import LATENT_DIM, device
 from metarl.agent.replay import MultiTaskReplayBuffer
 from metarl.training.config import (SEED, N_TRAIN_TASKS, META_ITERATIONS,
@@ -54,7 +51,7 @@ from metarl.training.config import (SEED, N_TRAIN_TASKS, META_ITERATIONS,
                                     FINETUNE_FROM, COLLECT_IN_WORKERS)
 from metarl.training.arms import arm_paths, get_arm, _build_agent
 from metarl.training.early_stopping import EarlyStopper
-from metarl.training.tasks import (seed_everything, make_env, make_task_pool,
+from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool,
                                    corner_risk, make_corner_tasks,
                                    MagnitudeStratifier,
                                    maybe_schedule_disturbance)
@@ -77,15 +74,7 @@ def _train(arm):
     n_collect = (META_COLLECT_EPISODES_PER_ITER if spec.multitask
                  else COLLECT_EPISODES_PER_ITER)
     seed_everything(SEED)
-    env = make_env(lagrangian=spec.lagrangian,
-                   sensor_model=(spec.train_sensor_noise
-                                 and SENSOR_MODEL_ENABLED))
-    if spec.use_context and spec.apn and not env.mask_internal_concentrations:
-        raise SystemExit(
-            f"[{label}] with concentrations observable the APN also projects "
-            f"harvest titer and purity, but {spec.name} may carry the "
-            f"inventory shield only. Mask the concentrations, or set "
-            f"apn=False in ARMS['{spec.name}'].")
+    env = make_arm_env(spec)
     agent = _build_agent(env, spec, train_apn_if_missing=True)
     replay = MultiTaskReplayBuffer(env.stateDim, env.actionDim,
                                    priv_dim=agent.critic_privileged_dim)
@@ -130,18 +119,9 @@ def _train(arm):
              f"({agent.critic_privileged_dim} ch) (privileged, training "
              f"only)\n" if use_context else "")
           + f"{'=' * 78}")
-    if env.sensor_model:
-        print(f"  instruments: at-line analyzer every "
-              f"{ANALYZER_SAMPLE_PERIOD_H} h, reported after "
-              f"{ANALYZER_REPORT_LAG_H} h, {ANALYZER_NOISE_RSD:.1%} RSD; online "
-              f"channels {ONLINE_NOISE_RSD:.1%} RSD; control interval "
-              f"{env.control_action_interval} h")
-    else:
-        print("  instruments: noise-free for training (exact observation)"
-              + ("; evaluation adds the instrument noise"
-                 if SENSOR_MODEL_ENABLED else ""))
-    print("  off-gas CO2 rate: " + ("observed per reactor"
-                                    if env.observe_co2_rate else "NOT observed"))
+    print(f"  plant: Fermentation-PPO's {type(env).__mro__[2].__name__}, "
+          f"observed exactly; control interval "
+          f"{env.control_action_interval} h")
 
     actor_warmup = max(1, META_ACTOR_WARMUP_ITERS) if spec.warm_start else 0
     src = None
@@ -267,8 +247,7 @@ def _train(arm):
     workers = None
     if HELDOUT_WORKERS > 1:
         try:
-            workers = RolloutPool(spec, HELDOUT_WORKERS,
-                                  sensor_model=env.sensor_model)
+            workers = RolloutPool(spec, HELDOUT_WORKERS)
             print(f"  held-out checks: {HELDOUT_WORKERS} worker processes"
                   + ("; training episodes collected there too, during the "
                      "updates" if COLLECT_IN_WORKERS else ""))

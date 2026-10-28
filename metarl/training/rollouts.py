@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.config import standardize_context, N_REACTORS, CTX_GAIN
+from metarl.env.config import standardize_context, N_REACTORS
 from metarl.env.layout import ACTION_DIM, ACTION_DIM_PER_REACTOR
 from metarl.training.config import CONSTRAINT_NAMES, DEPTH_CONSTRAINTS
 from metarl.training.tasks import (resolve_reactor, as_fault_schedule,
@@ -67,7 +67,7 @@ def collect_rollout(env, agent, replay, task_id, task, add_to_replay=True,
             led_to.append(next_state)
             state = next_state
             total_r += r
-            total_v += int(info["violation_count"])
+            total_v += int(info["violation_events"])
             step_rewards.append(r)
             steps += 1
     finally:
@@ -91,8 +91,8 @@ class TransitionRecorder:
 def collect_episode_record(env, agent, task_id, task, schedule, seed):
     """One training episode, recorded for another process's replay buffer.
 
-    Seeds this process's NumPy and torch generators and the instrument-noise
-    stream from ``seed``, so the episode is a function of its arguments.
+    Seeds this process's NumPy and torch generators from ``seed``, so the
+    episode is a function of its arguments.
 
     Returns:
         Dict with reward / violations / steps, the recorded ``transitions``
@@ -101,15 +101,10 @@ def collect_episode_record(env, agent, task_id, task, schedule, seed):
     """
     np.random.seed(int(seed) % (2 ** 32))
     torch.manual_seed(int(seed))
-    prev_key = getattr(env, "sensor_stream_key", None)
-    env.sensor_stream_key = ("train", int(seed))
     agent.proj_stats(reset=True)
     rec = TransitionRecorder(priv_dim=getattr(agent, "critic_privileged_dim", 0))
-    try:
-        r, v, steps = collect_rollout(env, agent, rec, task_id, task,
-                                      schedule=list(schedule))
-    finally:
-        env.sensor_stream_key = prev_key
+    r, v, steps = collect_rollout(env, agent, rec, task_id, task,
+                                  schedule=list(schedule))
     obs = np.stack([a[1] for a, _ in rec.items])
     next_obs = np.stack([a[4] for a, _ in rec.items])
     proj = (agent._proj_calls, agent._proj_noop, agent._proj_steps,
@@ -139,33 +134,14 @@ def ingest_episode_record(agent, replay, rec):
     return rec["reward"], rec["violations"], rec["steps"]
 
 
-def sensor_stream_key(task, disturbance=None, index=0):
-    """Content-addressed instrument-noise stream id for a deterministic episode.
-
-    Keyed on the task's prior descriptor (feed, every pump gain and leak) and
-    the resolved fault schedule, not on ``z_mode``, so the latent gate's
-    matched / swapped / zeroed rollouts stay paired.
-    """
-    ctx = tuple(round(float(v), 12) for v in
-                np.asarray(task["context"]).ravel()[:CTX_GAIN + 2 * N_REACTORS])
-    sched = as_fault_schedule(disturbance, index)
-    dist = ("none",) if not sched else tuple(
-        (str(d["kind"]), int(d["onset"]), round(float(d["magnitude"]), 12),
-         -1 if d["reactor"] is None else int(d["reactor"]))
-        + (() if d["end"] is None else (int(d["end"]),))
-        for d in sched)
-    return ("det", ctx, dist)
-
-
 CONSTRAINT_IDS = tuple(CONSTRAINT_NAMES)
 
 
-def _start_episode(env, agent, task, disturbance, stream_key, index=0):
+def _start_episode(env, agent, task, disturbance, index=0):
     """Install a task and its faults, reset the plant and the posterior."""
     agent.gate_floor = None
     apply_fault_schedule(env, disturbance, index)
     env.set_task(task)
-    env.sensor_stream_key = stream_key
     state = env.reset()
     agent.clear_z()
     return {"state": state, "done": False, "info": {}, "total_r": 0.0,
@@ -200,7 +176,7 @@ def _advance(env, agent, ep, stop_at=None):
         agent.update_context(state, safe_a, r, next_state)
         ep["state"], ep["done"], ep["info"] = next_state, done, info
         ep["total_r"] += r
-        ep["total_v"] += int(info["violation_count"])
+        ep["total_v"] += int(info["violation_events"])
         for cid, n in info.get("violation_counts", {}).items():
             if int(cid) in ep["viol_by_constraint"]:
                 ep["viol_by_constraint"][int(cid)] += int(n)
@@ -218,7 +194,7 @@ def _advance(env, agent, ep, stop_at=None):
         ep["probe_traj"].append(env.disturbance_probe())
         ep["storage_traj"].append(float(env.S_mass))
         ep["r_traj"].append(r)
-        ep["v_traj"].append(float(info["violation_count"] > 0))
+        ep["v_traj"].append(float(info["violation_events"] > 0))
 
 
 def _episode_metrics(env, agent, ep):
@@ -274,25 +250,21 @@ def rollout_deterministic(env, agent, task, z_mode="mean", disturbance=None,
                           index=0):
     """Run one deterministic episode and return production and safety metrics."""
     prev_mode = agent.z_mode
-    prev_key = getattr(env, "sensor_stream_key", None)
     try:
         agent.z_mode = z_mode
-        ep = _start_episode(env, agent, task, disturbance,
-                            sensor_stream_key(task, disturbance, index), index)
+        ep = _start_episode(env, agent, task, disturbance, index)
         _advance(env, agent, ep)
         return _episode_metrics(env, agent, ep)
     finally:
         agent.z_mode = prev_mode
-        env.sensor_stream_key = prev_key
 
 
 def branched_rollouts(env, agent, task, faults, onset, z_mode="mean", index=0):
     """Deterministic rollouts of one task: undisturbed, then under each fault.
 
     Every fault starts at ``onset``, so the undisturbed prefix is simulated
-    once and each faulted run continues from a snapshot; all runs use the
-    undisturbed instrument-noise stream, so each branch is exactly the
-    episode a from-scratch rollout with that stream would produce.
+    once and each faulted run continues from a snapshot, so each branch is
+    exactly the episode a from-scratch rollout would produce.
 
     Args:
         faults: Sequence of (kind, magnitude[, reactor]); "rotate" reactors
@@ -303,10 +275,9 @@ def branched_rollouts(env, agent, task, faults, onset, z_mode="mean", index=0):
         List of episode-metric dicts: undisturbed first, then one per fault.
     """
     prev_mode = agent.z_mode
-    prev_key = getattr(env, "sensor_stream_key", None)
     try:
         agent.z_mode = z_mode
-        ep = _start_episode(env, agent, task, None, sensor_stream_key(task))
+        ep = _start_episode(env, agent, task, None)
         if not faults:
             _advance(env, agent, ep)
             return [_episode_metrics(env, agent, ep)]
@@ -326,4 +297,3 @@ def branched_rollouts(env, agent, task, faults, onset, z_mode="mean", index=0):
         return rows
     finally:
         agent.z_mode = prev_mode
-        env.sensor_stream_key = prev_key

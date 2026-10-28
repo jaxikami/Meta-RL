@@ -6,8 +6,8 @@ reactors and the storage tank. Two pieces:
   1. A **learned scalar field** ``h(s, a)``: the signed, normalized distance to
      the nearest constraint boundary (CBF-like), regressed offline on
      synthetic one-control-interval lookahead labels (``metarl.apn.data``,
-     ``metarl.apn.train``) and then frozen. With concentrations masked it covers
-     the inventory constraints a single control interval can keep: each
+     ``metarl.apn.train``) and then frozen. It covers the inventory
+     constraints a single control interval can keep: each
      reactor's overflow and underflow, and storage overflow. Storage
      UNDERFLOW is left to the policy: its only fix is a batch ready to unload,
      which is decided tens of hours earlier (see ``metarl.apn.data``).
@@ -47,15 +47,17 @@ PROJ_REPAIR_THRESHOLD = float(
 PROJ_RETREAT_ITERS = 12
 
 # Shared by every arm and seed (the APN depends on the plant, not on a run).
+# Named for the Fermentation-PPO plant, so the previous plant's shield
+# (apn_plant.pth) is never overwritten by a retrain.
 APN_PATH = os.environ.get(
-    "PLANT_APN_PATH", os.path.join("policy", "apn_plant.pth"))
+    "PLANT_APN_PATH", os.path.join("policy", "apn_ppo_plant.pth"))
 
 
 class ActionProjectionNetwork(nn.Module):
     """Signed safety-margin regressor over (normalized state, squashed action).
 
     Encoder -> fusion -> residual block -> scalar head, as in the lean study,
-    at twice its width for the 75 + 12 inputs. The head is zero-initialised,
+    at twice its width for the 84 + 12 inputs. The head is zero-initialised,
     so training starts at margin 0 everywhere.
 
     Attributes:
@@ -63,10 +65,13 @@ class ActionProjectionNetwork(nn.Module):
         action_dim: Width of the action (12).
         inert_dims: Action dimensions the projection never moves (the stage
             clocks): they do not enter the mass balance.
+        ignored_obs: Observation channels zeroed before the encoder (the
+            species, which no shielded margin depends on), so the shield is
+            invariant to them by construction.
     """
 
     def __init__(self, obs_dim, action_dim, latent_dim=128, encoder_dim=128,
-                 inert_dims=(0,)):
+                 inert_dims=(0,), ignored_obs=()):
         """Build the margin regressor.
 
         Args:
@@ -75,11 +80,16 @@ class ActionProjectionNetwork(nn.Module):
             latent_dim: Width of the fused latent and the residual block.
             encoder_dim: Width of the state-action encoder.
             inert_dims: Action dimensions frozen by the projection.
+            ignored_obs: Observation channels the shield does not read.
         """
         super().__init__()
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.inert_dims = tuple(int(d) for d in inert_dims)
+        self.ignored_obs = tuple(int(c) for c in ignored_obs)
+        keep = torch.ones(self.obs_dim)
+        keep[list(self.ignored_obs)] = 0.0
+        self.register_buffer("obs_keep", keep)
 
         self.encoder = nn.Sequential(
             nn.Linear(self.obs_dim + self.action_dim, encoder_dim),
@@ -113,7 +123,7 @@ class ActionProjectionNetwork(nn.Module):
         Returns:
             Margin tensor of shape ``(...)``, in MARGIN_SCALE units.
         """
-        x = torch.cat([state_norm, action], dim=-1)
+        x = torch.cat([state_norm * self.obs_keep, action], dim=-1)
         h = self.encoder(x)
         h = self.fusion(h)
         h = self.res_act(h + self.res_block(h))
@@ -296,7 +306,7 @@ def load_apn(path=None, obs_dim=None, action_dim=None, device=None,
 
     Raises:
         SystemExit: When the checkpoint is missing (strict) or was trained
-            under a different observability setting, quality spec or plant.
+            for a different plant or observation layout.
     """
     p = APN_PATH if path is None else path
     dev = device if device is not None else (
@@ -311,44 +321,32 @@ def load_apn(path=None, obs_dim=None, action_dim=None, device=None,
 
     ckpt = torch.load(p, map_location=dev, weights_only=False)
 
-    from metarl.env.config import (MASK_INTERNAL_CONCENTRATIONS,
-                                   MIN_HARVEST_TITER, MIN_PRODUCT_TITER)
     retrain = (f"    Retrain it:  move {p} aside, then "
                f"python -m metarl.apn.train")
-    if bool(ckpt.get("mask_internal_concentrations")) != bool(
-            MASK_INTERNAL_CONCENTRATIONS):
-        raise SystemExit(
-            f"[!] observability mismatch for the APN at {p!r}: trained with "
-            f"mask_internal_concentrations = "
-            f"{ckpt.get('mask_internal_concentrations')}, configured "
-            f"{MASK_INTERNAL_CONCENTRATIONS}.\n" + retrain)
     stored_sig = ckpt.get("plant_signature")
     if stored_sig != plant_signature():
         raise SystemExit(
             f"[!] the APN at {p!r} was trained for a different plant "
             f"(reactor sizes, storage tank, feedstock pools or observation "
             f"layout).\n" + retrain)
-    if not MASK_INTERNAL_CONCENTRATIONS:
-        want = {"min_product_titer": float(MIN_PRODUCT_TITER),
-                "min_harvest_titer": float(MIN_HARVEST_TITER)}
-        drift = {k: (ckpt.get(k), v) for k, v in want.items()
-                 if float(ckpt.get(k, -1.0)) != v}
-        if drift:
-            raise SystemExit(
-                f"[!] the APN at {p!r} was trained against different quality "
-                f"specs ({drift}).\n" + retrain)
 
     net = ActionProjectionNetwork(
         ckpt["obs_dim"], ckpt["action_dim"],
         latent_dim=ckpt.get("latent_dim", 128),
         encoder_dim=ckpt.get("encoder_dim", 128),
-        inert_dims=tuple(ckpt.get("inert_dims", (0,)))).to(dev)
+        inert_dims=tuple(ckpt.get("inert_dims", (0,))),
+        ignored_obs=tuple(ckpt.get("ignored_obs", ()))).to(dev)
     for want, have, what in ((obs_dim, net.obs_dim, "obs_dim"),
                              (action_dim, net.action_dim, "action_dim")):
         if want is not None and int(want) != int(have):
             raise SystemExit(f"[!] the APN at {p!r} has {what}={have}, the "
                              f"agent needs {want}.\n" + retrain)
-    net.load_state_dict(ckpt["model"])
+    keys = net.load_state_dict(ckpt["model"], strict=False)
+    if keys.missing_keys or keys.unexpected_keys:
+        raise SystemExit(
+            f"[!] the APN at {p!r} has another architecture (missing "
+            f"{keys.missing_keys}, unexpected {keys.unexpected_keys}).\n"
+            + retrain)
     net.eval()
     for prm in net.parameters():
         prm.requires_grad_(False)
@@ -366,8 +364,6 @@ def save_apn(net, path=None, meta=None):
     Returns:
         The path written.
     """
-    from metarl.env.config import (MASK_INTERNAL_CONCENTRATIONS,
-                                   MIN_HARVEST_TITER, MIN_PRODUCT_TITER)
     p = APN_PATH if path is None else path
     os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
     ckpt = {
@@ -377,10 +373,8 @@ def save_apn(net, path=None, meta=None):
         "latent_dim": net.fusion[0].out_features,
         "encoder_dim": net.encoder[0].out_features,
         "inert_dims": list(net.inert_dims),
+        "ignored_obs": list(net.ignored_obs),
         "margin_scale": MARGIN_SCALE,
-        "min_product_titer": float(MIN_PRODUCT_TITER),
-        "min_harvest_titer": float(MIN_HARVEST_TITER),
-        "mask_internal_concentrations": bool(MASK_INTERNAL_CONCENTRATIONS),
         "plant_signature": plant_signature(),
     }
     if meta:

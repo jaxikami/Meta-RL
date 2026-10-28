@@ -22,7 +22,7 @@ PLOT_NEUTRAL = "#b4b3ad"
 # Constraints counted per step (product_purity counts per rejected lot).
 STEP_CONSTRAINTS = ("overflow", "underflow", "harvest_titer", "instability",
                     "mass_balance", "storage_overflow", "storage_underflow",
-                    "turnaround_conflict")
+                    "heat_load")
 CONSTRAINT_COLORS = {
     "overflow": "#2a78d6",
     "underflow": "#eb6834",
@@ -32,7 +32,7 @@ CONSTRAINT_COLORS = {
     "mass_balance": "#008300",
     "storage_overflow": "#6a4fb3",
     "storage_underflow": "#8c6d1f",
-    "turnaround_conflict": "#0f8b8d",
+    "heat_load": "#0f8b8d",
 }
 VIOL_MIX_MIN_LABEL_PCT = 6.0
 ACTUATORS = (

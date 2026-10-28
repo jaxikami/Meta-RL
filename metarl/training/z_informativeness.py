@@ -17,9 +17,8 @@ from metarl.training.config import (SEED, Z_INFORM_MIN_SNR,
                                     Z_INFORM_DISTURBANCES, LOG_DIR)
 from metarl.training.arms import (ARMS, BEST_META_PATH, META_PATH,
                                   _build_agent, _load_preferring_best)
-from metarl.training.tasks import (seed_everything, make_env, make_task_pool,
+from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool,
                                    apply_fault_schedule)
-from metarl.training.rollouts import sensor_stream_key
 from metarl.training.metrics import (latent_separability, gate_opening,
                                      _finite_mean, _paired_delta,
                                      _fmt_delta_sci)
@@ -30,11 +29,9 @@ def _z_rollout(env, agent, task, disturbance=None, z_mode="mean", fixed_z=None,
                keep_states=False, index=0):
     """Roll out once, optionally deploying a caller-supplied latent."""
     prev = agent.z_mode
-    prev_key = getattr(env, "sensor_stream_key", None)
     try:
         apply_fault_schedule(env, disturbance, index)
         env.set_task(task)
-        env.sensor_stream_key = sensor_stream_key(task, disturbance, index)
         state = env.reset()
         agent.z_mode = z_mode
         agent.clear_z()
@@ -54,7 +51,7 @@ def _z_rollout(env, agent, task, disturbance=None, z_mode="mean", fixed_z=None,
             agent.update_context(state, safe_a, r, next_state)
             state = next_state
             total_r += r
-            total_v += int(info["violation_count"])
+            total_v += int(info["violation_events"])
         return {
             "violations": total_v, "reward": total_r,
             "ethanol": float(env.product_eth),
@@ -68,7 +65,6 @@ def _z_rollout(env, agent, task, disturbance=None, z_mode="mean", fixed_z=None,
         }
     finally:
         agent.z_mode = prev
-        env.sensor_stream_key = prev_key
 
 
 def _probe_states(states, times, split, after, n):
@@ -83,19 +79,23 @@ def _actions_under_z(agent, states, z_vec, gate=None):
     """Re-score fixed observations under a fixed latent (optionally forcing the gate)."""
     if not states:
         return np.zeros((0, agent.action_dim)), np.zeros((0, agent.action_dim))
-    prev_z, prev_gate = agent.z.clone(), agent.gate_override
+    # The policy is recurrent: every state is scored from the same snapshot
+    # of its history state, which is restored afterwards.
+    snap, prev_gate = agent.posterior_state(), agent.gate_override
+    z_t = torch.as_tensor(np.asarray(z_vec, dtype=np.float32),
+                          device=agent.z.device).reshape(-1)
     try:
-        agent.z = torch.as_tensor(np.asarray(z_vec, dtype=np.float32),
-                                  device=agent.z.device).reshape(-1)
         agent.gate_override = gate
         safe, raw = [], []
         for s in states:
+            agent.set_posterior_state(snap)
+            agent.z = z_t
             a, r = agent.select_action(s, deterministic=True)
             safe.append(a)
             raw.append(r)
         return np.stack(safe), np.stack(raw)
     finally:
-        agent.z = prev_z
+        agent.set_posterior_state(snap)
         agent.gate_override = prev_gate
 
 
@@ -115,7 +115,7 @@ def z_informativeness(episodes=None):
     n_ep = Z_INFORM_EPISODES if episodes is None else int(episodes)
     if n_ep < 2:
         raise SystemExit("z_informativeness needs at least 2 tasks")
-    env = make_env(lagrangian=ARMS["meta"].lagrangian)
+    env = make_arm_env(ARMS["meta"])
     agent = _build_agent(env, "meta")
     _load_preferring_best(agent, BEST_META_PATH, META_PATH, "meta", strict=True)
     tasks = make_task_pool(n_ep, seed=12345, ood=False)

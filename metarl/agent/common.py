@@ -36,9 +36,10 @@ def _on_rollout_device(module):
 
 
 # The lean study used 5 latent dimensions for a 6-entry task descriptor; the
-# plant's descriptor has 15 (three reactors' gains, leaks, kinetic activity
-# and contamination, the feed and the downstream rate), and the latent must
-# also say WHICH reactor a fault is in.
+# plant's descriptor has 18 (three reactors' gains, leaks, kinetic activity
+# and contamination, the feed, the downstream rate, turnaround time, storage
+# volume and cooling capacity), and the latent must also say WHICH reactor a
+# fault is in.
 LATENT_DIM = 8
 LOG_STD_MIN, LOG_STD_MAX = -5.0, 2.0
 PRE_TANH_CLIP = 9.0
@@ -46,11 +47,12 @@ LOG_ALPHA_MIN, LOG_ALPHA_MAX = -5.0, 3.0
 ENTROPY_TERM_CLIP = 50.0
 
 # Network-architecture identifier stamped in every checkpoint.
-NET_ARCH = "plant_token_v1"
+# v2: cross-reactor attention over each reactor's GRU history (the
+# Fermentation-PPO policy), not over single-step readings.
+NET_ARCH = "plant_history_v2"
 
 # Length of one pre-drawn colored exploration sequence, in control steps. An
-# episode is ~120-135 (600 h at 5 h, plus an early end at every batch
-# boundary of any reactor).
+# episode is 120 (600 h at 5 h).
 EXPLORE_NOISE_LEN = 256
 
 # Hard bound on the encoder's posterior means (see the lean agent).
@@ -100,7 +102,7 @@ class RunningObsNorm(nn.Module):
     Statistics are buffers, so they travel with every ``state_dict``. One
     instance is shared by the actor, both critics and the encoder, and moves
     only through ``update`` from freshly collected observations. Constant
-    channels (masked concentrations) read 0.
+    channels (each reactor's capacities) read 0.
     """
 
     def __init__(self, dim, clip=10.0, eps=1e-4, max_count=1e5):
@@ -135,15 +137,18 @@ class RunningObsNorm(nn.Module):
                            -self.clip, self.clip)
 
 
-def _adamw(module, lr, weight_decay):
+def _adamw(module, lr, weight_decay, skip=()):
     """AdamW that decays only weight matrices, never FiLM projections.
 
     Biases, norms and the FiLM projections are exempt: decaying FiLM would
     pull every layer back toward ignoring z. With ``weight_decay=0`` this is
-    exactly Adam.
+    exactly Adam. Parameters under a top-level submodule named in ``skip``
+    are left out (another optimizer owns them).
     """
     decay, keep = [], []
     for name, p in module.named_parameters():
+        if name.split(".")[0] in skip:
+            continue
         if p.ndim >= 2 and "films" not in name.split("."):
             decay.append(p)
         else:

@@ -13,9 +13,13 @@ from metarl.training.config import (APN_PENALTY_WEIGHT, SEED, INCLUDE_BASELINE,
                                     META_AUX_STATE_TARGETS, NET_ACTOR_HIDDEN,
                                     NET_CRITIC_HIDDEN, NET_CRITIC_TOKEN_HIDDEN,
                                     NET_MIXER_LAYERS, NET_MIXER_HEADS,
+                                    NET_HISTORY_HIDDEN, NET_HISTORY_LAYERS,
+                                    NET_HISTORY_ATTN_DIM,
+                                    NET_HISTORY_ATTN_HEADS, NET_HISTORY_SKIP,
                                     NET_DEPTH, NET_LAYER_NORM, NET_RESIDUAL,
                                     NET_OBS_NORM, NET_ENCODER_LAYER_NORM,
                                     NET_ENCODER_HIDDEN, NET_WEIGHT_DECAY,
+                                    NET_HEAD_HIDDEN,
                                     POLICY_DIR, ALPHA_MIN, META_KL_LAMBDA,
                                     META_ENCODER_LR, GATE_LOSS_WEIGHT,
                                     GATE_SHARPNESS, GATE_INIT_BIAS,
@@ -29,7 +33,7 @@ class ArmSpec:
 
     def __init__(self, name, label, multitask, use_context, lagrangian,
                  action_mask, apn, blurb, apn_soft=False, warm_start=None,
-                 train_sensor_noise=True):
+                 bench_env=False):
         """Record one arm's configuration.
 
         Args:
@@ -38,7 +42,9 @@ class ArmSpec:
             multitask: Train on the disturbed multi-task pool rather than the
                 single nominal task.
             use_context: Enable the context encoder and latent z.
-            lagrangian: Enable the environment's dual multipliers.
+            lagrangian: Enable the environment's dual multipliers (False:
+                fixed per-violation penalties, Fermentation-PPO's
+                no-Lagrangian case study).
             action_mask: Enable the structural stage mask.
             apn: Hard shield: executed actions are projected by the APN.
             blurb: One-line description.
@@ -46,8 +52,9 @@ class ArmSpec:
             warm_start: Key of an arm whose trained checkpoint this arm starts
                 from; it is then anchored to that policy, selected against it
                 (NO_REGRESS_*) and, with context, gated (GATE_*).
-            train_sensor_noise: Train on the noisy instrument model (False:
-                exact observation; evaluation always adds the noise).
+            bench_env: Train and evaluate on Standard PPO's environment
+                (``FermentationEnvBench``: static spikes, stage logic in the
+                environment) rather than Safe PPO's (``FermentationEnv``).
         """
         self.name = name
         self.label = label
@@ -58,7 +65,7 @@ class ArmSpec:
         self.apn = bool(apn)
         self.apn_soft = bool(apn_soft)
         self.warm_start = warm_start
-        self.train_sensor_noise = bool(train_sensor_noise)
+        self.bench_env = bool(bench_env)
         self.blurb = blurb
 
     def summary(self):
@@ -71,7 +78,7 @@ class ArmSpec:
             s += " apn_soft=on"
         if self.warm_start:
             s += f" warm={self.warm_start}"
-        s += f" train_obs={'noisy' if self.train_sensor_noise else 'exact'}"
+        s += f" env={'bench' if self.bench_env else 'safe'}"
         return s
 
 
@@ -79,19 +86,18 @@ ARMS = {
     "baseline": ArmSpec(
         "baseline", "BASELINE", multitask=False, use_context=False,
         lagrangian=False, action_mask=False, apn=False, apn_soft=False,
-        train_sensor_noise=False,
-        blurb="unconstrained RL on the nominal regime: no duals, no mask, "
-              "no shield"),
+        bench_env=True,
+        blurb="Standard PPO's environment on the nominal regime: static "
+              "penalties, no duals, no mask, no shield"),
     "saferl": ArmSpec(
         "saferl", "SAFERL", multitask=False, use_context=False,
         lagrangian=True, action_mask=True, apn=True, apn_soft=False,
-        train_sensor_noise=False,
         blurb="constrained RL on the nominal regime: duals + stage mask + "
               "action projection"),
     "meta": ArmSpec(
         "meta", "META", multitask=True, use_context=True,
         lagrangian=True, action_mask=True, apn=True, apn_soft=False,
-        warm_start="saferl", train_sensor_noise=True,
+        warm_start="saferl",
         blurb="meta-RL across fresh disturbed regimes: duals + stage mask + "
               "inventory shield + latent task inference, from saferl's "
               "policy, which acts until the latent detects a fault"),
@@ -162,13 +168,22 @@ def _build_agent(env, arm, train_apn_if_missing=False):
                   residual=NET_RESIDUAL, obs_norm=NET_OBS_NORM,
                   encoder_layer_norm=NET_ENCODER_LAYER_NORM,
                   encoder_hidden=NET_ENCODER_HIDDEN,
-                  weight_decay=NET_WEIGHT_DECAY)
+                  weight_decay=NET_WEIGHT_DECAY,
+                  history_hidden=NET_HISTORY_HIDDEN,
+                  history_layers=NET_HISTORY_LAYERS,
+                  history_attn_dim=NET_HISTORY_ATTN_DIM,
+                  history_attn_heads=NET_HISTORY_ATTN_HEADS,
+                  history_skip=NET_HISTORY_SKIP,
+                  head_hidden=NET_HEAD_HIDDEN,
+                  # Every arm's critics read the task descriptor and the
+                  # plant's privileged state (training only), so they are
+                  # the same networks in every arm.
+                  critic_task_context=True,
+                  critic_privileged_dim=PRIVILEGED_STATE_DIM)
     if spec.use_context:
         kwargs.update(kl_lambda=META_KL_LAMBDA, encoder_lr=META_ENCODER_LR,
                       aux_mode=AUX_MODE, aux_weight=AUX_WEIGHT,
                       aux_sample_frac=AUX_SAMPLE_FRAC,
-                      critic_task_context=True,
-                      critic_privileged_dim=PRIVILEGED_STATE_DIM,
                       adapt_gate=arm_gated(spec),
                       gate_weight=GATE_LOSS_WEIGHT,
                       gate_sharpness=GATE_SHARPNESS,

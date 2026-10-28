@@ -24,19 +24,23 @@ Kept from the lean agent, unchanged in behaviour:
     detector on z fitted to the privileged fault flag, every actor-side term
     gate-weighted.
 
-New for the plant (``TokenActor`` / ``TokenCritic``): the 78-channel
-observation is read as one TOKEN per reactor -- its own 24 process channels,
-its CO2 rate and the 3 plant-wide channels (storage, both feed pools) -- with
-a learned slot embedding for its identity (the three vessels' pumps differ
-4x / 0.5x). The tokens pass through pre-LN self-attention blocks
-(``TokenMixer``), which is where the reactors coordinate over the shared tank
-and feed pool. The actor then runs ONE FiLM-conditioned residual trunk shared
-by all three tokens and emits each reactor's four actions from its own token,
-so every reactor's experience trains the same weights. Each critic flattens
-its mixed tokens (obs + that reactor's action) into a wide FiLM residual
-trunk: the plant's value is not a sum over reactors, because the tank couples
-them. Every arm uses the same architecture, so no contrast comes down to the
-network.
+New for the plant: the 84-channel observation (Fermentation-PPO's, one row of
+28 per reactor) is read as one TOKEN per reactor -- its row: its 25 process
+and capacity channels and the 3 plant-wide ones (storage, both feed pools),
+Safe PPO's per-reactor input. The policy is recurrent, as in
+Fermentation-PPO (``ReactorHistory``): each reactor's tokens are folded into
+a GRU shared by the reactors (each keeps its own state), and the reactors
+attend to each other's GRU outputs, so a reactor sees its siblings' history
+summaries rather than their single-step readings; a skip embedding of the
+current token is appended. The actor runs ONE FiLM-conditioned residual trunk
+shared by the three reactors' features and emits each reactor's four
+actions. Each critic reads the same history features (with that reactor's
+action), mixes them across reactors and flattens them into a wide FiLM
+residual trunk: the plant's value is not a sum over reactors, because the
+tank couples them. The history module lives in the actor; the critic's loss
+trains it (the actor reads it detached), and a warm-started arm keeps its
+source's history module frozen. Every arm uses the same architecture, so no
+contrast comes down to the network.
 """
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
@@ -88,7 +92,9 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
                  aux_state_targets=None, critic_token_hidden=256,
                  mixer_layers=2, mixer_heads=4, encoder_hidden=256,
                  fault_cls_weight=0.0, train_gate_open=False,
-                 encoder_update_every=1):
+                 encoder_update_every=1, history_hidden=256,
+                 history_layers=2, history_attn_dim=64, history_attn_heads=4,
+                 history_skip=128, head_hidden=256):
         """Initialise the agent.
 
         Arguments are the lean agent's, plus the token networks' shape:
@@ -121,9 +127,10 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.latent_dim = latent_dim if use_context else 0
-        self._z_dim = max(1, self.latent_dim)
-        if critic_task_context and not use_context:
-            raise ValueError("critic_task_context needs a context agent")
+        # Every arm's networks read a latent of the same width (all zeros
+        # without context), so a context-free source and a context agent
+        # have identically shaped actors and critics.
+        self._z_dim = max(1, int(latent_dim))
         if adapt_gate and not use_context:
             raise ValueError("adapt_gate needs a context agent: the gate "
                              "reads the latent")
@@ -202,6 +209,11 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
                            "critic_token_hidden": int(critic_token_hidden),
                            "mixer_layers": int(mixer_layers),
                            "mixer_heads": int(mixer_heads),
+                           "history_hidden": int(history_hidden),
+                           "history_layers": int(history_layers),
+                           "history_attn_dim": int(history_attn_dim),
+                           "history_attn_heads": int(history_attn_heads),
+                           "history_skip": int(history_skip),
                            "depth": int(net_depth),
                            "layer_norm": bool(layer_norm),
                            "use_film": bool(use_film),
@@ -226,15 +238,17 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         make_actor = lambda norm: TanhGaussianActor(                # noqa: E731
             obs_dim, action_dim, self._z_dim, hidden=actor_hidden,
             depth=net_depth, use_film=use_film, layer_norm=layer_norm,
-            residual=residual, obs_norm=norm, mixer_layers=mixer_layers,
-            mixer_heads=mixer_heads)
+            residual=residual, obs_norm=norm, history_hidden=history_hidden,
+            history_layers=history_layers, attn_dim=history_attn_dim,
+            attn_heads=history_attn_heads, skip_dim=history_skip)
         self.actor = make_actor(self.obs_norm).to(device)
+        feat_dim = self.actor.history.out_dim
         make_critic = lambda: Critic(                               # noqa: E731
             obs_dim, action_dim, self._critic_c_dim, hidden=critic_hidden,
             depth=net_depth, use_film=use_film, layer_norm=layer_norm,
-            residual=residual, obs_norm=self.obs_norm,
-            token_hidden=critic_token_hidden, mixer_layers=mixer_layers,
-            mixer_heads=mixer_heads).to(device)
+            residual=residual, token_hidden=critic_token_hidden,
+            mixer_layers=mixer_layers, mixer_heads=mixer_heads,
+            feature_dim=feat_dim).to(device)
         self.critic = make_critic()
         self.critic_target = make_critic()
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -255,22 +269,27 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         self.aux = None
         if self.aux_mode == "reward":
             self.aux = AuxHead(self._z_dim, 1, obs_dim, action_dim,
-                               mode="reward").to(device)
+                               hidden=head_hidden, mode="reward").to(device)
         elif self.aux_mode == "task":
             self.aux = AuxHead(self._z_dim, TASK_CONTEXT_DIM
                                + len(self.aux_state_targets),
-                               mode="task").to(device)
+                               hidden=head_hidden, mode="task").to(device)
 
         # Fault-kind classifier on z: logits over "no fault" and every kind.
         self.fault_cls_weight = float(fault_cls_weight) if use_context else 0.0
         self.fault_head = (AuxHead(self._z_dim, N_DISTURBANCE_KINDS + 1,
-                                   mode="task").to(device)
+                                   hidden=head_hidden, mode="task").to(device)
                            if self.fault_cls_weight > 0.0 else None)
 
         # The encoder and aux heads stay on plain Adam: the KL bottleneck
         # already regularises the encoder.
         self.weight_decay = float(weight_decay)
-        self.actor_opt = _adamw(self.actor, lr, self.weight_decay)
+        # The actor's history module has its own optimizer, stepped by the
+        # critic's loss; ``history_frozen`` (a warm start) stops it.
+        self.actor_opt = _adamw(self.actor, lr, self.weight_decay,
+                                skip=("history",))
+        self.history_opt = _adamw(self.actor.history, lr, self.weight_decay)
+        self.history_frozen = False
         self.critic_opt = _adamw(self.critic, lr, self.weight_decay)
         self.encoder_opt = torch.optim.Adam(
             self.encoder.parameters(), lr=encoder_lr if encoder_lr else lr)
@@ -335,6 +354,7 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         def count(m):
             return 0 if m is None else sum(p.numel() for p in m.parameters())
         return {"actor": count(self.actor), "critic": count(self.critic),
+                "history": count(self.actor.history),
                 "encoder": count(self.encoder) if self.use_context else 0,
                 "gate": count(self.gate)}
 

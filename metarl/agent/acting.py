@@ -1,7 +1,9 @@
 """Acting (``ActingMixin``): the online posterior over z and action selection.
 
-actor -> tanh -> [adaptation gate] -> stage mask -> action projection -> stage
-mask.
+history (per-reactor GRU + cross-reactor attention) -> actor -> tanh ->
+[adaptation gate] -> stage mask -> action projection -> stage mask. The
+actor's and the base policy's history states are carried from step to step
+and reset at every episode start.
 """
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
@@ -9,7 +11,7 @@ import numpy as np
 import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.plant import PlantFermentationEnv
+from metarl.env.adapter import PlantFermentationEnv
 from metarl.apn.network import project_to_safe
 from metarl.agent.common import (ROLLOUT_DEVICE, PRE_TANH_CLIP,
                                  EXPLORE_NOISE_LEN, powerlaw_noise)
@@ -24,6 +26,9 @@ class ActingMixin:
         self.z_mu = torch.zeros(self._z_dim, device=ROLLOUT_DEVICE)
         self.z_sigma_sq = torch.ones(self._z_dim, device=ROLLOUT_DEVICE)
         self._h = torch.zeros(1, self.encoder.hidden, device=ROLLOUT_DEVICE)
+        self._ph = self._actor_r.initial_state(1, ROLLOUT_DEVICE)
+        self._bh = (self._base_r.initial_state(1, ROLLOUT_DEVICE)
+                    if self.adapt_gate else None)
         self._z_steps = 0
         self._explore_seq = None
         self._explore_t = 0
@@ -72,6 +77,8 @@ class ActingMixin:
         return {
             "z_mu": self.z_mu.clone(), "z_sigma_sq": self.z_sigma_sq.clone(),
             "z": self.z.clone(), "steps": self._z_steps, "h": self._h.clone(),
+            "ph": self._ph.clone(),
+            "bh": None if self._bh is None else self._bh.clone(),
             "explore_seq": (None if self._explore_seq is None
                             else self._explore_seq.clone()),
             "explore_t": self._explore_t,
@@ -84,6 +91,8 @@ class ActingMixin:
         self.z = state["z"].clone()
         self._z_steps = state["steps"]
         self._h = state["h"].clone()
+        self._ph = state["ph"].clone()
+        self._bh = None if state["bh"] is None else state["bh"].clone()
         seq = state.get("explore_seq")
         self._explore_seq = None if seq is None else seq.clone()
         self._explore_t = state.get("explore_t", 0)
@@ -145,25 +154,34 @@ class ActingMixin:
         """``base_a + gate * (a - base_a)``, still in [-1, 1]."""
         return base_a + gate.unsqueeze(-1) * (a - base_a)
 
-    def _base_action(self, net, obs, z):
-        """The base policy's deterministic squashed action (it ignores z)."""
-        mean = net(obs, torch.zeros_like(z))[0]
+    def _base_action(self, net, feat, z):
+        """The base policy's deterministic squashed action (it ignores z).
+
+        ``feat`` are the base policy's own history features.
+        """
+        mean = net(feat, torch.zeros_like(z))[0]
         return torch.tanh(torch.clamp(mean, -PRE_TANH_CLIP, PRE_TANH_CLIP))
 
-    def _safe_sample(self, obs, z, deterministic=False, with_logprob=True,
-                     gate=None):
+    def _safe_sample(self, obs, feat, z, deterministic=False, with_logprob=True,
+                     gate=None, base_feat=None):
         """Sample a stage-masked (optionally gated) action with its log-prob.
+
+        ``feat`` are the actor's history features at ``obs``; ``base_feat``
+        the base policy's (the actor's when None: a warm-started arm keeps its
+        source's history module frozen, so both read the same).
 
         Returns:
             Tuple (action, logp, n_active); n_active counts unmasked action
             dimensions per sample.
         """
         mask = self._stage_mask(obs)
-        a, logp = self.actor.sample(obs, z, deterministic=deterministic,
+        a, logp = self.actor.sample(feat, z, deterministic=deterministic,
                                     with_logprob=with_logprob, mask=mask)
         if gate is not None:
             with torch.no_grad():
-                base_a = self._base_action(self.base_actor, obs, z)
+                base_a = self._base_action(
+                    self.base_actor, feat if base_feat is None else base_feat,
+                    z)
             a = self._gated(base_a, a, gate)
         a = self._apply_safety(obs, a, mask=mask)
         if mask is None:
@@ -214,8 +232,10 @@ class ActingMixin:
     def select_action(self, state, deterministic=False):
         """Choose an action for one environment step.
 
-        Pipeline: actor -> tanh -> [adaptation gate: blend from the base
-        policy's action] -> stage mask -> action projection -> stage mask.
+        Pipeline: history step -> actor -> tanh -> [adaptation gate: blend
+        from the base policy's action] -> stage mask -> action projection ->
+        stage mask. Advances the actor's (and base policy's) history state,
+        so call it once per environment step.
 
         Returns:
             Tuple (executed_action, raw_action), each shape (action_dim,).
@@ -228,13 +248,15 @@ class ActingMixin:
                  if not deterministic and self.explore_noise_beta > 0.0
                  else None)
         with torch.no_grad():
-            raw, _ = self._actor_r.sample(obs, z, deterministic=deterministic,
+            feat, self._ph = self._actor_r.history_step(obs, self._ph)
+            raw, _ = self._actor_r.sample(feat, z, deterministic=deterministic,
                                           with_logprob=False, noise=noise)
             if self.adapt_gate:
                 g = self._gate_open(self._gate_r, z)
                 if self.gate_floor is not None:
                     g = torch.clamp(g, min=float(self.gate_floor))
-                raw = self._gated(self._base_action(self._base_r, obs, z),
+                base_feat, self._bh = self._base_r.history_step(obs, self._bh)
+                raw = self._gated(self._base_action(self._base_r, base_feat, z),
                                   raw, g)
                 self.last_gate = float(g)
             mask = self._stage_mask(obs)

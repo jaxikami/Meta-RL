@@ -15,10 +15,11 @@ three heterogeneous reactors and a central storage tank. ``baseline`` and
 ``saferl`` train on the single undisturbed nominal task and meet uncertainty
 first at evaluation; ``meta`` trains on a fresh prior task every episode, with
 mid-episode faults on one reactor (or all, or the plant's feed tanks or its
-storage tank). Both shielded arms run the same APN, which with concentrations
-masked guards only the inventory constraints one control interval can keep;
-harvest titer, purity and storage underflow have no shield, so there meta
-must adapt. ``meta`` starts from saferl's trained policy, acts through it
+storage tank). Both shielded arms run the same APN, which guards only the
+inventory constraints one control interval can keep; harvest titer, purity,
+storage underflow and the plant heat load have no shield, so there meta must
+adapt. The plant is Fermentation-PPO's (``metarl.env``): saferl and meta run
+on Safe PPO's environment, baseline on Standard PPO's. ``meta`` starts from saferl's trained policy, acts through it
 until its adaptation gate opens, and its checkpoint must be no worse than
 saferl on any held-out branch (``NO_REGRESS_*``).
 
@@ -50,7 +51,7 @@ import os
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from metarl.env.config import (MIN_HARVEST_TITER, MIN_PRODUCT_TITER,
-                               N_REACTORS, S_MAX, S_MIN)
+                               MAX_HEAT_LOAD, N_REACTORS, S_MAX, S_MIN)
 from metarl.apn.network import APN_PATH
 from metarl.agent.common import LATENT_DIM
 from metarl.training.config import (MODE, SEED, INCLUDE_BASELINE, USE_FILM,
@@ -70,7 +71,8 @@ def main(argv):
           f"log_dir={LOG_DIR}")
     print(f"latent_dim={LATENT_DIM}  film={USE_FILM}  aux={AUX_MODE}  "
           f"specs: harvest {MIN_HARVEST_TITER:.0f} / purity "
-          f"{MIN_PRODUCT_TITER:.0f} g/L; storage {S_MIN:.0f}..{S_MAX:.0f} kg")
+          f"{MIN_PRODUCT_TITER:.0f} g/L; storage {S_MIN:.0f}..{S_MAX:.0f} kg; "
+          f"heat load <= {MAX_HEAT_LOAD:.0f} kg CO2/h")
     print("arms: " + " | ".join(f"{a} ({ARMS[a].summary()})"
                                 for a in active_arms())
           + ("" if INCLUDE_BASELINE

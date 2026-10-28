@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
+from metarl.env.config import PROD_REWARD_PER_ETH, VIOLATION_SPIKE
 from metarl.env.faults import (DISTURBANCE_ALIASES, DISTURBANCE_KIND_INDEX,
                                DISTURBANCE_INDEX_MAP)
 from metarl.training.config import (SELECT_MAX_WORST_VIOL, SELECT_VIOL_WEIGHT,
@@ -32,10 +33,13 @@ from metarl.training.metrics import (latent_separability, gate_opening,
                                      _finite_mean)
 
 
-def violation_price(env):
-    """Ethanol one violation event is worth at the reward's own exchange rate."""
-    return (SELECT_VIOL_WEIGHT * float(env.BASE_SPIKE)
-            * float(env.PROD_REWARD_SCALE) / float(env.PROD_REWARD_COEF))
+def violation_price():
+    """Ethanol one violation event is worth at the reward's own exchange rate.
+
+    The fixed spike of a violation at its limit over the production reward
+    per unit of ethanol (2e6 at the environment's rates).
+    """
+    return SELECT_VIOL_WEIGHT * VIOLATION_SPIKE / PROD_REWARD_PER_ETH
 
 
 def _score_rows(rows, viol_price=0.0):
@@ -80,7 +84,7 @@ def blended_heldout_score(env, agent, tasks, z_mode="mean", disturbed=True,
     """
     faults = tuple(HELDOUT_DISTURBANCES) if disturbed else ()
     onset = env.max_steps // 2
-    price = violation_price(env)
+    price = violation_price()
     if pool is not None:
         per_task = pool.run(agent, tasks, faults, onset, z_mode)
     else:

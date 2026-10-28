@@ -168,6 +168,15 @@ R_LF = 26
 R_C5 = 27
 REACTOR_OBS_DIM = 28
 
+# The environment's reward exchange rates, locals of its step (safe.py /
+# bench.py), so the selection can price a violation event in ethanol:
+# the production reward per unit of harvested ethanol (kg x g/L), and the
+# fixed spike of one violation at the limit (FermentationEnvBench's
+# spike_coef, and BASE_SPIKE in FermentationEnv's no-Lagrangian case study).
+# smoke_test checks both against the environment.
+PROD_REWARD_PER_ETH = 0.5 / 1e7
+VIOLATION_SPIKE = 0.1
+
 # Normalise each reactor's lot in the privileged state (the observation has
 # no lot channel). One batch's lot is at most a vessel (~0.55).
 PRODUCT_MASS_SCALE = 400000.0

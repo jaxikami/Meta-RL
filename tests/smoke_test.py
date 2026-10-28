@@ -102,7 +102,9 @@ from metarl.training.rollouts import (collect_rollout, rollout_deterministic,
                                       _episode_metrics, branched_rollouts,
                                       collect_episode_record,
                                       ingest_episode_record)
-from metarl.training.heldout import _regressions, RolloutPool
+from metarl.training.heldout import (_regressions, RolloutPool,
+                                     blended_heldout_score, violation_price)
+from metarl.env.config import PROD_REWARD_PER_ETH, VIOLATION_SPIKE
 from metarl.apn.train import new_apn
 
 CTX = CONTEXT_SIZE
@@ -110,8 +112,6 @@ T1 = -0.34657359          # clock action of exactly 1.0x
 # Fault kinds that cost the scripted policies nothing, by design of the
 # kinetics (MetaRL_Lean/README: "a row where a tie is expected").
 TIE_EXPECTED_KINDS = ("cell_viability",)
-# The environment's production reward per ethanol (0.5 per 1e7; envs/safe.py).
-PROD_REWARD_PER_ETH = 0.5 / 1e7
 PORTED_MODULES = ("kinetics", "disturbances", "plant", "safe", "bench")
 
 
@@ -827,9 +827,18 @@ def check_constraint_ids_and_lagrangian():
     assert env.reactor_overflow_lambda.max() > 0.0
     bench = make_env(bench=True)
     assert isinstance(bench, BenchPlantFermentationEnv) and not bench.use_lagrangian
+    # The reward rates the selection prices a violation with are the
+    # environment's (locals of its step, so read from the source).
+    assert bench.spike_coef == VIOLATION_SPIKE
+    with open(os.path.join(_ROOT, "metarl", "env", "safe.py"), encoding="utf-8") as f:
+        src = f.read()
+    assert f"BASE_SPIKE = {VIOLATION_SPIKE} if self.fixed_violation_penalties" in src
+    assert "reward_coef = 0.5" in src and "(total_harvested_eth/1e7)" in src
+    assert np.isclose(PROD_REWARD_PER_ETH, 0.5 / 1e7)
     print("  constraint ids and Lagrangian switch OK (ids 1-9 are the "
           "environment's; lagrangian=False is the fixed-penalty case study; "
-          "bench is Standard PPO's environment)")
+          "bench is Standard PPO's environment; selection prices a violation "
+          f"at {violation_price():.1e} ethanol, the environment's rate)")
 
 
 # ───────────────────────────────────────────────────────────────── agent
@@ -1230,6 +1239,11 @@ def check_branched_rollouts_and_pool():
             assert np.isclose(scratch["on_spec_ethanol"],
                               rows[k + 1]["on_spec_ethanol"])
             assert np.isclose(scratch["reward"], rows[k + 1]["reward"])
+    # The held-out score that selection and early stopping read.
+    ho = blended_heldout_score(env, agent, tasks)
+    assert np.isfinite(ho["score"]) and set(ho["panel"]) and np.isclose(
+        ho["undisturbed_score"], ho["undisturbed_on_spec_ethanol"]
+        - violation_price() * ho["undisturbed_violations"])
     if not usable:
         print("  branched rollouts OK (no APN checkpoint for this plant: "
               "worker pool skipped)")

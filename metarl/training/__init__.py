@@ -1,4 +1,4 @@
-"""The three-arm study: training, checkpoint selection, evaluation, figures.
+"""The two-arm study (saferl vs meta): training, checkpoint selection, evaluation, figures.
 
     cli                entry point (``python -m metarl <mode>``)
     config             every setting of the study

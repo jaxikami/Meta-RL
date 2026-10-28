@@ -560,8 +560,3 @@ def train_meta():
 def train_saferl():
     """Train the safe-RL arm: duals, stage mask and action projection."""
     return _train("saferl")
-
-
-def train_baseline():
-    """Train the unconstrained baseline: no duals, no mask, no projection."""
-    return _train("baseline")

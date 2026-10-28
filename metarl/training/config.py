@@ -1,4 +1,4 @@
-"""Settings of the three-arm study.
+"""Settings of the two-arm study (saferl vs meta).
 
 Task pool and collection, agent and network sizes, meta-training faults,
 evaluation scenarios, checkpoint selection, warm start and output paths.
@@ -15,9 +15,6 @@ from metarl.env.disturbances import (EVAL_DISTURBANCES, EVAL_ONSET,
 
 MODE = "all"
 SEED = int(os.environ.get("PLANT_SEED", 0))
-# Train and evaluate the unconstrained baseline arm (off by default, as in
-# the lean study; SAFETY is then not reported).
-INCLUDE_BASELINE = False
 
 # ─── Task pool and collection ─────────────────────────────────────────────────
 # Multitask arms draw a FRESH prior task for every training episode; the

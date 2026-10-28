@@ -216,7 +216,6 @@ class AblationConfig:
             apn=meta.apn and self.apn,
             apn_soft=meta.apn_soft and self.apn,
             warm_start=meta.warm_start if self.warmstart else None,
-            bench_env=meta.bench_env,
             blurb=f"ablation of meta: {self.label}")
 
 

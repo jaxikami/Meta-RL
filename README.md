@@ -8,18 +8,19 @@ The lean study's question (`../MetaRL_Lean`), asked of the full plant:
 > never trained for?
 
 **The environment is Fermentation-PPO's** (`../Fermentation-PPO/envs/`), so
-this study's arms and Safe PPO are benchmarked on one plant. Its five modules
+this study's arms and Safe PPO are benchmarked on one plant. Its four modules
 are ported into `metarl/env/` with only their import paths changed
-(`kinetics`, `disturbances`, `plant`, `safe`, `bench`, and its constants at
+(`kinetics`, `disturbances`, `plant`, `safe`, and its constants at
 the top of `config.py`). `tests/smoke_test.py` checks that they still equal
 Fermentation-PPO's sources, and steps both environments side by side under
 every evaluation fault with bit-identical observations, rewards and violation
 counts. It skips the check when `../Fermentation-PPO` is absent;
-`FERMENTATION_PPO_ROOT` points it elsewhere. `saferl` and `meta` run on Safe
-PPO's `FermentationEnv`; `baseline` runs on Standard PPO's
-`FermentationEnvBench`.
+`FERMENTATION_PPO_ROOT` points it elsewhere. Both arms run on Safe PPO's
+`FermentationEnv`. The benchmark is safe RL against meta-RL: there is no
+unconstrained baseline arm, and Standard PPO's `FermentationEnvBench` is not
+ported.
 
-What stays this study's own: the flow-only task distribution, the three arms,
+What stays this study's own: the flow-only task distribution, the two arms,
 the warm-started and gated meta agent, the action projection network, and
 the selection and evaluation protocol. `metarl/env/adapter.py` puts the
 environment behind the agent's interface without changing its plant, reward
@@ -34,9 +35,8 @@ Before the port, this study ran its own plant: the lean instrument model
 (masked concentrations, noisy assays, an off-gas CO₂ channel, a POMDP), a
 turnaround-conflict constraint as id 9, early-ending steps at batch
 boundaries, and its own reward scale. That plant and the results trained on
-it are in git history (commit `bc502ee` and before). The checkpoints in
-`policy/` and the figures in `results/` predate the port. They do not load
-against the current environment (observation layout v2), so retrain.
+it are in git history (commit `bc502ee` and before), as are the figures
+and logs trained on it.
 
 The previous multi-reactor implementation (product-of-Gaussians PEARL,
 inventory-only constraints) is in git history (commit `88452a4` and before).
@@ -47,17 +47,15 @@ superseded and do not import against the `metarl` package.
 
 ---
 
-## The three arms
+## The two arms
 
 | arm | environment | training tasks | latent z | Lagrangian duals | stage mask | action projection (APN) |
 |---|---|---|---|---|---|---|
-| `baseline` | Standard PPO's (`FermentationEnvBench`) | nominal only | no | no (static spikes) | no (the environment enforces the stages) | no |
 | `saferl` | Safe PPO's (`FermentationEnv`) | nominal only | no | yes | yes | **hard**: reactor overflow / underflow, storage overflow |
 | `meta` | Safe PPO's | fresh prior task per episode + mid-episode faults, from `saferl`'s policy, which acts until z detects a fault | yes | yes | yes | **hard**: the same shield |
 
-- `SAFETY = saferl − baseline`, `ADAPT = meta − saferl`, both paired.
-- `INCLUDE_BASELINE = False` by default (as in the lean study), so `all` trains
-  `saferl` then `meta` and reports `ADAPT`.
+- `ADAPT = meta − saferl`, paired. `all` trains `saferl` then `meta` and
+  reports `ADAPT`.
 - `meta` is the lean study's arm unchanged in kind: warm start from `saferl`
   (FiLM weights at zero, so it acts as `saferl` for every z), a frozen copy of
   `saferl` as the adaptation gate's base, `a = base(s) + g(z)(actor(s, z) −
@@ -173,10 +171,6 @@ Safe PPO's (`metarl/env/safe.py`), per reactor; the agent gets their sum:
 | barriers | storage log-barrier below 16 × S_MIN; feedstock below 2% |
 | purity shaping | `−0.002` quadratic on each lot below 1.15 × spec |
 | smoothing, trickle | `0.005 ×` mean squared change of the flow commands; `0.0005` per reactor in unload |
-
-`baseline`'s `FermentationEnvBench` prices every constraint with a static
-spike of `0.1 × (1 + 4 d / (1 + d))` instead, with log barriers on 1–4 and no
-dual or soft wall.
 
 ---
 
@@ -487,7 +481,7 @@ by the study's own code, over several seeds.
 |---|---|---|
 | `z` | `use_context=False` | the aux head, privileged critics and the adaptation gate |
 | `multitask` | `multitask=False` (nominal task only) | held-out selection on the undisturbed checks only |
-| `lagrangian` | `lagrangian=False` | none: the static shaping stays, as for `baseline` |
+| `lagrangian` | `lagrangian=False` | none: the static shaping stays |
 | `mask` | `action_mask=False` | none, but the plant has no interlock, so unmasked flows reach the shield and the plant |
 | `apn` | `apn=False` | the mapping penalty |
 | `warmstart` | `warm_start=None` (from scratch) | the anchor, L2-SP decay, actor warm-up, gate and no-regression selection |
@@ -516,9 +510,9 @@ into mixins, one module per concern.
 
 | module | role |
 |---|---|
-| `metarl/env/kinetics.py` / `disturbances.py` / `plant.py` / `safe.py` / `bench.py` | Fermentation-PPO's environment, ported with only the imports changed: kinetics and RK4, the eleven fault kinds and evaluation scenarios, the shared plant, Safe PPO's `FermentationEnv`, Standard PPO's `FermentationEnvBench` |
+| `metarl/env/kinetics.py` / `disturbances.py` / `plant.py` / `safe.py` | Fermentation-PPO's environment, ported with only the imports changed: kinetics and RK4, the eleven fault kinds and evaluation scenarios, the plant, Safe PPO's `FermentationEnv` |
 | `metarl/env/config.py` | Fermentation-PPO's constants, then the observation offsets and the task distribution |
-| `metarl/env/adapter.py` | `PlantFermentationEnv` / `BenchPlantFermentationEnv`: the two environments behind the agent's interface (flat views, tasks, fault tracking, privileged state, per-reactor ledger) |
+| `metarl/env/adapter.py` | `PlantFermentationEnv`: the environment behind the agent's interface (flat views, tasks, fault tracking, privileged state, per-reactor ledger) |
 | `metarl/env/layout.py` / `faults.py` | observation and action indices and the stage mask; fault kind codes, aliases and presets |
 | `metarl/agent/pearl.py` | `PEARLAgent`: the PEARL/SAC agent and its rollout copies |
 | `metarl/agent/acting.py` / `learning.py` / `checkpoint.py` | its mixins: posterior and action selection (adaptation gate, APN hooks), the update, save / load / warm start |

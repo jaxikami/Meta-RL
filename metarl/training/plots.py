@@ -13,10 +13,10 @@ from metarl.env.config import (MIN_PRODUCT_TITER, N_REACTORS, S_MAX, S_MIN,
 from metarl.training.config import (CONSTRAINT_NAMES, DEPTH_CONSTRAINTS,
                                     Z_INFORM_MIN_SNR, LOG_DIR, PLOT_DIR,
                                     TITER_PANEL_FLOOR_PAD, DISTURB_PROBES)
-from metarl.training.arms import ARMS, active_arms
+from metarl.training.arms import ARMS, ARM_ORDER
 from metarl.training.metrics import episodes_violated, _paired_delta
 
-ARM_COLORS = {"baseline": "#eb6834", "saferl": "#1baf7a", "meta": "#2a78d6"}
+ARM_COLORS = {"saferl": "#1baf7a", "meta": "#2a78d6"}
 PLOT_INK, PLOT_INK2, PLOT_GRID = "#0b0b0b", "#52514e", "#d8d7d2"
 PLOT_NEUTRAL = "#b4b3ad"
 # Constraints counted per step (product_purity counts per rejected lot).
@@ -457,7 +457,7 @@ def _plot_comparison(results):
 
     names = list(results.keys())
     labels = [n.replace("disturb_", "D ").replace("_", " ") for n in names]
-    arms = tuple(a for a in active_arms() if a in results[names[0]])
+    arms = tuple(a for a in ARM_ORDER if a in results[names[0]])
     colors = ARM_COLORS
     INK, INK2, GRID = PLOT_INK, PLOT_INK2, PLOT_GRID
     x = np.arange(len(names))
@@ -488,8 +488,7 @@ def _plot_comparison(results):
     w = 0.8 / max(len(arms), 1)
     off = lambda i: (i - (len(arms) - 1) / 2) * w          # noqa: E731
     os.makedirs(PLOT_DIR, exist_ok=True)
-    arm_titles = {"baseline": "Unconstrained RL", "saferl": "Safe RL",
-                  "meta": "Meta-RL"}
+    arm_titles = {"saferl": "Safe RL", "meta": "Meta-RL"}
     suptitle = " vs ".join(arm_titles.get(a, a) for a in arms)
     if "meta" in arms:
         snr = float(np.mean([results[n]["meta"]["z_snr"] for n in names]))
@@ -646,7 +645,7 @@ def plot_training_curves():
         print(f"[plot] training curves skipped: {exc}")
         return
     logs = {}
-    for arm in active_arms():
+    for arm in ARM_ORDER:
         path = os.path.join(LOG_DIR, f"{ARMS[arm].label.lower()}_log.json")
         if os.path.exists(path):
             with open(path) as f:

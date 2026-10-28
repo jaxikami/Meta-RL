@@ -1,4 +1,4 @@
-"""Evaluation: every active arm on every scenario, on both metric axes."""
+"""Evaluation: both arms on every scenario, on both metric axes."""
 
 # ─── Standard Library ─────────────────────────────────────────────────────────
 import json
@@ -17,8 +17,8 @@ from metarl.training.config import (SEED, EVAL_EPISODES, EVAL_Z_MODE,
                                     CONSTRAINT_NAMES, DEPTH_CONSTRAINTS,
                                     Z_INFORM_MIN_SNR, LOG_DIR, PLOT_DIR,
                                     DISTURB_PROBES)
-from metarl.training.arms import (ARMS, ARM_ORDER, CONTRASTS, active_arms,
-                                  arm_paths, _build_agent,
+from metarl.training.arms import (ARMS, ARM_ORDER, CONTRASTS, arm_paths,
+                                  _build_agent,
                                   _load_preferring_best)
 from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool,
                                    as_fault_schedule, pattern_schedule)
@@ -239,7 +239,7 @@ def eval_fault_scenarios(onset, horizon=None):
 
 
 def evaluate():
-    """Compare every active arm on every scenario, on both metric axes.
+    """Compare both arms on every scenario, on both metric axes.
 
     Every arm sees the same tasks in the same order (and, for rotating
     faults, the same faulted reactor per task), so results are paired. Each
@@ -250,7 +250,7 @@ def evaluate():
         The full results dict, also written to ``eval.json``.
     """
     seed_everything(SEED)
-    arms = active_arms()
+    arms = ARM_ORDER
     envs, agents = {}, {}
     for name in arms:
         spec = ARMS[name]

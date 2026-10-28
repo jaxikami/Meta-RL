@@ -4,9 +4,9 @@ The first half is Fermentation-PPO's ``envs/config.py`` verbatim: three
 heterogeneous fed-batch reactors (feed pumps 1x, 4x and 0.5x) sharing one LF /
 C5 feedstock pool and discharging into one central storage tank, the species,
 feeds, stage credits, the two titer specs and the plant heat-removal cap. The
-environment (``metarl.env.safe`` / ``metarl.env.bench``) is that project's,
-so Safe PPO and the arms here are benchmarked on one plant;
-``tests/smoke_test.py`` steps both side by side.
+environment (``metarl.env.safe``) is that project's, so Safe PPO and the
+arms here are benchmarked on one plant; ``tests/smoke_test.py`` steps both
+side by side.
 
 The second half is this project's: the observation's per-reactor layout
 offsets and the meta-RL task distribution. Only FLOW quantities are
@@ -168,11 +168,11 @@ R_LF = 26
 R_C5 = 27
 REACTOR_OBS_DIM = 28
 
-# The environment's reward exchange rates, locals of its step (safe.py /
-# bench.py), so the selection can price a violation event in ethanol:
-# the production reward per unit of harvested ethanol (kg x g/L), and the
-# fixed spike of one violation at the limit (FermentationEnvBench's
-# spike_coef, and BASE_SPIKE in FermentationEnv's no-Lagrangian case study).
+# The environment's reward exchange rates, locals of its step (safe.py), so
+# the selection can price a violation event in ethanol: the production reward
+# per unit of harvested ethanol (kg x g/L), and the fixed spike of one
+# violation at the limit (BASE_SPIKE in FermentationEnv's no-Lagrangian case
+# study).
 # smoke_test checks both against the environment.
 PROD_REWARD_PER_ETH = 0.5 / 1e7
 VIOLATION_SPIKE = 0.1
@@ -282,8 +282,7 @@ def _context(solids, gx, gains, leaks):
 def nominal_task():
     """Return the nominal task theta_0: the Fermentation-PPO plant exactly.
 
-    The sole training task for the single-regime arms (``baseline``,
-    ``saferl``). Its flow is ideal -- every pump gain 1.0, no leak, unscaled
+    The sole training task for the single-regime arm (``saferl``). Its flow is ideal -- every pump gain 1.0, no leak, unscaled
     feed -- so those arms never see a miscalibrated pump, a leaking vessel or
     off-spec feedstock until evaluation.
 

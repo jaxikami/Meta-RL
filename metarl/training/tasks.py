@@ -13,8 +13,7 @@ from metarl.env.config import (sample_task, N_REACTORS, CTX_SOLIDS, CTX_GX,
 from metarl.env.faults import (PLANT_DISTURBANCES, DISTURBANCE_ALIASES,
                                ADDITIVE_DISTURBANCES,
                                parse_active_disturbances)
-from metarl.env.adapter import (PlantFermentationEnv,
-                                BenchPlantFermentationEnv)
+from metarl.env.adapter import PlantFermentationEnv
 from metarl.training.config import (HELDOUT_CORNER_TASKS, HELDOUT_CORNER_SEED,
                                     HELDOUT_CORNER_CANDIDATES,
                                     RESET_LAMBDAS_PER_EPISODE,
@@ -50,21 +49,17 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def make_env(lagrangian=True, bench=False):
-    """Construct the plant: one of Fermentation-PPO's two environments.
+def make_env(lagrangian=True):
+    """Construct the plant: Fermentation-PPO's Safe PPO environment.
 
     Args:
         lagrangian: Price violations with the adaptive dual multipliers
             (Safe PPO's environment); False is its no-Lagrangian case study,
             fixed per-violation penalties instead.
-        bench: Standard PPO's environment instead (static spikes, stage logic
-            enforced in the environment); ``lagrangian`` is then ignored.
 
     Returns:
-        A ``PlantFermentationEnv`` or ``BenchPlantFermentationEnv``.
+        A ``PlantFermentationEnv``.
     """
-    if bench:
-        return BenchPlantFermentationEnv()
     env = PlantFermentationEnv()
     env.reset_lambdas_per_episode = RESET_LAMBDAS_PER_EPISODE
     env.use_lagrangian = lagrangian
@@ -73,7 +68,7 @@ def make_env(lagrangian=True, bench=False):
 
 def make_arm_env(spec):
     """The environment an ``ArmSpec`` trains and is evaluated on."""
-    return make_env(lagrangian=spec.lagrangian, bench=spec.bench_env)
+    return make_env(lagrangian=spec.lagrangian)
 
 
 def make_task_pool(n, seed=0, ood=False):

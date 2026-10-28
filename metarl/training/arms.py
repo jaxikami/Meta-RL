@@ -1,4 +1,4 @@
-"""The three arms (``ARMS``), their checkpoints and the agent each one runs."""
+"""The two arms (``ARMS``), their checkpoints and the agent each one runs."""
 
 # ─── Standard Library ─────────────────────────────────────────────────────────
 import os
@@ -7,8 +7,8 @@ import os
 from metarl.env.layout import SHIELD_OBS_DIM, PRIVILEGED_STATE_DIM
 from metarl.agent.common import device
 from metarl.agent.pearl import PEARLAgent
-from metarl.training.config import (APN_PENALTY_WEIGHT, SEED, INCLUDE_BASELINE,
-                                    NORMALIZE_REWARDS, REWARD_SCALE, USE_FILM,
+from metarl.training.config import (APN_PENALTY_WEIGHT, SEED, NORMALIZE_REWARDS,
+                                    REWARD_SCALE, USE_FILM,
                                     AUX_MODE, AUX_WEIGHT, AUX_SAMPLE_FRAC,
                                     META_AUX_STATE_TARGETS, NET_ACTOR_HIDDEN,
                                     NET_CRITIC_HIDDEN, NET_CRITIC_TOKEN_HIDDEN,
@@ -32,8 +32,7 @@ class ArmSpec:
     """Static configuration for one trained arm (see the lean study's)."""
 
     def __init__(self, name, label, multitask, use_context, lagrangian,
-                 action_mask, apn, blurb, apn_soft=False, warm_start=None,
-                 bench_env=False):
+                 action_mask, apn, blurb, apn_soft=False, warm_start=None):
         """Record one arm's configuration.
 
         Args:
@@ -52,9 +51,6 @@ class ArmSpec:
             warm_start: Key of an arm whose trained checkpoint this arm starts
                 from; it is then anchored to that policy, selected against it
                 (NO_REGRESS_*) and, with context, gated (GATE_*).
-            bench_env: Train and evaluate on Standard PPO's environment
-                (``FermentationEnvBench``: static spikes, stage logic in the
-                environment) rather than Safe PPO's (``FermentationEnv``).
         """
         self.name = name
         self.label = label
@@ -65,7 +61,6 @@ class ArmSpec:
         self.apn = bool(apn)
         self.apn_soft = bool(apn_soft)
         self.warm_start = warm_start
-        self.bench_env = bool(bench_env)
         self.blurb = blurb
 
     def summary(self):
@@ -78,17 +73,10 @@ class ArmSpec:
             s += " apn_soft=on"
         if self.warm_start:
             s += f" warm={self.warm_start}"
-        s += f" env={'bench' if self.bench_env else 'safe'}"
         return s
 
 
 ARMS = {
-    "baseline": ArmSpec(
-        "baseline", "BASELINE", multitask=False, use_context=False,
-        lagrangian=False, action_mask=False, apn=False, apn_soft=False,
-        bench_env=True,
-        blurb="Standard PPO's environment on the nominal regime: static "
-              "penalties, no duals, no mask, no shield"),
     "saferl": ArmSpec(
         "saferl", "SAFERL", multitask=False, use_context=False,
         lagrangian=True, action_mask=True, apn=True, apn_soft=False,
@@ -103,19 +91,12 @@ ARMS = {
               "policy, which acts until the latent detects a fault"),
 }
 
-ARM_ORDER = ("baseline", "saferl", "meta")
+ARM_ORDER = ("saferl", "meta")
 
 CONTRASTS = (
-    ("SAFETY", "saferl", "baseline",
-     "saferl - baseline : the safe-RL stack (duals + mask + projection)"),
     ("ADAPT", "meta", "saferl",
      "meta - saferl : meta-RL on top of safe RL, across regimes"),
 )
-
-
-def active_arms():
-    """Arms that train under ``all`` and run in ``evaluate``."""
-    return tuple(a for a in ARM_ORDER if INCLUDE_BASELINE or a != "baseline")
 
 
 def arm_paths(arm):

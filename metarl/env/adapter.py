@@ -1,9 +1,7 @@
 """The meta-RL interface over the Fermentation-PPO environments.
 
 ``PlantFermentationEnv`` is Fermentation-PPO's ``FermentationEnv`` (Safe PPO's
-environment: Lagrangian shaping, soft walls) and ``BenchPlantFermentationEnv``
-its ``FermentationEnvBench`` (Standard PPO's: static spikes, stage logic in
-the environment), each with ``MetaPlantMixin`` on top. The mixin changes
+environment: Lagrangian shaping, soft walls) with ``MetaPlantMixin`` on top. The mixin changes
 nothing about the plant, its reward or its constraints; it adds what the
 meta-RL side reads:
 
@@ -38,7 +36,6 @@ from metarl.env.faults import (VALID_DISTURBANCES, ADDITIVE_DISTURBANCES,
                                parse_active_disturbances)
 from metarl.env.plant import FermentationPlant
 from metarl.env.safe import FermentationEnv
-from metarl.env.bench import FermentationEnvBench
 
 # Constraint ids attributed to a reactor in ``reactor_violation_events``.
 REACTOR_CONSTRAINTS = (1, 2, 7, 8)
@@ -392,19 +389,3 @@ class PlantFermentationEnv(MetaPlantMixin, FermentationEnv):
         self.fixed_violation_penalties = not bool(value)
         if not value:
             self._zero_lambdas()
-
-
-class BenchPlantFermentationEnv(MetaPlantMixin, FermentationEnvBench):
-    """Standard PPO's environment (``FermentationEnvBench``) with the meta-RL interface."""
-
-    use_lagrangian = False
-
-    def __init__(self, control_action_interval=5, active_disturbances=None,
-                 max_steps=None):
-        self._init_meta(active_disturbances)
-        hw = get_main_reactor_config()
-        super().__init__(n_reactors=N_REACTORS, Mmax=hw['Mmax'],
-                         max_flow_LF=hw['max_flow_LF'],
-                         max_flow_C5=hw['max_flow_C5'],
-                         control_action_interval=control_action_interval)
-        self._finish_meta_init(max_steps)

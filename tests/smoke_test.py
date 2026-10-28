@@ -6,9 +6,8 @@ branched and worker rollouts -- without real training, and asserts the design
 properties that must not silently regress:
 
   * the environment IS Fermentation-PPO's: the ported modules equal its
-    ``envs/`` sources but for their import lines, and both environments (Safe
-    PPO's and Standard PPO's) step bit-identically to the originals under
-    every fault kind (skipped when ../Fermentation-PPO is absent);
+    ``envs/`` sources but for their import lines, and Safe PPO's environment
+    steps bit-identically to the original under every fault kind (skipped when ../Fermentation-PPO is absent);
   * the observation layout: each token is its reactor's observation row; the
     NumPy and Torch stage masks agree, and equal the environment's per row;
   * pump gains and leaks are drawn per reactor; the nominal task leaves the
@@ -75,8 +74,7 @@ from metarl.env.layout import (STATE_DIM, ACTION_DIM, SHIELD_OBS_DIM,
 from metarl.env.faults import (VALID_DISTURBANCES, DISTURBANCE_KIND_INDEX,
                                PLANT_DISTURBANCES)
 from metarl.env.plant import DISCHARGE_CUTOFF, FermentationPlant
-from metarl.env.adapter import (PlantFermentationEnv,
-                                BenchPlantFermentationEnv)
+from metarl.env.adapter import PlantFermentationEnv
 from metarl.agent.common import device, LATENT_DIM
 from metarl.agent.networks import token_index
 from metarl.agent.replay import MultiTaskReplayBuffer
@@ -112,7 +110,7 @@ T1 = -0.34657359          # clock action of exactly 1.0x
 # Fault kinds that cost the scripted policies nothing, by design of the
 # kinetics (MetaRL_Lean/README: "a row where a tie is expected").
 TIE_EXPECTED_KINDS = ("cell_viability",)
-PORTED_MODULES = ("kinetics", "disturbances", "plant", "safe", "bench")
+PORTED_MODULES = ("kinetics", "disturbances", "plant", "safe")
 
 
 def _clock(x):
@@ -208,7 +206,7 @@ def _ppo_modules():
         sys.path.insert(0, PPO_ROOT)
     import importlib
     return {m: importlib.import_module(f"envs.{m}")
-            for m in ("config", "safe", "bench", "disturbances")}
+            for m in ("config", "safe", "disturbances")}
 
 
 def check_parity_with_fermentation_ppo():
@@ -247,9 +245,7 @@ def check_parity_with_fermentation_ppo():
             assert np.array_equal(np.asarray(va), np.asarray(vb)), name
     hw = ref.get_main_reactor_config()
     worst = 0
-    for ref_cls, cls in ((ppo["safe"].FermentationEnv, PlantFermentationEnv),
-                         (ppo["bench"].FermentationEnvBench,
-                          BenchPlantFermentationEnv)):
+    for ref_cls, cls in ((ppo["safe"].FermentationEnv, PlantFermentationEnv),):
         for label in ppo["disturbances"].EVAL_DISTURBANCES:
             pattern = ("step", "recurrent")[len(label) % 2]
             ref_env = ref_cls(n_reactors=3, Mmax=hw['Mmax'],
@@ -277,7 +273,7 @@ def check_parity_with_fermentation_ppo():
                     info["reactor_violation_events"].sum())))
     assert worst <= 1, worst   # 8: one plant-wide event when nothing shipped
     print(f"  parity with Fermentation-PPO OK ({len(PORTED_MODULES)} modules "
-          f"equal its sources but for imports; both environments step "
+          f"equal its sources but for imports; the environment steps "
           f"bit-identically under all {len(ppo['disturbances'].EVAL_DISTURBANCES)}"
           f" evaluation faults; per-reactor events add up)")
 
@@ -389,8 +385,7 @@ def check_mass_conservation():
     cases = [(), (("leak", 100, 0.05, 1),), (("leak", 50, 1.0, None),),
              (("leak", 200, 0.25, 2), ("downstream_rate", 100, 1.6)),
              (("downstream_rate", 10, 0.2),)]
-    for cls in (PlantFermentationEnv, BenchPlantFermentationEnv):
-        env = cls()
+    for env in (PlantFermentationEnv(),):
         for faults in cases:
             task = sample_task(np.random.default_rng(len(faults)))
             _, counts, info, _ = _run(env, _pol_full_throttle, task=task,
@@ -401,7 +396,7 @@ def check_mass_conservation():
             assert env.S_mass >= 0.0
             worst = max(worst, abs(info["mass_balance_error"]))
     print(f"  mass conservation OK (worst residual {worst:.2e} kg over leaks, "
-          f"task leaks, tank draw and recharges, both environments)")
+          f"task leaks, tank draw and recharges)")
 
 
 def check_storage():
@@ -825,11 +820,8 @@ def check_constraint_ids_and_lagrangian():
     assert env.use_lagrangian and env.reset_lambdas_per_episode
     _, _, _, _ = _run(env, _pol_full_throttle)
     assert env.reactor_overflow_lambda.max() > 0.0
-    bench = make_env(bench=True)
-    assert isinstance(bench, BenchPlantFermentationEnv) and not bench.use_lagrangian
     # The reward rates the selection prices a violation with are the
     # environment's (locals of its step, so read from the source).
-    assert bench.spike_coef == VIOLATION_SPIKE
     with open(os.path.join(_ROOT, "metarl", "env", "safe.py"), encoding="utf-8") as f:
         src = f.read()
     assert f"BASE_SPIKE = {VIOLATION_SPIKE} if self.fixed_violation_penalties" in src
@@ -837,7 +829,7 @@ def check_constraint_ids_and_lagrangian():
     assert np.isclose(PROD_REWARD_PER_ETH, 0.5 / 1e7)
     print("  constraint ids and Lagrangian switch OK (ids 1-9 are the "
           "environment's; lagrangian=False is the fixed-penalty case study; "
-          "bench is Standard PPO's environment; selection prices a violation "
+          "selection prices a violation "
           f"at {violation_price():.1e} ethanol, the environment's rate)")
 
 

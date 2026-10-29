@@ -239,10 +239,12 @@ class ReactorHistory(nn.Module):
         K, R, N, _ = tok.shape
         x = (self.embed(tok) + self.slot).reshape(K, R, N * self.hidden)
         h = self.initial_state(K, tok.device)
+        # One [K * N, 1] multiplier per row, built before the loop: the loop
+        # is launch-bound, so every kernel per row counts.
+        keep = (~reset).to(h.dtype).t().repeat_interleave(N, dim=1).unsqueeze(-1)
         states = []
         for q in range(R):
-            keep = (~reset[:, q]).to(h.dtype).repeat_interleave(N)
-            h = h * keep.view(1, -1, 1)
+            h = h * keep[q]
             h = self._fold(x[:, q].reshape(K * N, self.hidden), h)
             states.append(h.view(self.layers, K, N, self.hidden))
         states = torch.stack(states)                  # [R, layers, K, N, H]
@@ -480,7 +482,8 @@ class TanhGaussianActor(nn.Module):
         a = torch.tanh(u)
         if not with_logprob:
             return a, None
-        dist = Normal(mean, std)
+        # Argument validation would sync the GPU on every update.
+        dist = Normal(mean, std, validate_args=False)
         log_one_minus_a_sq = 2.0 * (np.log(2.0) - u - F.softplus(-2.0 * u))
         logp = dist.log_prob(u) - log_one_minus_a_sq
         if mask is not None:

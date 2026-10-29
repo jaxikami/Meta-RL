@@ -98,10 +98,12 @@ from metarl.training.evaluate import eval_fault_scenarios
 from metarl.training.rollouts import (collect_rollout, rollout_deterministic,
                                       _start_episode, _advance,
                                       _episode_metrics, branched_rollouts,
+                                      scenario_rollouts,
                                       collect_episode_record,
                                       ingest_episode_record)
-from metarl.training.heldout import (_regressions, RolloutPool,
+from metarl.training.heldout import (_regressions,
                                      blended_heldout_score, violation_price)
+from metarl.training.workers import RolloutPool
 from metarl.env.config import PROD_REWARD_PER_ETH, VIOLATION_SPIKE
 from metarl.apn.train import new_apn
 
@@ -1231,6 +1233,21 @@ def check_branched_rollouts_and_pool():
             assert np.isclose(scratch["on_spec_ethanol"],
                               rows[k + 1]["on_spec_ethanol"])
             assert np.isclose(scratch["reward"], rows[k + 1]["reward"])
+    # Evaluation scenarios (every pattern, so both first onsets) branched
+    # from one undisturbed prefix equal from-scratch episodes exactly,
+    # shield counters included.
+    scen = {n: d for n, d in eval_fault_scenarios(onset, env.max_steps).items()
+            if n.startswith("leak_")}
+    names = [None] + sorted(scen)
+    rows = scenario_rollouts(env, agent, tasks[1], [scen.get(n) for n in names],
+                             index=1)
+    for n, row in zip(names, rows):
+        scratch = rollout_deterministic(env, agent, tasks[1],
+                                        disturbance=scen.get(n), index=1)
+        for k in ("reward", "violations", "on_spec_ethanol", "proj",
+                  "viol_depth_sum"):
+            assert scratch[k] == row[k], (n, k, scratch[k], row[k])
+        assert np.array_equal(scratch["act_traj"], row["act_traj"]), n
     # The held-out score that selection and early stopping read.
     ho = blended_heldout_score(env, agent, tasks)
     assert np.isfinite(ho["score"]) and set(ho["panel"]) and np.isclose(

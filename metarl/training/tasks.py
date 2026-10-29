@@ -29,17 +29,6 @@ from metarl.training.config import (HELDOUT_CORNER_TASKS, HELDOUT_CORNER_SEED,
                                     META_RECURRENT_ON_H, META_RECURRENT_OFF_H,
                                     META_RECURRENT_MAX)
 
-ACTIVE_DISTURBANCES = None
-
-
-def set_active_disturbances(selection):
-    """Restrict which kinds meta-training disturbance draws may use."""
-    global ACTIVE_DISTURBANCES
-    ACTIVE_DISTURBANCES = (None if selection is None
-                           else parse_active_disturbances(selection))
-    return ACTIVE_DISTURBANCES
-
-
 def seed_everything(seed):
     """Seed Python, NumPy and Torch."""
     random.seed(seed)
@@ -277,8 +266,6 @@ def maybe_schedule_disturbance(env, prob=None, rng=None, task_id=None,
     active = active_disturbances
     if active is None:
         active = getattr(env, "active_disturbances", None)
-    if active is None:
-        active = ACTIVE_DISTURBANCES
     if active is None:
         active = META_DISTURB_KINDS
     candidate_kinds = parse_active_disturbances(active)

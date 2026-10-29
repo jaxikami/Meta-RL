@@ -58,9 +58,96 @@ from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool
 from metarl.training.rollouts import collect_rollout, ingest_episode_record
 from metarl.training.heldout import (blended_heldout_score, _anchor_drift,
                                      _adapt_anchor, _anchor_kind_log,
-                                     _regressions, RolloutPool)
+                                     _regressions)
+from metarl.training.workers import RolloutPool
 from metarl.training.logs import _write_log
 from metarl.training.plots import plot_training_curves
+
+
+# Update diagnostics logged every iteration, with the value logged when an
+# update does not report one (None: always reported).
+_UPDATE_STATS = (("critic_loss", None), ("actor_loss", None), ("kl", None),
+                 ("aux_loss", None), ("fault_cls_loss", 0.0),
+                 ("map_loss", 0.0), ("anchor_loss", 0.0),
+                 ("anchor_gap_nominal", float("nan")),
+                 ("anchor_gap_fault", float("nan")),
+                 ("gate_loss", float("nan")), ("gate_nominal", float("nan")),
+                 ("hold_loss", float("nan")), ("stall_frac", float("nan")),
+                 ("gate_fault", float("nan")), ("alpha", None),
+                 ("z_norm", None))
+
+
+def _log_update(log, it, avg_r, avg_v, stats, pstats, gated):
+    """Append one iteration's training diagnostics to ``log``."""
+    log["iter"].append(it)
+    log["avg_reward"].append(avg_r)
+    log["avg_violations"].append(avg_v)
+    for k, default in _UPDATE_STATS:
+        v = stats[k] if default is None else stats.get(k, default)
+        log[k].append(v if gated or k != "gate_loss" else float("nan"))
+    for k in ("proj_noop_frac", "proj_mean_steps"):
+        log[k].append(pstats[k])
+
+
+class _Collector:
+    """One arm's training episodes: drawn here, run in a worker pool (during
+    the updates) or in-process, added to the replay.
+
+    Jobs are drawn in the in-process order (task first, then the fault), so
+    the path that runs an episode does not change what is drawn. A pool that
+    fails is dropped and the episodes run in-process.
+    """
+
+    def __init__(self, env, agent, replay, spec, draw_task, strat, rng, pool):
+        self.env, self.agent, self.replay = env, agent, replay
+        self.multitask = spec.multitask
+        self.patterns = META_FAULT_PATTERNS if spec.multitask else None
+        self.draw_task, self.strat, self.rng = draw_task, strat, rng
+        self.job_rng = np.random.default_rng(SEED + 3)
+        self.pool = pool
+
+    def _draw(self, tid):
+        """One episode's (task id, task, fault schedule, seed)."""
+        task = self.draw_task(tid)
+        d = (maybe_schedule_disturbance(self.env, rng=self.rng, task_id=tid,
+                                        strat=self.strat,
+                                        patterns=self.patterns)
+             if self.multitask else None)
+        self.env.clear_disturbances()
+        return (tid, task, [] if d is None else list(d["schedule"]),
+                int(self.job_rng.integers(2 ** 31)))
+
+    def start(self, tids):
+        """Start one episode per task id; returns (jobs, futures or None)."""
+        jobs = [self._draw(t) for t in tids]
+        if self.pool is not None:
+            try:
+                return jobs, self.pool.collect_async(self.agent, jobs)
+            except Exception as exc:                      # pragma: no cover
+                print(f"\n[collect] worker pool failed ({exc!r}); "
+                      f"collecting in-process")
+                self.pool = None
+        return jobs, None
+
+    def finish(self, started):
+        """Add ``start``'s episodes to the replay; (reward, viol) each."""
+        jobs, futures = started
+        out = []
+        for k, (tid, task, sched, _) in enumerate(jobs):
+            res = None
+            if futures is not None:
+                try:
+                    res = ingest_episode_record(self.agent, self.replay,
+                                                futures[k].result())
+                except Exception as exc:                  # pragma: no cover
+                    print(f"\n[collect] worker episode failed ({exc!r}); "
+                          f"collecting in-process")
+                    self.pool = None
+            if res is None:
+                res = collect_rollout(self.env, self.agent, self.replay, tid,
+                                      task, schedule=sched)
+            out.append(res[:2])
+        return out
 
 
 def _train(arm):
@@ -254,53 +341,9 @@ def _train(arm):
         except Exception as exc:                          # pragma: no cover
             print(f"  held-out checks: worker pool unavailable ({exc!r}); "
                   f"running in-process")
-    patterns = META_FAULT_PATTERNS if spec.multitask else None
-    job_rng = np.random.default_rng(SEED + 3)
-    collect_pool = [workers if COLLECT_IN_WORKERS else None]
-
-    def draw_job(tid):
-        """One episode's task, fault schedule and seed, in the in-process
-        draw order (task first, then the fault)."""
-        task = draw_task(tid)
-        d = (maybe_schedule_disturbance(env, rng=rng, task_id=tid,
-                                        strat=strat, patterns=patterns)
-             if spec.multitask else None)
-        env.clear_disturbances()
-        return (tid, task, [] if d is None else list(d["schedule"]),
-                int(job_rng.integers(2 ** 31)))
-
-    def start_collection(tids):
-        """Start one episode per task id: futures in the pool, or None."""
-        jobs = [draw_job(t) for t in tids]
-        if collect_pool[0] is not None:
-            try:
-                return jobs, collect_pool[0].collect_async(agent, jobs)
-            except Exception as exc:                      # pragma: no cover
-                print(f"\n[collect] worker pool failed ({exc!r}); "
-                      f"collecting in-process")
-                collect_pool[0] = None
-        return jobs, None
-
-    def finish_collection(jobs, futures):
-        """Add the started episodes to the replay; (reward, viol) each."""
-        out = []
-        for k, (tid, task, sched, _) in enumerate(jobs):
-            res = None
-            if futures is not None:
-                try:
-                    res = ingest_episode_record(agent, replay,
-                                                futures[k].result())
-                except Exception as exc:                  # pragma: no cover
-                    print(f"\n[collect] worker episode failed ({exc!r}); "
-                          f"collecting in-process")
-                    collect_pool[0] = None
-            if res is None:
-                res = collect_rollout(env, agent, replay, tid, task,
-                                      schedule=sched)
-            out.append(res[:2])
-        return out
-
-    finish_collection(*start_collection(
+    collector = _Collector(env, agent, replay, spec, draw_task, strat, rng,
+                           workers if COLLECT_IN_WORKERS else None)
+    collector.finish(collector.start(
         [tid for tid in range(len(pool))
          for _ in range(WARMUP_EPISODES_PER_TASK)]))
 
@@ -336,10 +379,10 @@ def _train(arm):
         # This iteration's episodes run with the weights from before its
         # updates (in the workers, concurrently with them) and enter the
         # replay after them.
-        started = start_collection([int(np.random.randint(len(pool)))
-                                    for _ in range(n_collect)])
+        started = collector.start([int(np.random.randint(len(pool)))
+                                   for _ in range(n_collect)])
         if started[1] is None:
-            for r, v in finish_collection(*started):
+            for r, v in collector.finish(started):
                 reward_hist.append(r)
                 viol_hist.append(v)
 
@@ -352,7 +395,7 @@ def _train(arm):
                 want_stats=(u == UPDATES_PER_ITER - 1),
                 train_actor=it > actor_warmup)
         if started[1] is not None:
-            for r, v in finish_collection(*started):
+            for r, v in collector.finish(started):
                 reward_hist.append(r)
                 viol_hist.append(v)
 
@@ -376,7 +419,7 @@ def _train(arm):
                       f"continuing in-process")
                 workers.close()
                 workers = None
-                collect_pool[0] = None
+                collector.pool = None
                 ho = blended_heldout_score(env, agent, heldout,
                                            z_mode=HELDOUT_Z_MODE,
                                            disturbed=spec.multitask,
@@ -445,28 +488,8 @@ def _train(arm):
         if stats is not None:
             pstats = agent.proj_stats() if spec.apn else {
                 "proj_noop_frac": float("nan"), "proj_mean_steps": float("nan")}
-            for k, v_ in (("iter", it), ("avg_reward", avg_r),
-                          ("avg_violations", avg_v),
-                          ("critic_loss", stats["critic_loss"]),
-                          ("actor_loss", stats["actor_loss"]),
-                          ("kl", stats["kl"]), ("aux_loss", stats["aux_loss"]),
-                          ("fault_cls_loss", stats.get("fault_cls_loss", 0.0)),
-                          ("map_loss", stats.get("map_loss", 0.0)),
-                          ("anchor_loss", stats.get("anchor_loss", 0.0)),
-                          ("anchor_gap_nominal",
-                           stats.get("anchor_gap_nominal", float("nan"))),
-                          ("anchor_gap_fault",
-                           stats.get("anchor_gap_fault", float("nan"))),
-                          ("gate_loss", stats.get("gate_loss", float("nan"))
-                           if agent.adapt_gate else float("nan")),
-                          ("gate_nominal", stats.get("gate_nominal", float("nan"))),
-                          ("hold_loss", stats.get("hold_loss", float("nan"))),
-                          ("stall_frac", stats.get("stall_frac", float("nan"))),
-                          ("gate_fault", stats.get("gate_fault", float("nan"))),
-                          ("alpha", stats["alpha"]), ("z_norm", stats["z_norm"]),
-                          ("proj_noop_frac", pstats["proj_noop_frac"]),
-                          ("proj_mean_steps", pstats["proj_mean_steps"])):
-                log[k].append(v_)
+            _log_update(log, it, avg_r, avg_v, stats, pstats,
+                        agent.adapt_gate)
             if hasattr(pbar, "set_postfix"):
                 post = {"Rwd": f"{avg_r:.1f}", "Viol": f"{avg_v:.1f}",
                         "hoV": f"{gate_v:.1f}", "hoW": f"{gate_w:.0f}"}
@@ -550,13 +573,3 @@ def _train(arm):
               f"{best_iter}), mean opening over the second half: "
               + ", ".join(f"{k} {v:.2f}" for k, v in g.items()))
     return agent
-
-
-def train_meta():
-    """Meta-train the PEARL agent across the disturbed multi-regime pool."""
-    return _train("meta")
-
-
-def train_saferl():
-    """Train the safe-RL arm: duals, stage mask and action projection."""
-    return _train("saferl")

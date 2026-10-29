@@ -31,8 +31,8 @@ from metarl.env.config import (N_REACTORS, I_ETH, SPECIES_IDX,
                                TITER_SCALE, TASK_CONTEXT_DIM,
                                get_main_reactor_config, nominal_task)
 from metarl.env.layout import STATE_DIM, ACTION_DIM
-from metarl.env.faults import (VALID_DISTURBANCES, ADDITIVE_DISTURBANCES,
-                               DISTURBANCE_ALIASES, DISTURBANCE_KIND_INDEX,
+from metarl.env.faults import (ADDITIVE_DISTURBANCES, DISTURBANCE_ALIASES,
+                               DISTURBANCE_KIND_INDEX,
                                parse_active_disturbances)
 from metarl.env.plant import FermentationPlant
 from metarl.env.safe import FermentationEnv
@@ -81,16 +81,6 @@ class MetaPlantMixin:
     def set_task(self, task):
         """Force a specific task on every subsequent reset() (None: nominal)."""
         self.fixed_task = task
-
-    def set_active_disturbances(self, selection):
-        """Restrict which disturbance kinds random scheduling may draw."""
-        self.active_disturbances = (None if selection is None
-                                    else parse_active_disturbances(selection))
-
-    def get_active_disturbances(self):
-        """Return the active disturbance kinds (all kinds when unrestricted)."""
-        return (self.active_disturbances if self.active_disturbances is not None
-                else VALID_DISTURBANCES)
 
     def _install_task(self, task):
         """Make a task's feeds, pump gains and leaks the plant's nominal values."""

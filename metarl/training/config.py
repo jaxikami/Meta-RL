@@ -46,6 +46,9 @@ WARMUP_EPISODES_PER_TASK = 3
 # Evaluation tasks per scenario. The pool is drawn in order from one seed, so
 # a larger value extends it. Each plant episode costs ~3x a lean one.
 EVAL_EPISODES = int(os.environ.get("PLANT_EVAL_EPISODES", 100))
+# Worker processes for evaluation: one job per (arm, task), each running every
+# scenario of its task from one undisturbed prefix. 0 or 1 runs in-process.
+EVAL_WORKERS = int(os.environ.get("PLANT_EVAL_WORKERS", os.cpu_count() or 1))
 
 # ─── Held-out deterministic evaluation (checkpoint selection + early stop) ────
 HELDOUT_EVAL_EVERY = 10

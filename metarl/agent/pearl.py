@@ -346,6 +346,10 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         self._default_a_r = self._default_a.to(ROLLOUT_DEVICE)
         self._roll_stale = False
         self._base_stale = False
+        # Whether the base policy reads exactly the actor's history (a warm
+        # start freezes it), so acting folds each observation once.
+        self._base_shares_history = False
+        self._share_check = True
 
         self.clear_z()
 
@@ -360,10 +364,18 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
 
     def _mark_rollout_stale(self):
         self._roll_stale = self._actor_r is not self.actor
+        self._share_check = True
 
     def _mark_base_stale(self):
         self._base_stale = (self.base_actor is not None
                             and self._base_r is not self.base_actor)
+        self._share_check = True
+
+    @staticmethod
+    def _history_inputs(actor):
+        """The tensors ``history_step`` reads: the history and the input norm."""
+        return {k: v for k, v in actor.state_dict().items()
+                if k.split(".")[0] in ("history", "obs_norm", "in_norm")}
 
     def _sync_rollout(self):
         """Refresh the rollout copies if the training weights changed."""
@@ -377,6 +389,13 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         if self._base_stale:
             self._base_r.load_state_dict(self.base_actor.state_dict())
             self._base_stale = False
+        if self._share_check:
+            # Bitwise-equal weights on one device give bitwise-equal features.
+            self._base_shares_history = self._base_r is not None and all(
+                torch.equal(a, b) for a, b in zip(
+                    self._history_inputs(self._actor_r).values(),
+                    self._history_inputs(self._base_r).values()))
+            self._share_check = False
 
     def rollout_weights(self):
         """Everything a rollout needs, as picklable arrays (worker processes)."""
@@ -388,6 +407,8 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
             "base_actor": (to_np(self.base_actor) if self.adapt_gate
                            else None),
             "gate": to_np(self.gate) if self.adapt_gate else None,
+            # ``load`` may adopt a checkpoint's sharpness.
+            "gate_sharpness": self.gate_sharpness,
             "ret_rms": (None if self.ret_rms is None else
                         (self.ret_rms.mean, self.ret_rms.var, self.ret_rms.count)),
         }
@@ -409,6 +430,8 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
                                  "but this agent has one")
             self.base_actor.load_state_dict(as_t(weights["base_actor"]))
             self.gate.load_state_dict(as_t(weights["gate"]))
+            self.gate_sharpness = float(weights.get("gate_sharpness",
+                                                    self.gate_sharpness))
             self._mark_base_stale()
         if self.ret_rms is not None and weights["ret_rms"] is not None:
             self.ret_rms.mean, self.ret_rms.var, self.ret_rms.count = (

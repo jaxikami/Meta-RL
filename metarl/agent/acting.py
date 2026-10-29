@@ -217,6 +217,19 @@ class ActingMixin:
             self._proj_moved += 1
         return out
 
+    def proj_counts(self):
+        """The projection's raw counters: (calls, no-ops, steps, moved)."""
+        return (self._proj_calls, self._proj_noop, self._proj_steps,
+                self._proj_moved)
+
+    def add_proj_counts(self, counts):
+        """Add raw counters from elsewhere (a worker's episode)."""
+        calls, noop, steps, moved = counts
+        self._proj_calls += calls
+        self._proj_noop += noop
+        self._proj_steps += steps
+        self._proj_moved += moved
+
     def proj_stats(self, reset=True):
         """Report and optionally reset the projection's activity counters."""
         calls = max(self._proj_calls, 1)
@@ -255,7 +268,11 @@ class ActingMixin:
                 g = self._gate_open(self._gate_r, z)
                 if self.gate_floor is not None:
                     g = torch.clamp(g, min=float(self.gate_floor))
-                base_feat, self._bh = self._base_r.history_step(obs, self._bh)
+                if self._base_shares_history:
+                    base_feat, self._bh = feat, self._ph
+                else:
+                    base_feat, self._bh = self._base_r.history_step(obs,
+                                                                    self._bh)
                 raw = self._gated(self._base_action(self._base_r, base_feat, z),
                                   raw, g)
                 self.last_gate = float(g)

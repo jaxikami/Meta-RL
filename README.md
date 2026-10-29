@@ -39,11 +39,8 @@ it are in git history (commit `bc502ee` and before), as are the figures
 and logs trained on it.
 
 The previous multi-reactor implementation (product-of-Gaussians PEARL,
-inventory-only constraints) is in git history (commit `88452a4` and before).
-Its leftover modules (`env_safe.py`, `agent_safe.py`, `main.py`,
-`train_pearl_single_run.py`, `train_pearl_seed_sweep.py`,
-`smoke_test_pearl.py`) are kept in `legacy/` for reference; they are
-superseded and do not import against the `metarl` package.
+inventory-only constraints) is in git history (commit `88452a4` and before),
+with its leftover modules.
 
 ---
 
@@ -404,6 +401,11 @@ with these plant-specific settings:
   per-reactor branches rotate.
 - `EVAL_EPISODES = 100` (lean 200; a plant episode costs ~3×;
   `PLANT_EVAL_EPISODES` overrides it for a quick run).
+- Evaluation runs one job per (arm, task) in `EVAL_WORKERS` processes
+  (default: every logical CPU). A job simulates the task's undisturbed
+  episode once and continues every fault scenario from a snapshot taken just
+  before its first onset, so each row is exactly the from-scratch episode
+  (the smoke test checks it) at about half the simulation.
 - Evaluation scenarios: in-distribution, OOD, then every
   `EVAL_DISTURBANCES` kind (Fermentation-PPO's) under every pattern, named
   `<kind>_<pattern>` (`leak`, `feed_gain`, `dilution`, `kinetics_decay`,
@@ -521,12 +523,11 @@ into mixins, one module per concern.
 | `metarl/training/config.py` | every setting of the study (`NET_*`, `SELECT_*`, fault ranges, scenarios, output paths) |
 | `metarl/training/cli.py` | the modes behind `python -m metarl` |
 | `metarl/training/arms.py` / `train.py` / `heldout.py` / `early_stopping.py` | arms and their agents, training, held-out checks and checkpoint selection, early stopping |
-| `metarl/training/tasks.py` / `rollouts.py` | task pools and fault schedules; training and deterministic episodes |
+| `metarl/training/tasks.py` / `rollouts.py` / `workers.py` | task pools and fault schedules; training and deterministic (branched) episodes; the worker processes that run them |
 | `metarl/training/evaluate.py` / `z_informativeness.py` | evaluation and the latent gate |
 | `metarl/training/metrics.py` / `plots.py` / `logs.py` | statistics, figures, JSON logs |
 | `metarl/ablation.py` | ablation study of the meta arm's components (`python -m metarl.ablation`) |
 | `tests/smoke_test.py` | fast CPU check of every code path and the design properties |
-| `legacy/` | the previous implementation's modules, superseded |
 
 ## How to run
 
@@ -575,6 +576,7 @@ $env:PLANT_SEED=1; $env:PLANT_RUN_TAG="seed1"; python -m metarl all
 | `PLANT_HELDOUT_WORKERS` | held-out worker processes; `0` or `1` runs in-process |
 | `PLANT_COLLECT_WORKERS` | `0` collects training episodes in-process instead of in the worker pool |
 | `PLANT_EVAL_EPISODES` | evaluation tasks per scenario (default 100) |
+| `PLANT_EVAL_WORKERS` | evaluation worker processes (default: every logical CPU); `0` or `1` runs in-process |
 | `PLANT_EARLY_STOP_PATIENCE` | early-stop patience in held-out checks (default 50) |
 | `PLANT_DEVICE` | force the training device, e.g. `cpu` |
 | `PLANT_VERBOSE_PBAR` | `1` adds losses and latent diagnostics to the progress bar |
@@ -587,5 +589,5 @@ Outputs: `policy/[tag]/<arm>.pth` and `<arm>_best.pth`; `results/log/[tag]/`
 
 `numpy`, `numba`, `torch`, `matplotlib`, `tqdm` (optional). Gradient updates
 use a CUDA/ROCm GPU when available (the critics are ~9.5M parameters);
-rollouts always run on the CPU, held-out checks and training episodes in
-worker processes.
+rollouts always run on the CPU, held-out checks, training episodes and
+evaluation in worker processes.

@@ -1,16 +1,13 @@
-"""Held-out checks: scoring, no-regression and the parallel worker pool.
+"""Held-out checks: scoring, no-regression and anchor adaptation.
 
 The blended held-out score that checkpoint selection and early stopping read,
-the no-regression comparison against a warm-start source, the per-fault-kind
-anchor adaptation, and the worker processes that run the checks.
+the no-regression comparison against a warm-start source and the
+per-fault-kind anchor adaptation. The checks run in ``workers.RolloutPool``
+when one is passed.
 """
-
-# ─── Standard Library ─────────────────────────────────────────────────────────
-import os
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
 import numpy as np
-import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from metarl.env.config import PROD_REWARD_PER_ETH, VIOLATION_SPIKE
@@ -25,10 +22,7 @@ from metarl.training.config import (SELECT_MAX_WORST_VIOL, SELECT_VIOL_WEIGHT,
                                     NO_REGRESS_TAIL_REL,
                                     NO_REGRESS_ETH_REL_CLEAN,
                                     NO_REGRESS_CLEAN_VIOL)
-from metarl.training.arms import ARMS, get_arm, _build_agent
-from metarl.training.tasks import make_arm_env
-from metarl.training.rollouts import (branched_rollouts,
-                                      collect_episode_record)
+from metarl.training.rollouts import branched_rollouts
 from metarl.training.metrics import (latent_separability, gate_opening,
                                      _finite_mean)
 
@@ -213,88 +207,3 @@ def _regressions(ho, ref):
         if _gap_without_worst_task(e_ref - e) > tol_e * e_ref.mean():
             out.append(f"{name}:eth")
     return out
-
-
-
-_WORKER_AGENTS = {}
-
-
-def _rollout_worker_init():
-    """Worker setup: one torch thread each, since the workers run in parallel."""
-    torch.set_num_threads(1)
-
-
-def _worker_agent(arm, weights):
-    """This worker's environment and agent for ``arm``, with ``weights`` installed."""
-    if arm not in _WORKER_AGENTS:
-        env = make_arm_env(ARMS[arm])
-        _WORKER_AGENTS[arm] = (env, _build_agent(env, arm))
-    env, agent = _WORKER_AGENTS[arm]
-    agent.load_rollout_weights(weights)
-    return env, agent
-
-
-def _collect_job(job):
-    """Run one stochastic training episode inside a worker process."""
-    arm, weights, task_id, task, schedule, seed = job
-    env, agent = _worker_agent(arm, weights)
-    return collect_episode_record(env, agent, task_id, task, schedule, seed)
-
-
-def _rollout_job(job):
-    """Run ``branched_rollouts`` for one task inside a worker process."""
-    arm, weights, task, faults, onset, z_mode, index = job
-    env, agent = _worker_agent(arm, weights)
-    return branched_rollouts(env, agent, task, faults, onset, z_mode,
-                             index=index)
-
-
-class RolloutPool:
-    """Worker processes running one arm's rollouts: held-out checks (one task
-    per job) and stochastic training episodes (one episode per job).
-
-    CPU-only (``PLANT_DEVICE=cpu`` is set for the pool's lifetime). Each
-    worker builds its own environment and agent once and receives the current
-    rollout weights with every job, then runs the same code as the in-process
-    path (the duals reset every episode, so no env carries state across
-    episodes).
-    """
-
-    def __init__(self, arm, workers):
-        import multiprocessing as mp
-        from concurrent.futures import ProcessPoolExecutor
-        self.arm = get_arm(arm).name
-        self._prev_device = os.environ.get("PLANT_DEVICE")
-        os.environ["PLANT_DEVICE"] = "cpu"
-        self._ex = ProcessPoolExecutor(
-            max_workers=int(workers), mp_context=mp.get_context("spawn"),
-            initializer=_rollout_worker_init)
-
-    def run(self, agent, tasks, faults, onset, z_mode):
-        """Run ``branched_rollouts`` for every task with ``agent``'s weights."""
-        weights = agent.rollout_weights()
-        jobs = [(self.arm, weights, t, tuple(faults),
-                 onset, z_mode, i) for i, t in enumerate(tasks)]
-        return list(self._ex.map(_rollout_job, jobs))
-
-    def collect_async(self, agent, jobs):
-        """Start training episodes with ``agent``'s current weights.
-
-        Args:
-            agent: The training agent (its weights are copied now).
-            jobs: (task_id, task, schedule, seed) tuples.
-
-        Returns:
-            Futures of ``collect_episode_record`` results, in job order.
-        """
-        weights = agent.rollout_weights()
-        return [self._ex.submit(_collect_job, (self.arm, weights) + tuple(j))
-                for j in jobs]
-
-    def close(self):
-        """Shut the workers down and restore PLANT_DEVICE."""
-        self._ex.shutdown(wait=True)
-        if self._prev_device is None:
-            os.environ.pop("PLANT_DEVICE", None)
-        else:
-            os.environ["PLANT_DEVICE"] = self._prev_device

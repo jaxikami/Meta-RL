@@ -135,11 +135,17 @@ class ActionProjectionNetwork(nn.Module):
 
 
 def _inert(net, like):
-    """Boolean mask over the action dims the projection must not move."""
-    m = torch.zeros(like.shape[-1], dtype=torch.bool, device=like.device)
-    for d in getattr(net, "inert_dims", (0,)):
-        m[d] = True
-    return m
+    """Boolean mask over the action dims the projection must not move.
+
+    Built once per network, width and device: it runs every control step.
+    """
+    key = (like.shape[-1], like.device)
+    cache = net.__dict__.setdefault("_inert_cache", {})
+    if key not in cache:
+        m = torch.zeros(like.shape[-1], dtype=torch.bool)
+        m[list(getattr(net, "inert_dims", (0,)))] = True
+        cache[key] = m.to(like.device)
+    return cache[key]
 
 
 def project_to_safe(net, state_norm, action, stage_mask=None,

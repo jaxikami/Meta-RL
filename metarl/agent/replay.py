@@ -96,9 +96,6 @@ class _TaskRing:
         fields = self._fields()[:4] if context_only else self._fields()
         return tuple(f[p] for f in fields)
 
-    def gather(self, logical):
-        return _to_device(self.gather_np(logical))
-
     def episode_steps(self, logical):
         return self.ep_step[self._physical(logical)]
 
@@ -131,14 +128,6 @@ class MultiTaskReplayBuffer:
     def size(self, task_id):
         buf = self._tasks.get(task_id)
         return 0 if buf is None else buf.n
-
-    def sample_batch_np(self, task_id, batch_size):
-        buf = self._tasks[task_id]
-        idx = np.random.randint(0, buf.n, size=batch_size)
-        return buf.gather_np(idx)
-
-    def sample_batch(self, task_id, batch_size):
-        return _to_device(self.sample_batch_np(task_id, batch_size))
 
     def sample_windows_np(self, task_id, batch_size, window,
                           chunk_len=WINDOW_CHUNK_LEN, starts=None):

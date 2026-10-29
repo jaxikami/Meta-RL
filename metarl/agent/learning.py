@@ -25,46 +25,75 @@ from metarl.agent.replay import WINDOW_CHUNK_LEN, _to_device, _as_long
 HOLD_PRE_TANH_TARGET = float(np.arctanh(DISCHARGE_CUTOFF - 1.0))
 
 
+def window_resets(lo, hi, rows):
+    """Rows at which a windowed batch's GRUs restart, from host-side indices.
+
+    Built in NumPy before the upload: on the device, the boolean indexing
+    and the window check each synchronise.
+
+    Args:
+        lo, hi: Int arrays [K, L] from ``sample_windows_np``.
+        rows: R, the rows per window.
+
+    Returns:
+        Bool array [K, R]: True at every row some transition's context
+        starts at.
+
+    Raises:
+        ValueError: If a context fills the whole window.
+    """
+    lo, hi = np.asarray(lo), np.asarray(hi)
+    W = rows - lo.shape[1] + 1
+    if np.any(hi - lo >= W):
+        raise ValueError(
+            f"a context filled the whole {W}-transition window, so it may "
+            f"not reach its episode start; the recurrent encoder needs a "
+            f"context_size longer than any episode")
+    reset = np.zeros((lo.shape[0], rows), dtype=bool)
+    k, p = np.nonzero(lo < rows)
+    reset[k, lo[k, p]] = True
+    return reset
+
+
 class LearningMixin:
     """The meta-gradient update of ``PEARLAgent``."""
 
-    def _window_posterior(self, rows, lo, hi):
+    @staticmethod
+    def _resets_of(rows, lo, hi):
+        """``window_resets`` for device-side ``lo`` / ``hi`` (tests only)."""
+        reset = window_resets(lo.cpu().numpy(), hi.cpu().numpy(),
+                              rows[2].shape[1])
+        return torch.as_tensor(reset, device=lo.device)
+
+    def _window_posterior(self, rows, lo, hi, reset=None):
         """Posterior over z for every transition of a windowed batch.
 
         Runs the GRU along each chunk's rows, zeroing the state at every row
-        some transition's context starts at, and reads transition ``p``'s
-        posterior from the state after row ``hi - 1`` -- the state the online
-        GRU held when the action was taken, provided each context reaches its
-        episode start.
+        some transition's context starts at (``reset``, from
+        ``window_resets``), and reads transition ``p``'s posterior from the
+        state after row ``hi - 1`` -- the state the online GRU held when the
+        action was taken, provided each context reaches its episode start.
 
         Raises:
-            ValueError: If a context fills the whole window.
+            ValueError: If ``reset`` is not given and a context fills the
+                whole window.
         """
+        if reset is None:
+            reset = self._resets_of(rows, lo, hi)
         o, a, r, o2 = rows
         K, R = r.shape
         L = lo.shape[1]
-        W = R - L + 1
-        if bool(((hi - lo) >= W).any()):
-            raise ValueError(
-                f"a context filled the whole {W}-transition window, so it may "
-                f"not reach its episode start; the recurrent encoder needs a "
-                f"context_size longer than any episode")
         r = r.reshape(K, R, 1).float()
         if self.ret_rms is not None:
             r = r / self.ret_rms.std
         trans = torch.cat([o.float(), a.float(), r, o2.float()], dim=-1)
         enc = self.encoder
         x = enc.embed_inputs(trans.reshape(K * R, -1)).reshape(K, R, -1)
-        reset = torch.zeros(K, R, dtype=torch.bool, device=x.device)
-        rows_k = torch.arange(K, device=x.device)
-        for p in range(L):
-            inside = lo[:, p] < R
-            reset[rows_k[inside], lo[inside, p]] = True
+        keep = (~reset).to(x.dtype).t().unsqueeze(-1)        # [R, K, 1]
         h = torch.zeros(K, enc.hidden, device=x.device)
         states = []
         for q in range(R):
-            h = torch.where(reset[:, q:q + 1], torch.zeros_like(h), h)
-            h = enc.cell(x[:, q], h)
+            h = enc.cell(x[:, q], h * keep[q])
             states.append(h)
         states = torch.stack(states, dim=1)
         last = (hi - 1).clamp(min=0)
@@ -76,7 +105,7 @@ class LearningMixin:
         sigma_sq = torch.where(empty, torch.ones_like(sigma_sq), sigma_sq)
         return mu, sigma_sq
 
-    def _history_features(self, rows, lo, hi, o, o2):
+    def _history_features(self, rows, lo, hi, o, o2, reset=None):
         """The actor's history features at each transition and its successor.
 
         Rows of the sampled windows give each transition's GRU state after
@@ -87,13 +116,9 @@ class LearningMixin:
         Returns:
             Tuple (features at o, features at o2), each [B, N, feature_dim].
         """
+        if reset is None:
+            reset = self._resets_of(rows, lo, hi)
         obs_rows = rows[0].float()
-        K, R = obs_rows.shape[:2]
-        reset = torch.zeros(K, R, dtype=torch.bool, device=obs_rows.device)
-        rows_k = torch.arange(K, device=obs_rows.device)
-        for p in range(lo.shape[1]):
-            inside = lo[:, p] < R
-            reset[rows_k[inside], lo[inside, p]] = True
         with torch.set_grad_enabled(not self.history_frozen):
             return self.actor.history_window(obs_rows, reset, hi, hi <= lo,
                                              o, o2)
@@ -253,14 +278,17 @@ class LearningMixin:
                            for i in range(len(parts[0][0])))
         rows = _to_device(np.concatenate([p[1][i] for p in parts])
                           for i in range(4))
-        lo = _as_long(np.concatenate([p[2] for p in parts]))
-        hi = _as_long(np.concatenate([p[3] for p in parts]))
+        lo_np = np.concatenate([p[2] for p in parts])
+        hi_np = np.concatenate([p[3] for p in parts])
+        reset = torch.as_tensor(window_resets(lo_np, hi_np, rows[2].shape[1]),
+                                device=device)
+        lo, hi = _as_long(lo_np), _as_long(hi_np)
         if self.use_context:
             # The encoder steps on one update in ``encoder_update_every``;
             # between, its posterior is read without a graph (the heads still
             # train on it).
             with torch.set_grad_enabled(step_encoder):
-                mu, sigma_sq = self._window_posterior(rows, lo, hi)
+                mu, sigma_sq = self._window_posterior(rows, lo, hi, reset)
             std = torch.sqrt(torch.clamp(sigma_sq, min=1e-8))
             z = mu + std * torch.randn_like(std)
             kl = 0.5 * torch.sum(
@@ -275,7 +303,7 @@ class LearningMixin:
             raise ValueError("the gate's base policy reads the actor's history "
                              "features: freeze the history module (a warm "
                              "start does)")
-        feat, feat2 = self._history_features(rows, lo, hi, o, o2)
+        feat, feat2 = self._history_features(rows, lo, hi, o, o2, reset)
         feat2 = feat2.detach()
         feat_d = feat.detach()
         priv, priv2 = priv.float(), priv2.float()

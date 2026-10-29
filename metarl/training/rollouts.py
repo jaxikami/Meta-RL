@@ -11,8 +11,7 @@ import torch
 from metarl.env.config import standardize_context, N_REACTORS
 from metarl.env.layout import ACTION_DIM, ACTION_DIM_PER_REACTOR
 from metarl.training.config import CONSTRAINT_NAMES, DEPTH_CONSTRAINTS
-from metarl.training.tasks import (resolve_reactor, as_fault_schedule,
-                                   apply_fault_schedule,
+from metarl.training.tasks import (as_fault_schedule, apply_fault_schedule,
                                    maybe_schedule_disturbance)
 
 
@@ -107,8 +106,7 @@ def collect_episode_record(env, agent, task_id, task, schedule, seed):
                                   schedule=list(schedule))
     obs = np.stack([a[1] for a, _ in rec.items])
     next_obs = np.stack([a[4] for a, _ in rec.items])
-    proj = (agent._proj_calls, agent._proj_noop, agent._proj_steps,
-            agent._proj_moved)
+    proj = agent.proj_counts()
     agent.proj_stats(reset=True)
     return {"reward": r, "violations": v, "steps": steps,
             "transitions": rec.items, "obs": obs, "next_obs": next_obs,
@@ -126,11 +124,7 @@ def ingest_episode_record(agent, replay, rec):
         replay.add(*args, **kwargs)
     agent.observe_rewards(rec["rewards"])
     agent.observe_obs(rec["obs"], next_observations=rec["next_obs"])
-    calls, noop, steps, moved = rec["proj"]
-    agent._proj_calls += calls
-    agent._proj_noop += noop
-    agent._proj_steps += steps
-    agent._proj_moved += moved
+    agent.add_proj_counts(rec["proj"])
     return rec["reward"], rec["violations"], rec["steps"]
 
 
@@ -145,6 +139,9 @@ def _start_episode(env, agent, task, disturbance, index=0):
     state = env.reset()
     agent.clear_z()
     return {"state": state, "done": False, "info": {}, "total_r": 0.0,
+            # The shield's counters at the start, so the episode's own are
+            # the difference at its end.
+            "proj0": np.asarray(agent.proj_counts()),
             "total_v": 0, "acts": [], "r_traj": [], "v_traj": [],
             "act_traj": [], "probe_traj": [], "storage_traj": [],
             "gate_traj": [], "stage_traj": [],
@@ -243,6 +240,9 @@ def _episode_metrics(env, agent, ep):
                        else np.zeros((0, N_REACTORS), dtype=int)),
         "z_mu": agent.z_mu.detach().cpu().numpy().copy(),
         "z_sigma_sq": agent.z_sigma_sq.detach().cpu().numpy().copy(),
+        # The shield's (calls, no-ops, steps, moved) in this episode.
+        "proj": tuple(int(c) for c in
+                      np.asarray(agent.proj_counts()) - ep["proj0"]),
     }
 
 
@@ -259,12 +259,64 @@ def rollout_deterministic(env, agent, task, z_mode="mean", disturbance=None,
         agent.z_mode = prev_mode
 
 
+def scenario_rollouts(env, agent, task, schedules, z_mode="mean", index=0):
+    """Deterministic rollouts of one task under several fault schedules.
+
+    Every schedule is undisturbed up to its first onset, so the undisturbed
+    episode is simulated once, snapshotted just before each distinct first
+    onset, and each faulted run continues from its snapshot: every row is
+    exactly the episode a from-scratch ``rollout_deterministic`` produces,
+    shield counters included.
+
+    Args:
+        schedules: Sequence of fault schedules (any ``as_fault_schedule``
+            form; None or [] is undisturbed). "rotate" reactors resolve with
+            ``index``.
+        index: The task's index in its pool.
+
+    Returns:
+        List of episode-metric dicts, one per schedule, in order.
+    """
+    scheds = [as_fault_schedule(s, index) for s in schedules]
+    firsts = [min(d["onset"] for d in s) if s else None for s in scheds]
+    prev_mode = agent.z_mode
+    try:
+        agent.z_mode = z_mode
+        ep = _start_episode(env, agent, task, None)
+        snaps = {}
+        for t in sorted({f for f in firsts if f is not None}):
+            _advance(env, agent, ep, stop_at=t)
+            snaps[t] = (copy.deepcopy(env), agent.posterior_state(),
+                        copy.deepcopy(ep), np.asarray(agent.proj_counts()))
+        _advance(env, agent, ep)
+        trunk = _episode_metrics(env, agent, ep)
+        rows = []
+        for sched, first in zip(scheds, firsts):
+            if first is None:
+                rows.append(trunk)
+                continue
+            snap_env, snap_z, snap_ep, snap_proj = snaps[first]
+            b_env, b_ep = copy.deepcopy(snap_env), copy.deepcopy(snap_ep)
+            agent.set_posterior_state(snap_z)
+            # The prefix's shield counts belong to this episode too.
+            b_ep["proj0"] = (b_ep["proj0"] + np.asarray(agent.proj_counts())
+                             - snap_proj)
+            for d in sched:
+                b_env.schedule_disturbance(d["kind"], d["onset"],
+                                           d["magnitude"],
+                                           reactor=d["reactor"],
+                                           end_step=d["end"])
+            _advance(b_env, agent, b_ep)
+            rows.append(_episode_metrics(b_env, agent, b_ep))
+        return rows
+    finally:
+        agent.z_mode = prev_mode
+
+
 def branched_rollouts(env, agent, task, faults, onset, z_mode="mean", index=0):
     """Deterministic rollouts of one task: undisturbed, then under each fault.
 
-    Every fault starts at ``onset``, so the undisturbed prefix is simulated
-    once and each faulted run continues from a snapshot, so each branch is
-    exactly the episode a from-scratch rollout would produce.
+    Every fault steps at ``onset`` (``scenario_rollouts``).
 
     Args:
         faults: Sequence of (kind, magnitude[, reactor]); "rotate" reactors
@@ -274,26 +326,6 @@ def branched_rollouts(env, agent, task, faults, onset, z_mode="mean", index=0):
     Returns:
         List of episode-metric dicts: undisturbed first, then one per fault.
     """
-    prev_mode = agent.z_mode
-    try:
-        agent.z_mode = z_mode
-        ep = _start_episode(env, agent, task, None)
-        if not faults:
-            _advance(env, agent, ep)
-            return [_episode_metrics(env, agent, ep)]
-        _advance(env, agent, ep, stop_at=onset)
-        snap_env, snap_z, snap_ep = (copy.deepcopy(env), agent.posterior_state(),
-                                     copy.deepcopy(ep))
-        _advance(env, agent, ep)
-        rows = [_episode_metrics(env, agent, ep)]
-        for f in faults:
-            kind, mag = f[0], f[1]
-            reactor = resolve_reactor(kind, f[2] if len(f) > 2 else None, index)
-            b_env, b_ep = copy.deepcopy(snap_env), copy.deepcopy(snap_ep)
-            agent.set_posterior_state(snap_z)
-            b_env.schedule_disturbance(kind, onset, mag, reactor=reactor)
-            _advance(b_env, agent, b_ep)
-            rows.append(_episode_metrics(b_env, agent, b_ep))
-        return rows
-    finally:
-        agent.z_mode = prev_mode
+    schedules = [None] + [[(f[0], onset, f[1], f[2] if len(f) > 2 else None)]
+                          for f in faults]
+    return scenario_rollouts(env, agent, task, schedules, z_mode, index=index)

@@ -3,6 +3,7 @@
 # ─── Standard Library ─────────────────────────────────────────────────────────
 import json
 import os
+import time
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
 import numpy as np
@@ -11,6 +12,7 @@ import numpy as np
 from metarl.env.config import N_REACTORS
 from metarl.env.layout import ACTION_DIM_PER_REACTOR
 from metarl.training.config import (SEED, EVAL_EPISODES, EVAL_Z_MODE,
+                                    EVAL_WORKERS,
                                     EVAL_DISTURBANCES, FAULT_PATTERNS,
                                     EVAL_SPIKE_H, EVAL_GRADUAL_H,
                                     EVAL_RECURRENT_WINDOWS, META_DRIFT_TREADS,
@@ -22,7 +24,9 @@ from metarl.training.arms import (ARMS, ARM_ORDER, CONTRASTS, arm_paths,
                                   _load_preferring_best)
 from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool,
                                    as_fault_schedule, pattern_schedule)
-from metarl.training.rollouts import rollout_deterministic
+from metarl.training.rollouts import (rollout_deterministic,
+                                      scenario_rollouts)
+from metarl.training.workers import RolloutPool
 from metarl.training.metrics import (latent_separability, gate_opening,
                                      gate_opening_in_stage, _finite_mean,
                                      _paired_delta, _verdict_sign, _fmt_delta,
@@ -71,13 +75,29 @@ def _eval_agent_on_tasks(env, agent, tasks, disturbance=None, z_mode=None,
         Dict of aggregated metrics plus per-episode arrays for paired tests.
     """
     mode = z_mode if z_mode is not None else EVAL_Z_MODE
-    agent.proj_stats(reset=True)
     rows = [rollout_deterministic(env, agent, t, z_mode=mode,
                                   disturbance=disturbance, index=i)
             for i, t in enumerate(tasks)]
-    shield = agent.proj_stats(reset=True)
+    return _aggregate_rows(rows, disturbance, env.control_action_interval,
+                           mode if agent.use_context else "n/a (z=0)",
+                           trace_probe)
+
+
+def _aggregate_rows(rows, disturbance, interval, z_label, trace_probe=None):
+    """Both metric axes of one arm on one scenario, from its episode rows.
+
+    Args:
+        rows: One ``_episode_metrics`` dict per task, in task order.
+        disturbance: The scenario's fault schedule (None: undisturbed).
+        interval: The environment's control interval, in inner steps.
+        z_label: What the report records as the z mode.
+        trace_probe: ``DISTURB_PROBES`` key to trace, or None.
+    """
+    calls, _, _, moved = np.sum([r["proj"] for r in rows], axis=0)
+    shield = {"proj_calls": int(calls),
+              "proj_moved_frac": moved / max(calls, 1)}
     targets = []
-    for i in range(len(tasks)):
+    for i in range(len(rows)):
         sched = as_fault_schedule(disturbance, i)
         targets.append(sched[0]["reactor"] if sched else None)
 
@@ -102,7 +122,7 @@ def _eval_agent_on_tasks(env, agent, tasks, disturbance=None, z_mode=None,
             for cid in CONSTRAINT_NAMES}
 
     out = {
-        "z_mode": mode if agent.use_context else "n/a (z=0)",
+        "z_mode": z_label,
         "reward": float(np.mean(col("reward"))),
         "reward_std": float(np.std(col("reward"))),
         "violations": float(np.mean(col("violations"))),
@@ -197,7 +217,7 @@ def _eval_agent_on_tasks(env, agent, tasks, disturbance=None, z_mode=None,
             "storage": [np.round(r["storage_traj"], 1).tolist() for r in rows],
         }
     sched0 = as_fault_schedule(disturbance, 0)
-    split = (int(min(d["onset"] for d in sched0) // env.control_action_interval)
+    split = (int(min(d["onset"] for d in sched0) // interval)
              if sched0 else L // 2)
     for k, lo, hi in (("gate_pre", 0, split + 1), ("gate_post", split + 1, None)):
         v = _finite_mean([gate_opening(r["gate_traj"], lo, hi) for r in rows])
@@ -244,7 +264,9 @@ def evaluate():
     Every arm sees the same tasks in the same order (and, for rotating
     faults, the same faulted reactor per task), so results are paired. Each
     arm gets its own environment so one arm's rollouts cannot move another's
-    duals.
+    duals. One job per (arm, task) runs every scenario of that task from one
+    undisturbed prefix (``scenario_rollouts``), in ``EVAL_WORKERS`` processes
+    (in-process when that is 0 or 1, or the pool fails).
 
     Returns:
         The full results dict, also written to ``eval.json``.
@@ -270,13 +292,21 @@ def evaluate():
     for name, dist in eval_fault_scenarios(onset, env.max_steps).items():
         scenarios[name] = {"tasks": id_tasks, "dist": dist}
 
+    # Scenarios grouped by task pool: each group is one job per task.
+    groups = [(id_tasks, [n for n, sc in scenarios.items()
+                          if sc["tasks"] is id_tasks]),
+              (ood_tasks, ["out_of_distribution"])]
+    n_eps = sum(len(t) * len(names) for t, names in groups) * len(arms)
+    rows = _scenario_rows(envs, agents, arms, groups, scenarios, n_eps)
+
     results = {}
     for name, sc in scenarios.items():
-        print(f"[eval] {name} ...")
-        probe = scenario_probe(name)
         results[name] = {
-            arm: _eval_agent_on_tasks(envs[arm], agents[arm], sc["tasks"],
-                                      sc["dist"], trace_probe=probe)
+            arm: _aggregate_rows(
+                rows[arm][name], sc["dist"],
+                envs[arm].control_action_interval,
+                EVAL_Z_MODE if agents[arm].use_context else "n/a (z=0)",
+                trace_probe=scenario_probe(name))
             for arm in arms
         }
 
@@ -291,6 +321,57 @@ def evaluate():
     _plot_comparison(results)
     plot_training_curves()
     return results
+
+
+def _scenario_rows(envs, agents, arms, groups, scenarios, n_eps):
+    """Every arm's episode rows on every scenario: {arm: {scenario: rows}}.
+
+    Args:
+        groups: (tasks, scenario names) pairs; every scenario of a group runs
+            on its tasks.
+        n_eps: Total episodes, for the progress line.
+    """
+    plan = []                                   # (arm, tasks, names, traced)
+    for arm in arms:
+        for tasks, names in groups:
+            plan.append((arm, tasks, names,
+                         [scenario_probe(n) is not None for n in names]))
+
+    def schedules(names):
+        return [scenarios[n]["dist"] for n in names]
+
+    t0 = time.time()
+    per_task = None
+    if EVAL_WORKERS > 1:
+        pool = None
+        try:
+            pool = RolloutPool(None, EVAL_WORKERS)
+            print(f"[eval] {n_eps} episodes in {EVAL_WORKERS} worker "
+                  f"processes ...")
+            futures = [pool.scenarios_async(agents[arm], tasks,
+                                            schedules(names), EVAL_Z_MODE,
+                                            traced, arm=arm)
+                       for arm, tasks, names, traced in plan]
+            per_task = [[f.result() for f in fs] for fs in futures]
+        except Exception as exc:                          # pragma: no cover
+            print(f"[eval] worker pool failed ({exc!r}); running in-process")
+            per_task = None
+        finally:
+            if pool is not None:
+                pool.close()
+    if per_task is None:
+        print(f"[eval] {n_eps} episodes in-process ...")
+        per_task = [[scenario_rollouts(envs[arm], agents[arm], t,
+                                       schedules(names), EVAL_Z_MODE, index=i)
+                     for i, t in enumerate(tasks)]
+                    for arm, tasks, names, _ in plan]
+    print(f"[eval] rollouts done in {time.time() - t0:.0f}s")
+
+    out = {arm: {} for arm in arms}
+    for (arm, _, names, _), task_rows in zip(plan, per_task):
+        for k, name in enumerate(names):
+            out[arm][name] = [r[k] for r in task_rows]
+    return out
 
 
 def _eval_verdict(res, arm_a, arm_b):

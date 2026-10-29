@@ -1,0 +1,10 @@
+# Fermentation-PPO's environment, ported verbatim: tests/smoke_test.py checks
+# these files still equal ../Fermentation-PPO/envs, so they are never fixed
+# or reformatted here.
+force-exclude = true
+extend-exclude = [
+    "metarl/env/kinetics.py",
+    "metarl/env/disturbances.py",
+    "metarl/env/plant.py",
+    "metarl/env/safe.py",
+]

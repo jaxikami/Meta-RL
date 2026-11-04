@@ -97,8 +97,9 @@ def resolve_reactor(kind, reactor, index=0):
 
     Args:
         kind: Disturbance kind (aliases accepted).
-        reactor: None (every reactor), an int, or "rotate" (episode
-            ``index`` faults reactor ``index % N_REACTORS``).
+        reactor: None (every reactor), an int, "rotate" (episode ``index``
+            faults reactor ``index % N_REACTORS``) or "rotate+k" (reactor
+            ``(index + k) % N_REACTORS``).
         index: Episode index within its scenario.
 
     Returns:
@@ -107,8 +108,9 @@ def resolve_reactor(kind, reactor, index=0):
     kind = DISTURBANCE_ALIASES.get(kind, kind)
     if kind in PLANT_DISTURBANCES or reactor is None:
         return None
-    if reactor == "rotate":
-        return int(index) % N_REACTORS
+    if isinstance(reactor, str) and reactor.startswith("rotate"):
+        shift = int(reactor[len("rotate"):] or 0)
+        return (int(index) + shift) % N_REACTORS
     return int(reactor)
 
 

@@ -413,6 +413,24 @@ with these plant-specific settings:
   `turnaround_delay`, `storage_capacity`, `cooling_capacity` × `step`,
   `spike`, `gradual`, `recurrent`): 46 scenarios. The held-out panel and the
   latent gate use step faults.
+- **Tiers.** Every scenario is filed in one tier, and `eval_summary.json`
+  (`tiers`), the console and `compare_tiers.png` report ADAPT per tier: the
+  pooled burden cut and net-production gain, and the significant paired wins
+  per side. All tiers run on the same paired in-distribution tasks.
+
+  | tier | what is new to `meta` at test | scenarios |
+  |---|---|---|
+  | T1 | only the draw: instance, timing, reactor | the 44-scenario grid, `in_distribution` |
+  | T2 | parameters past training | `out_of_distribution` (prior 1.8× wider); `<kind>_extreme`: a step at a magnitude past the training range, by one rule for every kind (`EVAL_EXTRAPOLATION`: the training edge pushed 1.5× as far from nominal in log space; additive kinds 1.5× the upper edge) |
+  | T3 | the fault kind | any scenario with a kind in `PLANT_HOLDOUT_KINDS`, which `meta` then trains without (out of its training faults, compound pairs, held-out selection panel and gate) |
+  | T4 | the combination | `combo_*` (`EVAL_COMBINATIONS`): three kinds at once, staggered onsets, a ramp with a recurrent fault. Training compounds only two kinds stepping at one onset |
+
+  T3 needs its own `meta` run (`PLANT_HOLDOUT_KINDS=leak,contamination,storage_capacity`,
+  one kind per family, each with a trained sibling that acts on the same
+  constraint) against the same `saferl`; report T1, T2 and T4 from the run
+  that trains on every kind. Training writes the holdout to
+  `policy/[tag]/meta_holdout.json`, and `evaluate` refuses a different one.
+  `saferl` never trains on a fault, so every tier is new to it.
 
 ### Why `meta` tied `saferl`, and the training fixes
 
@@ -582,6 +600,7 @@ $env:PLANT_SEED=1; $env:PLANT_RUN_TAG="seed1"; python -m metarl all
 | `PLANT_EVAL_EPISODES` | evaluation tasks per scenario (default 100) |
 | `PLANT_EVAL_WORKERS` | evaluation worker processes (default: every logical CPU); `0` or `1` runs in-process |
 | `PLANT_EARLY_STOP_PATIENCE` | early-stop patience in held-out checks (default 50) |
+| `PLANT_HOLDOUT_KINDS` | comma-separated fault kinds `meta` trains without (tier 3; default none) |
 | `PLANT_DEVICE` | force the training device, e.g. `cpu` |
 | `PLANT_VERBOSE_PBAR` | `1` adds losses and latent diagnostics to the progress bar |
 

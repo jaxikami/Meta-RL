@@ -1,6 +1,7 @@
 """The two arms (``ARMS``), their checkpoints and the agent each one runs."""
 
 # ─── Standard Library ─────────────────────────────────────────────────────────
+import json
 import os
 
 # ─── Local ────────────────────────────────────────────────────────────────────
@@ -25,7 +26,8 @@ from metarl.training.config import (APN_PENALTY_WEIGHT, SEED, NORMALIZE_REWARDS,
                                     GATE_SHARPNESS, GATE_INIT_BIAS,
                                     META_EXPLORE_NOISE_BETA,
                                     META_TRAIN_GATE_OPEN, META_FAULT_CLS_WEIGHT,
-                                    META_ENCODER_UPDATE_EVERY)
+                                    META_ENCODER_UPDATE_EVERY,
+                                    META_HOLDOUT_KINDS)
 
 
 class ArmSpec:
@@ -201,3 +203,36 @@ def _load_preferring_best(agent, best_path, final_path, label, strict=False):
     if strict:
         raise SystemExit(msg)
     print(msg + " -- using random weights")
+
+
+def holdout_path():
+    """Where a multitask run records the fault kinds it was trained without."""
+    return os.path.join(POLICY_DIR, "meta_holdout.json")
+
+
+def write_holdout():
+    """Record META_HOLDOUT_KINDS next to the meta checkpoints."""
+    os.makedirs(POLICY_DIR, exist_ok=True)
+    with open(holdout_path(), "w") as f:
+        json.dump({"holdout_kinds": list(META_HOLDOUT_KINDS)}, f)
+
+
+def check_holdout():
+    """Refuse to evaluate under a holdout other than meta's training one.
+
+    Tier 3 reads META_HOLDOUT_KINDS, so evaluating a run with a different
+    PLANT_HOLDOUT_KINDS would file seen kinds as unseen (or the reverse).
+    A run trained before the record existed is taken at the current value.
+
+    Raises:
+        SystemExit: When the record and META_HOLDOUT_KINDS differ.
+    """
+    if not os.path.exists(holdout_path()):
+        return
+    with open(holdout_path()) as f:
+        trained = tuple(json.load(f).get("holdout_kinds", ()))
+    if set(trained) != set(META_HOLDOUT_KINDS):
+        raise SystemExit(
+            f"[!] meta in {POLICY_DIR} was trained without {list(trained)}, "
+            f"but PLANT_HOLDOUT_KINDS gives {list(META_HOLDOUT_KINDS)}; set it "
+            f"to the training value")

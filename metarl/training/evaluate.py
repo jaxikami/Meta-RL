@@ -10,6 +10,7 @@ import numpy as np
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from metarl.env.config import N_REACTORS
+from metarl.env.faults import ADDITIVE_DISTURBANCES
 from metarl.env.layout import ACTION_DIM_PER_REACTOR
 from metarl.training.config import (SEED, EVAL_EPISODES, EVAL_Z_MODE,
                                     EVAL_WORKERS,
@@ -18,10 +19,12 @@ from metarl.training.config import (SEED, EVAL_EPISODES, EVAL_Z_MODE,
                                     EVAL_RECURRENT_WINDOWS, META_DRIFT_TREADS,
                                     CONSTRAINT_NAMES, DEPTH_CONSTRAINTS,
                                     Z_INFORM_MIN_SNR, LOG_DIR, PLOT_DIR,
-                                    DISTURB_PROBES)
+                                    DISTURB_PROBES, META_DISTURB_MAG_RANGES,
+                                    META_HOLDOUT_KINDS, EVAL_EXTRAPOLATION,
+                                    EVAL_COMBINATIONS, EVAL_TIERS)
 from metarl.training.arms import (ARMS, ARM_ORDER, CONTRASTS, arm_paths,
                                   _build_agent,
-                                  _load_preferring_best)
+                                  _load_preferring_best, check_holdout)
 from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool,
                                    as_fault_schedule, pattern_schedule)
 from metarl.training.rollouts import (rollout_deterministic,
@@ -32,8 +35,8 @@ from metarl.training.metrics import (latent_separability, gate_opening,
                                      _paired_delta, _verdict_sign, _fmt_delta,
                                      _fmt_delta_sci)
 from metarl.training.logs import _json_default
-from metarl.training.plots import (_plot_comparison, plot_training_curves,
-                                   scenario_probe)
+from metarl.training.plots import (_plot_comparison, _plot_tiers,
+                                   plot_training_curves, scenario_probe)
 
 
 def _recovery_metrics(reward_traj, viol_traj, onset_outer, win=10):
@@ -274,6 +277,54 @@ def eval_fault_scenarios(onset, horizon=None):
     return out
 
 
+def extreme_magnitude(label):
+    """Tier 2's magnitude for EVAL_DISTURBANCES ``label``, past training.
+
+    The training range's edge on the evaluation magnitude's side of nominal
+    (1.0), EVAL_EXTRAPOLATION times as far from nominal in log space; an
+    additive kind (nominal 0) takes EVAL_EXTRAPOLATION x its upper edge.
+    """
+    d = EVAL_DISTURBANCES[label]
+    lo, hi = META_DISTURB_MAG_RANGES[d["kind"]]
+    if d["kind"] in ADDITIVE_DISTURBANCES:
+        return float(EVAL_EXTRAPOLATION * hi)
+    edge = lo if d["magnitude"] < 1.0 else hi
+    return float(edge ** EVAL_EXTRAPOLATION)
+
+
+def eval_tier_scenarios(onset, horizon):
+    """Tier 2's extrapolated magnitudes and tier 4's combinations.
+
+    Returns:
+        Dict scenario name -> (base tier, fault schedule): "<label>_extreme"
+        (T2, a step at ``onset``) and "combo_<name>" (T4, EVAL_COMBINATIONS).
+    """
+    out = {}
+    for label, d in EVAL_DISTURBANCES.items():
+        out[f"{label}_extreme"] = ("T2", pattern_schedule(
+            d["kind"], extreme_magnitude(label), "step", onset, d["reactor"],
+            horizon))
+    for name, parts in EVAL_COMBINATIONS.items():
+        sched = []
+        for label, pattern, t0, shift in parts:
+            d = EVAL_DISTURBANCES[label]
+            reactor = (f"rotate+{shift}" if d["reactor"] == "rotate" and shift
+                       else d["reactor"])
+            sched += pattern_schedule(
+                d["kind"], d["magnitude"], pattern,
+                onset if t0 is None else t0, reactor, horizon,
+                spike_h=EVAL_SPIKE_H, gradual_h=EVAL_GRADUAL_H,
+                treads=META_DRIFT_TREADS, windows=EVAL_RECURRENT_WINDOWS)
+        out[f"combo_{name}"] = ("T4", sched)
+    return out
+
+
+def scenario_tier(base, dist, holdout=META_HOLDOUT_KINDS):
+    """A scenario's tier: T3 when it contains a held-out kind, else ``base``."""
+    kinds = {d["kind"] for d in as_fault_schedule(dist)}
+    return "T3" if kinds & set(holdout) else base
+
+
 def evaluate():
     """Compare both arms on every scenario, on both metric axes.
 
@@ -288,6 +339,7 @@ def evaluate():
         The full results dict, also written to ``eval.json``.
     """
     seed_everything(SEED)
+    check_holdout()
     arms = ARM_ORDER
     envs, agents = {}, {}
     for name in arms:
@@ -302,11 +354,17 @@ def evaluate():
     ood_tasks = make_task_pool(EVAL_EPISODES, seed=99999, ood=True)
     onset = env.max_steps // 2
     scenarios = {
-        "in_distribution": {"tasks": id_tasks, "dist": None},
-        "out_of_distribution": {"tasks": ood_tasks, "dist": None},
+        "in_distribution": {"tasks": id_tasks, "dist": None, "tier": "T1"},
+        "out_of_distribution": {"tasks": ood_tasks, "dist": None,
+                                "tier": "T2"},
     }
     for name, dist in eval_fault_scenarios(onset, env.max_steps).items():
-        scenarios[name] = {"tasks": id_tasks, "dist": dist}
+        scenarios[name] = {"tasks": id_tasks, "dist": dist,
+                           "tier": scenario_tier("T1", dist)}
+    for name, (base, dist) in eval_tier_scenarios(onset,
+                                                  env.max_steps).items():
+        scenarios[name] = {"tasks": id_tasks, "dist": dist,
+                           "tier": scenario_tier(base, dist)}
 
     # Scenarios grouped by task pool: each group is one job per task.
     groups = [(id_tasks, [n for n, sc in scenarios.items()
@@ -327,6 +385,9 @@ def evaluate():
         }
 
     summary = _eval_summary(results, arms)
+    summary["tiers"] = _tier_summary(
+        results, summary, {n: sc["tier"] for n, sc in scenarios.items()})
+    summary["holdout_kinds"] = list(META_HOLDOUT_KINDS)
     _print_eval(results, summary)
     os.makedirs(LOG_DIR, exist_ok=True)
     with open(os.path.join(LOG_DIR, "eval.json"), "w") as f:
@@ -335,6 +396,7 @@ def evaluate():
         json.dump(summary, f, indent=2, default=_json_default)
     print(f"\nwrote {os.path.join(LOG_DIR, 'eval.json')} and eval_summary.json")
     _plot_comparison(results)
+    _plot_tiers(summary["tiers"])
     plot_training_curves()
     return results
 
@@ -474,6 +536,67 @@ def _headline(results, arms):
     return out
 
 
+def _tier_summary(results, summary, tiers, arm_a="meta", arm_b="saferl"):
+    """ADAPT per tier: significant wins per side, and the pooled gaps.
+
+    ``burden_reduction`` is 1 - (meta's summed burden / saferl's) over the
+    tier's scenarios; ``score_gain`` the summed net-production gap over
+    saferl's summed on-spec ethanol (``_score_delta``'s scale). Wins are the
+    per-scenario paired verdicts (``_verdict_sign``).
+
+    Returns:
+        Dict tier -> its numbers and scenario names; {} without both arms.
+    """
+    contrast = next((summary["contrasts"][label] for label, a, b, _
+                     in CONTRASTS if (a, b) == (arm_a, arm_b)
+                     and label in summary["contrasts"]), None)
+    if contrast is None:
+        return {}
+    out = {}
+    for tier, label in EVAL_TIERS.items():
+        names = [n for n in results if tiers.get(n) == tier]
+        if not names:
+            continue
+
+        def total(arm, k):
+            return float(sum(results[n][arm][k] for n in names))
+
+        def wins(key):
+            s = [_verdict_sign(contrast[n][key]) for n in names]
+            return {arm_a: s.count(1), arm_b: s.count(-1), "tied": s.count(0)}
+
+        b_ref, e_ref = total(arm_b, "burden"), total(arm_b, "on_spec_ethanol")
+        out[tier] = {
+            "label": label, "n": len(names), "scenarios": names,
+            "burden_wins": wins("d_burden"), "score_wins": wins("d_score"),
+            "burden_reduction": (1.0 - total(arm_a, "burden") / b_ref
+                                 if b_ref > 0 else float("nan")),
+            "score_gain": ((total(arm_a, "score") - total(arm_b, "score"))
+                           / e_ref if e_ref > 0 else float("nan")),
+        }
+    return out
+
+
+def _print_tiers(tiers, holdout):
+    """One line per tier: meta's pooled gaps and its significant wins."""
+    if not tiers:
+        return
+    print("\nADAPT BY TIER (meta vs saferl, paired; wins = significant "
+          "scenarios, meta / saferl / tied)")
+    print(f"  {'tier':<5}{'':<60}{'n':>4}{'burden cut':>12}{'B wins':>12}"
+          f"{'Pi gain':>10}{'Pi wins':>12}")
+    for tier, t in tiers.items():
+        bw, sw = t["burden_wins"], t["score_wins"]
+        print(f"  {tier:<5}{t['label']:<60}{t['n']:>4}"
+              f"{t['burden_reduction'] * 100:>+11.1f}%"
+              f"{bw['meta']:>5}/{bw['saferl']}/{bw['tied']:<4}"
+              f"{t['score_gain'] * 100:>+9.1f}%"
+              f"{sw['meta']:>5}/{sw['saferl']}/{sw['tied']:<4}")
+    if "T3" not in tiers:
+        print("  T3   none: set PLANT_HOLDOUT_KINDS and retrain meta"
+              + (f" (held out: {', '.join(holdout)})" if holdout else ""))
+
+
 def _print_eval(results, summary):
     """Print the arms that ran and, per scenario, each contrast's verdict."""
     arms = tuple(a for a in ARM_ORDER if a in next(iter(results.values())))
@@ -510,5 +633,6 @@ def _print_eval(results, summary):
                   f"B {_fmt_delta(v['d_burden']):<22}"
                   f"eth {_fmt_delta_sci(v['d_eth']):<26}"
                   f"Pi {_fmt_delta_sci(v['d_score'])}")
+    _print_tiers(summary.get("tiers", {}), summary.get("holdout_kinds", ()))
     print(f"\nfull per-scenario tables: eval.json  |  figures: {PLOT_DIR}  |  "
           f"redraw figures only: python -m metarl plot_eval")

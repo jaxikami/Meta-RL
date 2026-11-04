@@ -94,7 +94,10 @@ from metarl.training.early_stopping import EarlyStopper
 from metarl.training.tasks import (make_env, make_task_pool, resolve_reactor,
                                    maybe_schedule_disturbance,
                                    pattern_schedule, apply_fault_schedule)
-from metarl.training.evaluate import eval_fault_scenarios
+from metarl.training.evaluate import (eval_fault_scenarios,
+                                      eval_tier_scenarios, extreme_magnitude,
+                                      scenario_tier, _eval_summary,
+                                      _tier_summary)
 from metarl.training.rollouts import (collect_rollout, rollout_deterministic,
                                       _start_episode, _advance,
                                       _episode_metrics, branched_rollouts,
@@ -669,6 +672,84 @@ def check_magnitudes_in_support():
     print("  magnitudes in support OK")
 
 
+def check_eval_tiers():
+    """Tier 2 magnitudes lie past training; tier 4 is outside it; tier 3
+    filters training, the panel and the gate; the tier summary counts."""
+    import subprocess
+    from metarl.env.faults import ADDITIVE_DISTURBANCES
+    from metarl.training.config import EVAL_COMBINATIONS, _holdout_kinds
+    env = PlantFermentationEnv()
+    env.set_task(nominal_task())
+    tiers = eval_tier_scenarios(env.max_steps // 2, env.max_steps)
+    assert set(tiers) == ({f"{k}_extreme" for k in EVAL_DISTURBANCES}
+                          | {f"combo_{c}" for c in EVAL_COMBINATIONS}), sorted(tiers)
+    for label, d in EVAL_DISTURBANCES.items():
+        lo, hi = META_DISTURB_MAG_RANGES[d["kind"]]
+        m = extreme_magnitude(label)
+        if d["kind"] in ADDITIVE_DISTURBANCES:
+            assert m > hi, (label, m)
+        else:   # past the edge, on the evaluation magnitude's side of 1.0
+            assert (m < lo) if d["magnitude"] < 1.0 else (m > hi), (label, m)
+        assert tiers[f"{label}_extreme"][0] == "T2"
+    for name, (tier, sched) in tiers.items():
+        for index in range(N_REACTORS):
+            apply_fault_schedule(env, sched, index=index)
+        if tier != "T4":
+            continue
+        # Training compounds two kinds stepping at one onset: every
+        # combination has three kinds, two onsets, or a non-step pattern.
+        parts = EVAL_COMBINATIONS[name[len("combo_"):]]
+        assert (len(parts) > 2 or len({p[2] for p in parts}) > 1
+                or any(p[1] != "step" for p in parts)), name
+    assert resolve_reactor("leak", "rotate+1", 2) == 0
+    assert resolve_reactor("leak", "rotate", 2) == 2
+    leak, gain = (d for d in tiers["combo_triple_flow"][1]
+                  if d["kind"] in ("leak", "feed_gain"))
+    for index in range(N_REACTORS):
+        assert (resolve_reactor("leak", leak["reactor"], index)
+                != resolve_reactor("feed_gain", gain["reactor"], index))
+    # Tier 3: any scenario containing a held-out kind.
+    bio = tiers["combo_staggered_bio"][1]
+    assert scenario_tier("T4", bio, ("contamination",)) == "T3"
+    assert scenario_tier("T4", bio, ("leak",)) == "T4"
+    assert scenario_tier("T1", None, ("leak",)) == "T1"
+    assert _holdout_kinds(" kinetics_decay, leak,leak") == (
+        "disturb_kinetics_decay", "leak")
+    try:
+        _holdout_kinds("leek")
+        raise AssertionError("an unknown held-out kind was accepted")
+    except ValueError:
+        pass
+    code = ("from metarl.training import config as c; "
+            "assert 'leak' not in c.META_DISTURB_KINDS; "
+            "assert all(d[0] != 'leak' for d in c.HELDOUT_DISTURBANCES); "
+            "assert 'leak' not in c.GATE_FAULT_KINDS; "
+            "assert c.META_HOLDOUT_KINDS == ('leak',)")
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=_ROOT,
+                   env={**os.environ, "PLANT_HOLDOUT_KINDS": "leak"})
+    # The tier summary: meta cuts burden significantly on "a", ties on "b".
+    rng = np.random.default_rng(0)
+
+    def arm(burden, eth):
+        n = 20
+        b = burden + rng.normal(0, 0.1, n)
+        e = eth + rng.normal(0, 1e4, n)
+        return {"burden_per_ep": b.tolist(), "viol_per_ep": b.tolist(),
+                "on_spec_ethanol_per_ep": e.tolist(), "score_per_ep": e.tolist(),
+                "burden": float(b.mean()), "on_spec_ethanol": float(e.mean()),
+                "score": float(e.mean()), "mean_titer": 80.0, "z_snr": 2.0}
+    res = {"a": {"meta": arm(1.0, 1e7), "saferl": arm(4.0, 1e7)},
+           "b": {"meta": arm(2.0, 1e7), "saferl": arm(2.0, 1e7)}}
+    summ = _eval_summary(res, ("saferl", "meta"))
+    t = _tier_summary(res, summ, {"a": "T2", "b": "T2"})["T2"]
+    assert t["n"] == 2 and t["burden_wins"] == {"meta": 1, "saferl": 0,
+                                                "tied": 1}, t
+    assert np.isclose(t["burden_reduction"], 1 - 3.0 / 6.0, atol=0.05), t
+    print(f"  evaluation tiers OK ({len(tiers)} tier-2/4 scenarios; "
+          f"magnitudes past training, combinations outside it, tier-3 "
+          f"filtering)")
+
+
 def _apply_until(env, t_end):
     """Fire scheduled faults step by step up to ``t_end``, without biology."""
     for t in range(t_end):
@@ -1238,6 +1319,8 @@ def check_branched_rollouts_and_pool():
     # shield counters included.
     scen = {n: d for n, d in eval_fault_scenarios(onset, env.max_steps).items()
             if n.startswith("leak_")}
+    scen["combo_ramp_and_recurrent"] = eval_tier_scenarios(
+        onset, env.max_steps)["combo_ramp_and_recurrent"][1]
     names = [None] + sorted(scen)
     rows = scenario_rollouts(env, agent, tasks[1], [scen.get(n) for n in names],
                              index=1)
@@ -1334,6 +1417,7 @@ def main():
     check_fault_coverage(ref_info)
     check_magnitudes_in_support()
     check_fault_patterns()
+    check_eval_tiers()
     check_plant_wide_faults()
     check_constraint_ids_and_lagrangian()
     check_agent_shapes_and_modes()

@@ -605,6 +605,70 @@ def _plot_comparison(results):
     print(f"wrote figures to {PLOT_DIR}/")
 
 
+def _plot_tiers(tiers):
+    """compare_tiers.png: meta's pooled gap on saferl in each tier.
+
+    Two panels, one quantity each: the violation-burden cut and the
+    net-production gain (``evaluate._tier_summary``). A bar takes the colour
+    of the arm it favours; the label beside it gives the significant
+    per-scenario wins, meta / saferl / tied.
+    """
+    if not tiers:
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Patch
+    except Exception as exc:                             # pragma: no cover
+        print(f"[plot] skipped: {exc}")
+        return
+    names = list(tiers)
+    y = np.arange(len(names))[::-1]
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 1.2 + 0.75 * len(names)),
+                             sharey=True)
+    fig.patch.set_facecolor("#fcfcfb")
+    panels = (("burden_reduction", "burden_wins",
+               "violation burden cut vs saferl (%)"),
+              ("score_gain", "score_wins",
+               "net production gain vs saferl\n(% of saferl's on-spec ethanol)"))
+    for ax, (key, wkey, title) in zip(axes, panels):
+        vals = np.array([100.0 * tiers[n][key] for n in names], dtype=float)
+        vals = np.nan_to_num(vals)
+        cols = [ARM_COLORS["meta"] if v > 0 else ARM_COLORS["saferl"]
+                for v in vals]
+        ax.barh(y, vals, height=0.5, color=cols, edgecolor="#fcfcfb", lw=2)
+        ax.axvline(0.0, color=PLOT_INK2, lw=1.0)
+        span = max(np.max(np.abs(vals)), 1.0)
+        ax.set_xlim(-1.9 * span, 1.9 * span)
+        for yi, v, n in zip(y, vals, names):
+            w = tiers[n][wkey]
+            ax.annotate(f"{v:+.1f}%   {w['meta']}/{w['saferl']}/{w['tied']}",
+                        (v, yi), xytext=(6 if v >= 0 else -6, 0),
+                        textcoords="offset points", va="center",
+                        ha="left" if v >= 0 else "right", fontsize=8.5,
+                        color=PLOT_INK)
+        ax.set_title(title, fontsize=10.5, color=PLOT_INK, fontweight="bold")
+        _style_ax(ax, PLOT_INK2, PLOT_GRID)
+        ax.grid(axis="y", visible=False)
+        ax.grid(axis="x", alpha=0.5, color=PLOT_GRID, lw=0.8)
+        ax.tick_params(axis="y", length=0)
+    axes[0].set_yticks(y)
+    axes[0].set_yticklabels([f"{n}  {tiers[n]['label'].split(' (')[0]}\n"
+                             f"{tiers[n]['n']} scenarios" for n in names],
+                            fontsize=9, color=PLOT_INK2)
+    fig.legend(handles=[Patch(color=ARM_COLORS["meta"], label="meta ahead"),
+                        Patch(color=ARM_COLORS["saferl"], label="saferl ahead")],
+               loc="lower center", ncol=2, frameon=False, fontsize=9)
+    fig.suptitle("Meta-RL vs Safe RL by evaluation tier   |   labels: pooled "
+                 "gap, then significant scenario wins meta / saferl / tied",
+                 fontweight="bold", fontsize=11, color=PLOT_INK)
+    fig.tight_layout(rect=(0, 0.07, 1, 0.92))
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    fig.savefig(os.path.join(PLOT_DIR, "compare_tiers.png"), dpi=150)
+    plt.close(fig)
+
+
 TRAIN_CURVE_SMOOTH_ITERS = 50
 
 

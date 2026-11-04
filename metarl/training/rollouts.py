@@ -37,7 +37,7 @@ def collect_rollout(env, agent, replay, task_id, task, add_to_replay=True,
     agent.clear_z()
 
     total_r, total_v, steps = 0.0, 0, 0
-    step_rewards, acted_on, led_to = [], [], []
+    step_rewards, acted_on, led_to, acted = [], [], [], []
     store_priv = (add_to_replay and replay is not None
                   and getattr(replay, "priv_dim", 0) > 0)
     priv = env.privileged_state() if store_priv else None
@@ -53,6 +53,8 @@ def collect_rollout(env, agent, replay, task_id, task, add_to_replay=True,
             fault = env.fault_kind()
             safe_a, _ = agent.select_action(state, deterministic=False)
             next_state, r, done, info = env.step(safe_a)
+            agent.observe_step(next_state, info)
+            acted.append(safe_a)
             if add_to_replay and replay is not None:
                 # The EFFECTIVE context after this step, clipped (a fired leak
                 # is many prior SDs away).
@@ -74,6 +76,7 @@ def collect_rollout(env, agent, replay, task_id, task, add_to_replay=True,
         agent.gate_floor = None
     agent.observe_rewards(step_rewards)
     agent.observe_obs(np.stack(acted_on), next_observations=np.stack(led_to))
+    agent.observe_episode(np.stack(acted_on), np.stack(acted))
     return total_r, total_v, steps
 
 
@@ -118,13 +121,15 @@ def ingest_episode_record(agent, replay, rec):
     """Add a ``collect_episode_record`` result to ``replay`` and ``agent``.
 
     Exactly what ``collect_rollout`` does in-process after its episode: the
-    transitions, then the reward and observation normalisers, then the
-    shield's counters.
+    transitions, then the reward and observation normalisers and the
+    shield's refiner, then the shield's counters.
     """
     for args, kwargs in rec["transitions"]:
         replay.add(*args, **kwargs)
     agent.observe_rewards(rec["rewards"])
     agent.observe_obs(rec["obs"], next_observations=rec["next_obs"])
+    agent.observe_episode(rec["obs"],
+                          np.stack([a[2] for a, _ in rec["transitions"]]))
     agent.add_proj_counts(rec["proj"])
     return rec["reward"], rec["violations"], rec["steps"]
 
@@ -172,6 +177,7 @@ def _advance(env, agent, ep, stop_at=None):
         safe_a, _ = agent.select_action(state, deterministic=True)
         ep["gate_traj"].append(agent.last_gate)
         next_state, r, done, info = env.step(safe_a)
+        agent.observe_step(next_state, info)
         agent.update_context(state, safe_a, r, next_state)
         ep["state"], ep["done"], ep["info"] = next_state, done, info
         ep["total_r"] += r

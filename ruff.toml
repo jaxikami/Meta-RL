@@ -1,10 +1,20 @@
-# Fermentation-PPO's environment, ported verbatim: tests/smoke_test.py checks
-# these files still equal ../Fermentation-PPO/envs, so they are never fixed
-# or reformatted here.
+# Fermentation-PPO's environment and safety layer, ported verbatim:
+# tests/smoke_test.py checks these files still equal ../Fermentation-PPO/envs
+# and ../Fermentation-PPO/safety, so they are never fixed or reformatted here.
 force-exclude = true
 extend-exclude = [
     "metarl/env/kinetics.py",
     "metarl/env/disturbances.py",
     "metarl/env/plant.py",
     "metarl/env/safe.py",
+    "metarl/apn/constants.py",
+    "metarl/apn/kinetic.py",
+    "metarl/apn/apn.py",
+    "metarl/apn/adaptation.py",
+    "metarl/apn/plant_sim.py",
+    "metarl/apn/data.py",
+    "metarl/apn/train.py",
+    "metarl/apn/refiner.py",
+    "metarl/apn/validate.py",
+    "metarl/apn/validation_plots.py",
 ]

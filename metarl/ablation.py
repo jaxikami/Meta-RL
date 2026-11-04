@@ -30,9 +30,10 @@ Components (all on in ``full``, which is ``ARMS["meta"]``):
                 ferment or unload, or race a cleanup's clock. The shield was
                 trained on stage-masked flows and meets off-distribution
                 actions here.
-    apn         The hard inventory shield. Ablated by ``apn=False``: no
-                projection and no mapping penalty. No-regression selection
-                still compares against saferl as it runs, shield included.
+    apn         Safe PPO's multi-head APN. Ablated by ``apn=False``: no
+                projection, L3 adaptation, safety gradient, mapping penalty or
+                KineticNet refresh. No-regression selection still compares
+                against saferl as it runs, APN included.
     warmstart   Starting from saferl's trained policy. Ablated by
                 ``warm_start=None``: trained from scratch, which also removes
                 everything the warm start carries: the anchor, the weight decay

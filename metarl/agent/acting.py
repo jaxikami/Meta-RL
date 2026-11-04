@@ -1,10 +1,14 @@
 """Acting (``ActingMixin``): the online posterior over z and action selection.
 
 history (per-reactor GRU + cross-reactor attention) -> actor -> tanh ->
-[adaptation gate] -> stage mask -> action projection -> stage mask. The
-actor's and the base policy's history states are carried from step to step
-and reset at every episode start.
+[adaptation gate] -> stage mask -> APN projection (with L3's buffers and
+residual) -> stage mask. The actor's and the base policy's history states,
+and the APN's L3 adaptation, are carried from step to step and reset at
+every episode start.
 """
+
+# ─── Standard Library ─────────────────────────────────────────────────────────
+import copy
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
 import numpy as np
@@ -12,7 +16,8 @@ import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from metarl.env.adapter import PlantFermentationEnv
-from metarl.apn.network import project_to_safe
+from metarl.env.config import N_REACTORS
+from metarl.apn.constants import I_S
 from metarl.agent.common import (ROLLOUT_DEVICE, PRE_TANH_CLIP,
                                  EXPLORE_NOISE_LEN, powerlaw_noise)
 
@@ -32,6 +37,9 @@ class ActingMixin:
         self._z_steps = 0
         self._explore_seq = None
         self._explore_t = 0
+        self._shield_backoff.reset()
+        self._shield_residual.reset()
+        self._shield_last = None
         self._resample_z()
 
     def _next_explore_noise(self):
@@ -82,6 +90,9 @@ class ActingMixin:
             "explore_seq": (None if self._explore_seq is None
                             else self._explore_seq.clone()),
             "explore_t": self._explore_t,
+            "shield": copy.deepcopy((self._shield_backoff,
+                                     self._shield_residual,
+                                     self._shield_last)),
         }
 
     def set_posterior_state(self, state):
@@ -96,6 +107,9 @@ class ActingMixin:
         seq = state.get("explore_seq")
         self._explore_seq = None if seq is None else seq.clone()
         self._explore_t = state.get("explore_t", 0)
+        if "shield" in state:
+            (self._shield_backoff, self._shield_residual,
+             self._shield_last) = copy.deepcopy(state["shield"])
 
     @staticmethod
     def _flatten_transition(obs, act, reward, next_obs):
@@ -192,30 +206,64 @@ class ActingMixin:
         return a, logp, n_active
 
     @staticmethod
-    def _shield_obs(net, obs):
-        """The leading observation channels an APN was trained on."""
-        return obs[..., :net.obs_dim]
+    def _rows(x):
+        """A flat observation or action [..., n * k] as per-reactor rows [B, n, k]."""
+        return x.reshape(-1, N_REACTORS, x.shape[-1] // N_REACTORS)
+
+    def _shield_l3(self):
+        """L3's offsets and residual for the APN (none without adaptation)."""
+        if not self.apn_adaptation:
+            return {}
+        return {"offsets": self._shield_backoff.offsets(),
+                "residual": self._shield_residual.tensors(ROLLOUT_DEVICE)}
 
     def _project(self, obs, action, mask=None):
-        """Push a rollout action onto the APN's safe set, then re-apply the mask.
+        """L2: project a rollout action with the APN, then re-apply the mask.
 
-        Precedence: mask > projection > actor.
+        Precedence: mask > projection > actor. L3's residual is first fitted
+        to the transition the last executed action caused.
         """
         if self._apn_r is None or not self.apn_hard_project:
             return action
         if mask is None:
             mask = self._stage_mask(obs)
-        proj, steps = project_to_safe(self._apn_r,
-                                      self._shield_obs(self._apn_r, obs),
-                                      action, stage_mask=mask)
-        out = self._apply_safety(obs, proj, mask=mask)
+        rows = self._rows(obs)
+        if self.apn_adaptation and self._shield_last is not None:
+            last_obs, last_act = self._shield_last
+            self._shield_residual.update(last_obs, last_act,
+                                         rows[0].cpu().numpy())
+        proj, stats = self._apn_r.project(rows, self._rows(action),
+                                          **self._shield_l3())
+        out = self._apply_safety(obs, proj.reshape(action.shape), mask=mask)
+        self._shield_last = (rows[0].cpu().numpy(),
+                             self._rows(out)[0].cpu().numpy())
         self._proj_calls += 1
-        self._proj_steps += steps
-        if steps == 0:
+        self._proj_steps += stats["iters"]
+        if stats["noop"]:
             self._proj_noop += 1
         if bool((out - action).abs().max() > 1e-6):
             self._proj_moved += 1
         return out
+
+    def observe_step(self, next_state, info):
+        """L3: learn from the plant's alarms after the last executed action.
+
+        Call after every ``env.step`` of an episode the agent acts in. Raises
+        the buffer of every constraint the plant alarmed on and re-locates a
+        moved storage or heat-removal limit (Safe PPO's ``observe``).
+
+        Args:
+            next_state: Flat observation after the step.
+            info: The step's info dict ('violation_counts' and the alarms'
+                depths).
+        """
+        if (self._apn_r is None or not self.apn_hard_project
+                or not self.apn_adaptation or self._shield_last is None):
+            return
+        self._shield_backoff.update(info.get("violation_counts", {}))
+        nxt = np.asarray(next_state, dtype=np.float32).reshape(N_REACTORS, -1)
+        self._shield_backoff.calibrate(info, float(self._shield_last[0][0, I_S]),
+                                       float(nxt[0, I_S]))
 
     def proj_counts(self):
         """The projection's raw counters: (calls, no-ops, steps, moved)."""

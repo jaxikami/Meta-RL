@@ -30,7 +30,10 @@ properties that must not silently regress:
   * the online GRU posterior equals the training posterior; a warm-started
     agent acts exactly as its saferl source for every z; behind a shut
     adaptation gate it executes the source, behind an open one its actor;
-  * the projection never moves a stage clock or a locked dimension;
+  * the APN is Fermentation-PPO's (its ported modules equal ``safety/``):
+    the projection never moves a stage-locked dimension and repairs a short
+    exact head, L3 raises a buffer on an alarm and resets each episode, and
+    the update trains the actor through the safety gradient;
   * branched held-out rollouts equal from-scratch ones, and worker-process
     rollouts match in-process ones.
 
@@ -65,12 +68,12 @@ from metarl.env.config import (N_REACTORS, nominal_task, sample_task,
                                PRODUCT_MASS_SCALE, TITER_SCALE,
                                get_main_reactor_config)
 from metarl.env.kinetics import integrate_rk4
-from metarl.env.layout import (STATE_DIM, ACTION_DIM, SHIELD_OBS_DIM,
+from metarl.env.layout import (STATE_DIM, ACTION_DIM,
                                STORAGE_CHANNEL, PRIVILEGED_STATE_DIM,
                                PRIV_LOT_MASS, PRIV_LOT_TITER,
                                DEFAULT_MASKED_ACTION, TIME_ACTION_DIMS,
                                stage_mask_np, apply_stage_mask_np,
-                               reactor_channel, reactor_action)
+                               reactor_channel)
 from metarl.env.faults import (VALID_DISTURBANCES, DISTURBANCE_KIND_INDEX,
                                PLANT_DISTURBANCES)
 from metarl.env.plant import DEPTH_GAIN, DISCHARGE_CUTOFF, FermentationPlant
@@ -79,10 +82,6 @@ from metarl.agent.common import device, LATENT_DIM
 from metarl.agent.networks import token_index
 from metarl.agent.replay import MultiTaskReplayBuffer
 from metarl.agent.pearl import PEARLAgent
-from metarl.apn.network import project_to_safe
-from metarl.apn.data import (safety_margin, safety_margins, sample_states,
-                             sample_actions, shut_action,
-                             assert_plant_constants_match)
 from metarl.training.config import (CONTEXT_SIZE, META_AUX_STATE_TARGETS,
                                     META_DISTURB_KINDS,
                                     META_DISTURB_MAG_RANGES,
@@ -108,7 +107,6 @@ from metarl.training.heldout import (_regressions,
                                      blended_heldout_score, violation_price)
 from metarl.training.workers import RolloutPool
 from metarl.env.config import PROD_REWARD_PER_ETH, VIOLATION_SPIKE
-from metarl.apn.train import new_apn
 
 CTX = CONTEXT_SIZE
 T1 = -0.34657359          # clock action of exactly 1.0x
@@ -116,6 +114,10 @@ T1 = -0.34657359          # clock action of exactly 1.0x
 # kinetics (MetaRL_Lean/README: "a row where a tie is expected").
 TIE_EXPECTED_KINDS = ("cell_viability",)
 PORTED_MODULES = ("kinetics", "disturbances", "plant", "safe")
+# Fermentation-PPO's safety/ package (and the validation figure from its
+# reporting/), ported into metarl/apn/.
+PORTED_APN_MODULES = ("constants", "kinetic", "apn", "adaptation", "plant_sim",
+                      "data", "train", "refiner", "validate", "validation_plots")
 
 
 def _clock(x):
@@ -229,12 +231,20 @@ def check_parity_with_fermentation_ppo():
         for pkg in ("metarl.env", "envs"):
             text = text.replace(f"from {pkg}.", "from PKG.")
             text = text.replace(f"{pkg.replace('.', '/')}/", "PKG/")
+        for pkg in ("metarl.apn", "safety", "reporting"):
+            text = text.replace(f"{pkg}.", "SAFETY.")
+            text = text.replace(f"{pkg.replace('.', '/')}/", "SAFETY/")
         return text
 
     for m in PORTED_MODULES:
         a = body(os.path.join(PPO_ROOT, "envs", f"{m}.py"))
         b = body(os.path.join(here, f"{m}.py"))
         assert a == b, f"metarl/env/{m}.py differs from Fermentation-PPO's envs/{m}.py"
+    for m in PORTED_APN_MODULES:
+        src = "reporting" if m == "validation_plots" else "safety"
+        a = body(os.path.join(PPO_ROOT, src, f"{m}.py"))
+        b = body(os.path.join(_ROOT, "metarl", "apn", f"{m}.py"))
+        assert a == b, f"metarl/apn/{m}.py differs from Fermentation-PPO's {src}/{m}.py"
     import metarl.env.config as cfg
     ref = ppo["config"]
     for name in dir(ref):
@@ -277,7 +287,8 @@ def check_parity_with_fermentation_ppo():
                 worst = max(worst, abs(local - int(
                     info["reactor_violation_events"].sum())))
     assert worst <= 1, worst   # 8: one plant-wide event when nothing shipped
-    print(f"  parity with Fermentation-PPO OK ({len(PORTED_MODULES)} modules "
+    print(f"  parity with Fermentation-PPO OK ({len(PORTED_MODULES)} env and "
+          f"{len(PORTED_APN_MODULES)} APN modules "
           f"equal its sources but for imports; the environment steps "
           f"bit-identically under all {len(ppo['disturbances'].EVAL_DISTURBANCES)}"
           f" evaluation faults; per-reactor events add up)")
@@ -285,7 +296,7 @@ def check_parity_with_fermentation_ppo():
 
 def check_layout_and_masks():
     """Observation layout, token index and stage masks."""
-    assert STATE_DIM == 84 and ACTION_DIM == 12 and SHIELD_OBS_DIM == STATE_DIM
+    assert STATE_DIM == 84 and ACTION_DIM == 12
     assert REACTOR_OBS_DIM == PlantFermentationEnv().get_state_norm().shape[1]
     tok = token_index().numpy()
     assert tok.shape == (N_REACTORS, REACTOR_OBS_DIM)
@@ -903,13 +914,16 @@ def check_constraint_ids_and_lagrangian():
     assert env.use_lagrangian and env.reset_lambdas_per_episode
     _, _, _, _ = _run(env, _pol_full_throttle)
     assert env.reactor_overflow_lambda.max() > 0.0
+    # The adapter zeroes the duals at every reset (the environment itself
+    # carries them over).
+    env.reset()
+    assert env.reactor_overflow_lambda.max() == 0.0
     # The reward rates the selection prices a violation with are the
-    # environment's (locals of its step, so read from the source).
-    with open(os.path.join(_ROOT, "metarl", "env", "safe.py"), encoding="utf-8") as f:
-        src = f.read()
-    assert f"BASE_SPIKE = {VIOLATION_SPIKE} if self.fixed_violation_penalties" in src
-    assert "reward_coef = 0.5" in src and "(total_harvested_eth/1e7)" in src
-    assert np.isclose(PROD_REWARD_PER_ETH, 0.5 / 1e7)
+    # environment's.
+    from metarl.env import plant, safe
+    assert safe.BASE_SPIKE == VIOLATION_SPIKE
+    assert np.isclose(PROD_REWARD_PER_ETH,
+                      plant.PROD_REWARD_COEF / plant.PROD_REWARD_SCALE)
     print("  constraint ids and Lagrangian switch OK (ids 1-9 are the "
           "environment's; lagrangian=False is the fixed-penalty case study; "
           "selection prices a violation "
@@ -1246,56 +1260,112 @@ def check_warm_start_and_gate():
 
 
 def check_shield():
-    """The projection never moves a clock or a locked dimension; label sanity."""
+    """Safe PPO's APN: exact heads, projection, L3 and the actor's terms."""
+    from metarl.apn.apn import HEADS, MultiHeadAPN, stage_mask
     torch.manual_seed(0)
-    net = new_apn()
-    with torch.no_grad():
-        net.margin_head.weight.normal_(0.0, 0.5)
-        net.margin_head.bias.fill_(-0.5)
     rng = np.random.default_rng(0)
-    o = torch.from_numpy(sample_states(512, rng))
-    a = torch.from_numpy(sample_actions(512, rng))
-    mask = PlantFermentationEnv.get_action_mask(o)
-    proj, steps = project_to_safe(net, o, a, stage_mask=mask)
-    frozen = 1.0 - mask
-    frozen[:, list(TIME_ACTION_DIMS)] = 1.0
-    assert float(((proj - a).abs() * frozen).max()) == 0.0
-    assert steps > 0, "the untrained shield admitted nothing; test is void"
+    # Plant states from a random-action episode, with random actions.
     env = PlantFermentationEnv()
-    assert_plant_constants_match(env)
-    # Synthetic states have the environment's structure: its capacity
-    # channels, and the plant-wide channels repeated in every row.
-    rows = sample_states(64, rng).reshape(64, N_REACTORS, REACTOR_OBS_DIM)
-    real = env.reset().reshape(N_REACTORS, REACTOR_OBS_DIM)
-    assert np.allclose(rows[:, :, 22:25], real[None, :, 22:25])
-    assert np.allclose(rows[:, :, 25:], rows[:, :1, 25:])
-    # A nearly full tank (below the 5% back-off) with a reactor draining hard
-    # is unsafe; shutting is safe.
-    env.S_mass = 0.93 * S_MAX
+    obs = [env.reset()]
+    done = False
+    while not done:
+        o, _, done, _ = env.step(rng.uniform(-1.0, 1.0, ACTION_DIM))
+        obs.append(o)
+    s = torch.as_tensor(np.stack(obs), dtype=torch.float32).reshape(
+        -1, N_REACTORS, REACTOR_OBS_DIM)
+    a = torch.as_tensor(rng.uniform(-1.0, 1.0, (len(s), N_REACTORS, 4)),
+                        dtype=torch.float32)
+    mask = stage_mask(s)
+    assert torch.equal(mask.reshape(len(s), -1),
+                       PlantFermentationEnv.get_action_mask(s.reshape(len(s), -1)))
+    a = a * mask + torch.as_tensor(DEFAULT_MASKED_ACTION, dtype=torch.float32
+                                   ).reshape(N_REACTORS, 4) * (1 - mask)
+    # An untrained KineticNet: the learned heads are live, if arbitrary.
+    for apn in (MultiHeadAPN(use_kinetic=False), MultiHeadAPN()):
+        proj, stats = apn.project(s, a)
+        assert float(((proj - a).abs() * (1 - mask)).max()) == 0.0, \
+            "the projection moved a stage-locked dimension"
+        assert not stats["noop"]
+    exact = MultiHeadAPN(use_kinetic=False)
+    assert {h.name for h in exact.heads} == {h.name for h in HEADS if h.exact}
+    # A nearly full tank with a reactor draining hard: the storage-overflow
+    # head is short, and the projection closes the valve until it is not
+    # (one hold: +25 t drained, -7.5 t drawn, against the 95% wall).
+    env.reset()
+    env.S_mass = 0.94 * S_MAX
     env.current_stage[0] = 3
     env.M[0] = 150000.0
-    s = torch.as_tensor(env.observe()[None, :SHIELD_OBS_DIM])
-    drain = torch.as_tensor(np.tile([0.0, -1, -1, -1.0], N_REACTORS)[None],
-                            dtype=torch.float32)
-    drain[0, reactor_action(0, 3)] = 1.0
-    mm = safety_margins(s, drain)
-    assert float(mm[0, -1]) < 0.0 and float(safety_margin(s, shut_action(1))) > 0.0
-    assert mm.shape[1] == 2 * N_REACTORS + 1
-    print(f"  shield OK (clocks and locked dims never move; synthetic states "
-          f"shaped like the plant's; storage-overflow margin: drain "
-          f"{float(mm[0, -1]):+.3f}, shut safe)")
+    st = torch.as_tensor(env.get_state_norm()[None], dtype=torch.float32)
+    drain = torch.as_tensor(DEFAULT_MASKED_ACTION, dtype=torch.float32
+                            ).reshape(1, N_REACTORS, 4).clone()
+    drain[0, 0, 3] = 1.0
+    before = float(exact.head_margins(st, drain)["storage_over"][0])
+    fixed, _ = exact.project(st, drain)
+    after = float(exact.head_margins(st, fixed)["storage_over"][0])
+    assert before < 0.0 <= after and float(fixed[0, 0, 3]) < 1.0
+    # The agent: L3 raises a buffer on an alarm and resets each episode, and
+    # an update trains the actor through the safety gradient and mapping
+    # penalty.
+    agent = PEARLAgent(STATE_DIM, ACTION_DIM, use_context=False,
+                       apn=MultiHeadAPN().to(device))
+    env = PlantFermentationEnv(max_steps=30)
+    o = env.reset()
+    agent.clear_z()
+    rep = MultiTaskReplayBuffer(STATE_DIM, ACTION_DIM)
+    ep_obs, ep_act = [], []
+    done = False
+    while not done:
+        act, _ = agent.select_action(o, deterministic=False)
+        o2, r, done, info = env.step(act)
+        agent.observe_step(o2, info)
+        rep.add(0, o, act, r, o2, done, np.zeros(TASK_CONTEXT_DIM))
+        ep_obs.append(o)
+        ep_act.append(act)
+        o = o2
+    calls = agent.proj_counts()[0]
+    assert calls == env.time_step_count // env.control_action_interval
+    agent.observe_step(o, {"violation_counts": {3: 1},
+                           "storage_overflow_violation": 0.1})
+    assert agent._shield_backoff.offsets()[3] > 0.0
+    assert agent._shield_backoff.floor[3] > 0.0
+    agent.clear_z()
+    assert agent._shield_backoff.offsets()[3] == 0.0 and agent._shield_last is None
+    stats = agent.update(rep, batch_size=8, context_size=CTX, min_buffer=1)
+    assert np.isfinite(stats["safety_loss"]) and np.isfinite(stats["map_loss"])
+    assert stats["safety_loss"] > 0.0
+    # The KineticNet refresh on the policy's own states, and the refined
+    # weights reaching a worker's agent and a checkpoint.
+    from metarl.apn.refiner import APNRefiner
+    agent.enable_refiner(every=1, episodes_per_step=1)
+    agent.refiner = APNRefiner(agent.kinetic, device, every=1, n_label=12,
+                               steps=2, data_path="")
+    w0 = [p.detach().clone() for p in agent.kinetic.parameters()]
+    assert agent.observe_episode(np.stack(ep_obs), np.stack(ep_act))
+    assert any(not torch.equal(a_, b_) for a_, b_ in
+               zip(w0, agent.kinetic.parameters())), "the refresh moved nothing"
+    worker = PEARLAgent(STATE_DIM, ACTION_DIM, use_context=False,
+                        apn=MultiHeadAPN().to(device))
+    worker.load_rollout_weights(agent.rollout_weights())
+    with tempfile.TemporaryDirectory() as d:
+        agent.save(os.path.join(d, "a.pth"))
+        loaded = PEARLAgent(STATE_DIM, ACTION_DIM, use_context=False,
+                            apn=MultiHeadAPN().to(device))
+        loaded.load(os.path.join(d, "a.pth"))
+    for other in (worker, loaded):
+        assert all(torch.equal(a_, b_) for a_, b_ in zip(
+            agent.kinetic.parameters(), other._apn_r.kinetic.parameters()))
+    print(f"  APN OK (Safe PPO's heads; the projection never moves a locked "
+          f"dimension and repairs storage overflow {before:+.3f} -> "
+          f"{after:+.3f}; L3 buffers alarm and reset; KineticNet refreshed "
+          f"and carried to workers and checkpoints; safety gradient "
+          f"{stats['safety_loss']:.4f}, mapping penalty "
+          f"{stats['map_loss']:.4f})")
 
 
 def check_branched_rollouts_and_pool():
     """Branched held-out rollouts equal from-scratch ones; workers match."""
-    from metarl.apn.network import load_apn
     env = make_env()
-    try:
-        usable = load_apn(strict=False, device=torch.device("cpu")) is not None
-    except SystemExit:          # a shield trained for another plant
-        usable = False
-    agent = (_build_agent(env, "saferl") if usable
-             else PEARLAgent(STATE_DIM, ACTION_DIM, use_context=False))
+    agent = _build_agent(env, "saferl", quiet=True)
     tasks = make_task_pool(2, seed=5)
     faults = (("feed_gain", 1.4, "rotate"), ("downstream_rate", 0.6, None))
     onset = env.max_steps // 2
@@ -1345,10 +1415,6 @@ def check_branched_rollouts_and_pool():
     assert np.isfinite(ho["score"]) and set(ho["panel"]) and np.isclose(
         ho["undisturbed_score"], ho["undisturbed_on_spec_ethanol"]
         - violation_price() * ho["undisturbed_violations"])
-    if not usable:
-        print("  branched rollouts OK (no APN checkpoint for this plant: "
-              "worker pool skipped)")
-        return
     t0 = time.time()
     pool = RolloutPool("saferl", 2)
     sched = [("feed_gain", 50, 1.3, 1)]

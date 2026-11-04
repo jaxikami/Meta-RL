@@ -68,6 +68,9 @@ class MetaPlantMixin:
         self._step_events = np.zeros(n, dtype=np.int64)
         self._pre_M = np.zeros(n)
         self._pre_titer = np.zeros(n)
+        # The environment carries its Lagrange multipliers across episodes;
+        # True zeroes them at every reset (RESET_LAMBDAS_PER_EPISODE).
+        self.reset_lambdas_per_episode = False
 
     def _finish_meta_init(self, max_steps=None):
         """Flat dimensions; ``max_steps`` shortens the horizon (tests only)."""
@@ -105,6 +108,8 @@ class MetaPlantMixin:
 
     def reset(self):
         """Install the task, reset the plant; returns the flat observation."""
+        if self.reset_lambdas_per_episode:
+            self._zero_lambdas()
         self._install_task(self.fixed_task if self.fixed_task is not None
                            else nominal_task())
         super().reset()

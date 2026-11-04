@@ -2,9 +2,9 @@
 
     arm       multi-task + latent z   Lagrangian   stage mask   APN
     -----------------------------------------------------------------------
-    saferl          no                   yes          yes       hard: reactor overflow /
-                                                                underflow, storage overflow
-    meta           yes                   yes          yes       hard: the same shield
+    saferl          no                   yes          yes       hard: Safe PPO's multi-head APN
+    meta           yes                   yes          yes       hard: the same APN, from
+                                                                saferl's refined KineticNet
 
     ADAPT  = meta   - saferl      what meta-RL adds on top of safe RL
 
@@ -13,10 +13,10 @@ three heterogeneous reactors and a central storage tank. ``saferl`` trains
 on the single undisturbed nominal task and meets uncertainty first at
 evaluation; ``meta`` trains on a fresh prior task every episode, with
 mid-episode faults on one reactor (or all, or the plant's feed tanks or its
-storage tank). Both arms run the same APN, which guards only the
-inventory constraints one control interval can keep; harvest titer, purity,
-storage underflow and the plant heat load have no shield, so there meta must
-adapt. The plant is Fermentation-PPO's (``metarl.env``), and both arms run
+storage tank). Both arms run Safe PPO's multi-head APN (``metarl.apn``):
+exact heads for the mass balances and the titer floor, learned heads for
+purity and the plant heat load, its L3 adaptation and its safety gradient.
+Faults that hide from the observation remain for meta to adapt to. The plant is Fermentation-PPO's (``metarl.env``), and both arms run
 on Safe PPO's environment. ``meta`` starts from saferl's trained policy,
 acts through it until its adaptation gate opens, and its checkpoint must be
 no worse than saferl on any held-out branch (``NO_REGRESS_*``).
@@ -29,7 +29,7 @@ Run ``python -m metarl <mode>`` from the repository root. Modes (default
 
     train_saferl       train the safe-RL arm on the nominal task
     train_meta         meta-train PEARL over the disturbed task pool
-    train_apn          train the shared action projection network
+    train_apn          generate the APN's KineticNet data and train it
     evaluate           every arm on every scenario, both metric axes
     z_informativeness  gate: does the meta arm's z carry task information
                        the actor acts on?
@@ -38,8 +38,8 @@ Run ``python -m metarl <mode>`` from the repository root. Modes (default
     all                train saferl -> meta -> evaluate -> z_informativeness
 
 Environment variables: ``PLANT_SEED`` (default 0), ``PLANT_RUN_TAG``
-(subfolder for checkpoints, logs and plots), ``PLANT_APN_PATH`` (APN
-checkpoint), ``PLANT_HELDOUT_WORKERS``, ``PLANT_DEVICE``.
+(subfolder for checkpoints, logs and plots), ``PLANT_HELDOUT_WORKERS``,
+``PLANT_DEVICE``.
 """
 
 # ─── Standard Library ─────────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ import os
 # ─── Local ────────────────────────────────────────────────────────────────────
 from metarl.env.config import (MIN_HARVEST_TITER, MIN_PRODUCT_TITER,
                                MAX_HEAT_LOAD, N_REACTORS, S_MAX, S_MIN)
-from metarl.apn.network import APN_PATH
+from metarl.apn.constants import KINETIC_PATH
 from metarl.agent.common import LATENT_DIM
 from metarl.training.config import (MODE, SEED, USE_FILM, AUX_MODE,
                                     POLICY_DIR, LOG_DIR)
@@ -73,14 +73,14 @@ def main(argv):
           f"heat load <= {MAX_HEAT_LOAD:.0f} kg CO2/h")
     print("arms: " + " | ".join(f"{a} ({ARMS[a].summary()})"
                                 for a in ARM_ORDER))
-    print(f"projection network: {APN_PATH}")
+    print(f"APN learned heads: {KINETIC_PATH}")
 
     known = {f"train_{a}": a for a in ARM_ORDER}
     if mode in known:
         _train(known[mode])
     elif mode == "train_apn":
-        from metarl.apn.train import train
-        train()
+        from metarl.training.arms import _train_kinetic
+        _train_kinetic()
     elif mode == "evaluate":
         evaluate()
     elif mode == "z_informativeness":

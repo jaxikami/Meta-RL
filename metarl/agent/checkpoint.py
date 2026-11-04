@@ -107,7 +107,17 @@ class CheckpointMixin:
             ckpt["base_actor"] = self.base_actor.state_dict()
             ckpt["gate"] = self.gate.state_dict()
             ckpt["gate_sharpness"] = self.gate_sharpness
+        # The APN's KineticNet as refined during training: the policy was
+        # trained against it, not against the one on disk.
+        if self.kinetic is not None:
+            ckpt["apn_kinetic"] = self.kinetic.state_dict()
         torch.save(ckpt, path)
+
+    def _restore_kinetic(self, path, ckpt):
+        """Install a checkpoint's refined KineticNet, if both sides have one."""
+        if self.kinetic is None or "apn_kinetic" not in ckpt:
+            return
+        self.install_kinetic(ckpt["apn_kinetic"])
 
     @staticmethod
     def _torch_load_safe(path):
@@ -196,6 +206,7 @@ class CheckpointMixin:
                 print(f"[info] adopting checkpoint gate_sharpness={stored} "
                       f"(was {self.gate_sharpness})")
                 self.gate_sharpness = float(stored)
+        self._restore_kinetic(path, ckpt)
         for key, have in (("use_safeguard", self.use_safeguard),
                           ("uses_apn", self.apn is not None),
                           ("apn_hard_project", self.apn_hard_project)):
@@ -212,8 +223,8 @@ class CheckpointMixin:
         """Start from another agent's trained policy and critics.
 
         Loads the actor, both critics and the target critic, the temperature,
-        the reward scaler and the observation statistics of a checkpoint with
-        the same ``net_config`` (a context-free agent's, whose encoder options
+        the reward scaler, the observation statistics and the APN's refined
+        KineticNet of a checkpoint with the same ``net_config`` (a context-free agent's, whose encoder options
         are not compared). FiLM projection weights stay at zero, so this agent
         acts exactly as the source for every z until training grows them.
         With the gate, the loaded policy is also its frozen base (and the
@@ -255,6 +266,7 @@ class CheckpointMixin:
             self.ret_rms.mean = float(mean)
             self.ret_rms.var = float(var)
             self.ret_rms.count = float(min(count, self.ret_rms.max_count))
+        self._restore_kinetic(path, ckpt)
         for key, have in (("use_safeguard", self.use_safeguard),
                           ("uses_apn", self.apn is not None)):
             want = ckpt.get(key)

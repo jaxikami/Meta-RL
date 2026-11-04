@@ -14,3 +14,6 @@ results/log/
 results/plot/
 
 manuscript/
+
+# metarl.apn.validate's figure (Fermentation-PPO's output folder).
+am_plot/

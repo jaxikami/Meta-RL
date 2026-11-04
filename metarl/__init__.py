@@ -4,7 +4,7 @@ Subpackages:
 
     env       the plant: kinetics, configuration, faults, instruments, ledger
     agent     the PEARL / SAC agent every arm runs
-    apn       the action projection network (the shared safety shield)
+    apn       Safe PPO's multi-head action projection network (the safety layer)
     training  arms, training, checkpoint selection, evaluation and figures
 
 Run the study with ``python -m metarl <mode>`` (modes in

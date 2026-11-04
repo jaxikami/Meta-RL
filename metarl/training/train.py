@@ -17,7 +17,8 @@ except ImportError:                                    # pragma: no cover
 from metarl.env.config import nominal_task, sample_task, N_REACTORS
 from metarl.agent.common import LATENT_DIM, device
 from metarl.agent.replay import MultiTaskReplayBuffer
-from metarl.training.config import (SEED, N_TRAIN_TASKS, META_ITERATIONS,
+from metarl.training.config import (APN_REFINE_EVERY, APN_REFINE_EPISODES,
+                                    SEED, N_TRAIN_TASKS, META_ITERATIONS,
                                     META_HOLDOUT_KINDS,
                                     COLLECT_EPISODES_PER_ITER,
                                     META_COLLECT_EPISODES_PER_ITER,
@@ -70,7 +71,8 @@ from metarl.training.plots import plot_training_curves
 # update does not report one (None: always reported).
 _UPDATE_STATS = (("critic_loss", None), ("actor_loss", None), ("kl", None),
                  ("aux_loss", None), ("fault_cls_loss", 0.0),
-                 ("map_loss", 0.0), ("anchor_loss", 0.0),
+                 ("map_loss", 0.0), ("safety_loss", 0.0),
+                 ("anchor_loss", 0.0),
                  ("anchor_gap_nominal", float("nan")),
                  ("anchor_gap_fault", float("nan")),
                  ("gate_loss", float("nan")), ("gate_nominal", float("nan")),
@@ -165,6 +167,7 @@ def _train(arm):
     seed_everything(SEED)
     env = make_arm_env(spec)
     agent = _build_agent(env, spec, train_apn_if_missing=True)
+    agent.enable_refiner(APN_REFINE_EVERY, APN_REFINE_EPISODES, seed=SEED)
     replay = MultiTaskReplayBuffer(env.stateDim, env.actionDim,
                                    priv_dim=agent.critic_privileged_dim)
     rng = np.random.default_rng(SEED + 1)
@@ -307,7 +310,7 @@ def _train(arm):
 
     log_keys = ("iter", "avg_reward", "avg_violations", "critic_loss",
                 "actor_loss", "kl", "aux_loss", "fault_cls_loss", "map_loss",
-                "anchor_loss",
+                "safety_loss", "anchor_loss",
                 "alpha", "anchor_gap_nominal", "anchor_gap_fault",
                 "gate_loss", "gate_nominal", "gate_fault", "hold_loss", "stall_frac",
                 "z_norm", "proj_noop_frac", "proj_mean_steps",

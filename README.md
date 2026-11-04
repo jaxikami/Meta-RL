@@ -21,8 +21,10 @@ unconstrained baseline arm, and Standard PPO's `FermentationEnvBench` is not
 ported.
 
 What stays this study's own: the flow-only task distribution, the two arms,
-the warm-started and gated meta agent, the action projection network, and
-the selection and evaluation protocol. `metarl/env/adapter.py` puts the
+the warm-started and gated meta agent, and the selection and evaluation
+protocol. The safety layer is Safe PPO's too: its multi-head action
+projection network (`safety/`) is ported into `metarl/apn/` the same way,
+also checked by the smoke test. `metarl/env/adapter.py` puts the
 environment behind the agent's interface without changing its plant, reward
 or constraints. It flattens the per-reactor observation and sums the
 per-reactor rewards, installs a task's feeds, pump gains and leaks as the
@@ -48,8 +50,8 @@ with its leftover modules.
 
 | arm | environment | training tasks | latent z | Lagrangian duals | stage mask | action projection (APN) |
 |---|---|---|---|---|---|---|
-| `saferl` | Safe PPO's (`FermentationEnv`) | nominal only | no | yes | yes | **hard**: reactor overflow / underflow, storage overflow |
-| `meta` | Safe PPO's | fresh prior task per episode + mid-episode faults, from `saferl`'s policy, which acts until z detects a fault | yes | yes | yes | **hard**: the same shield |
+| `saferl` | Safe PPO's (`FermentationEnv`) | nominal only | no | yes | yes | **hard**: Safe PPO's multi-head APN (all seven heads, L3, safety gradient) |
+| `meta` | Safe PPO's | fresh prior task per episode + mid-episode faults, from `saferl`'s policy, which acts until z detects a fault | yes | yes | yes | **hard**: the same APN, from `saferl`'s refined KineticNet |
 
 - `ADAPT = meta − saferl`, paired. `all` trains `saferl` then `meta` and
   reports `ADAPT`.
@@ -249,36 +251,76 @@ Fermentation-PPO's kinds and evaluation scenarios (`metarl/env/disturbances.py`)
 
 ## The action projection network (APN)
 
-`metarl/apn/` (`network.py`, `data.py`, `train.py`): the lean shield, widened. It
-covers **each reactor's overflow and underflow and the storage overflow**
-(seven margins, smooth minimum) under a one-interval lookahead that
-reproduces the discharge cap, the shared feed pool drawn in reactor order and
-the tank's inflow and draw. The projection never moves a reactor's stage
-clock or a locked dimension; mask > projection > actor. The species channels
-are zeroed at its input (`SHIELD_IGNORED_CHANNELS`): no shielded margin
-depends on them, and reading them as noise cost the repair rate.
+`metarl/apn/` is Safe PPO's safety layer (Fermentation-PPO's `safety/`),
+ported with only its imports changed. Both arms run all of it, with Safe
+PPO's settings:
 
-**Storage underflow is not shielded.** Within one interval the only way to
-raise the tank is to drain a reactor already in unload. When none is, every
-action is equally unsafe, and the shield would "repair" it by shutting every
-feed, costing production for nothing. Keeping the tank supplied is decided
-tens of hours earlier, so it is left to the policy and the reward. So are
-harvest titer and purity (the observation carries no lot) and the heat load
-(it needs the kinetics; Safe PPO learns that head, `safety/kinetic.py`).
+| head | id | scope | kind | priority | moves |
+|---|---|---|---|---|---|
+| `overflow` | 1 | reactor | exact: mass after the hold ≤ 95% Mmax | 100 | LF, C5, discharge |
+| `underflow` | 2 | reactor | exact: mass after the hold ≥ 105% of the dry floor | 100 | LF, C5, discharge |
+| `storage_over` | 3 | plant | exact: tank after the hold ≤ 95% S_MAX | 100 | discharge |
+| `storage_under` | 4 | plant | exact: tank after the hold ≥ 105% S_MIN | 3 | discharge |
+| `titer_drain` | 7 | reactor | exact: no discharge below 102% of the harvest spec | 30 | discharge |
+| `purity` | 8 | reactor | learned: harvest titer if the action is held ≥ 101% of spec | 1 | clock, LF, C5 |
+| `heat` | 9 | plant | learned: smooth peak of the 10 h heat-load profile ≤ 95% of the cap | 30 | clock, LF, C5 |
 
-The network is twice the lean width (128) for its 96 inputs. Validation of
-`policy/apn_ppo_plant.pth` on 50k fresh samples: sign accuracy 0.992,
-boundary accuracy 0.971, no-op rate 1.000, safe preserved 1.000, mask drift 0;
-repair rate 0.897-0.906 across validation seeds, against a gate of 0.90.
-The repair test counts a projection as repaired only when the *smooth*
-minimum margin turns positive; on the hard constraints it repairs 97.4%, and
-the misses end within 0.3% of a limit. The shield was trained through the
-whole cosine schedule (`PATIENCE = 9000`): stopped mid-cycle, as the old
-patience did, it reached repair 0.87. `policy/apn_plant.pth` is the previous
-plant's shield and is not loaded. `metarl/apn/train.py` ranks validation
-checks on (passed every gate, score): the lean trainer ranked on score alone
-and, after an early stop on a passing check, restored an earlier check that
-failed the repair gate.
+- **L1, margins.** The exact heads are the plant's own mass-balance and titer
+  arithmetic in torch. The learned heads come from KineticNet, which reads
+  one reactor at a time (`policy/apn_kinetic.pth`, 0.144M parameters). It
+  is trained offline on vectorized-plant rollouts (`python -m
+  metarl.apn.data`, then `python -m metarl.apn.train`; `python -m metarl
+  train_apn` runs both, and training an arm runs them when the checkpoint is
+  missing). Without it the APN runs its exact heads only, as Safe PPO does.
+- **L2, projection.** A closed-form, priority-weighted minimum-norm step on
+  the short heads (three re-linearisations), then two passes on the
+  containment heads (1, 2, 3) alone. Stage-locked dimensions never move, but
+  the clock can: the purity and heat heads use it. Mask > APN > actor.
+- **L3, adaptation**, reset every episode and snapshotted with the posterior
+  for branched rollouts. `AdaptiveBackoff` raises a constraint's buffer on
+  the plant's alarms (the agent's `observe_step`, after every `env.step`),
+  and re-locates a storage or cooling capacity a fault moved from the
+  alarm's depth. `AdaptiveResidual` fits the exact heads' mass-balance
+  residual (pump gain, leak, downstream draw) by RLS.
+- **The actor's terms** (`metarl/agent/learning.py`). These are Safe PPO's
+  safety gradient (the hinge on every head's margin, weight
+  `APN_SAFETY_GRAD_WEIGHT = 1.0`) and its mapping penalty (the pull toward
+  the projected action, weighted by the worst margin,
+  `APN_PENALTY_WEIGHT = 0.01`). Both act on the actor's deterministic,
+  gate-blended action. Off-policy, the projection is recomputed in the
+  update with the static buffers (L3 belongs to an episode), where Safe PPO
+  uses the action it stored. The weights were set for PPO's
+  normalised-advantage loss and have not been recalibrated for SAC's
+  Q-scaled actor loss.
+- **KineticNet refresh** (`metarl/apn/refiner.py`, DAgger-style). It
+  relabels the policy's own (state, action) pairs and fine-tunes KineticNet
+  every `APN_REFINE_EVERY = 5` steps of `APN_REFINE_EPISODES = 10`
+  training episodes, Safe PPO's 5 PPO updates of 10 episodes each. Only the
+  training process refines. The weights reach the workers through
+  `rollout_weights` and are saved in every checkpoint (`apn_kinetic`), so
+  evaluation runs the APN the policy was trained against. `meta`'s warm
+  start loads `saferl`'s.
+
+`python -m metarl.apn.validate` on this plant, with Fermentation-PPO's
+trained KineticNet (the plants are identical), passes every check:
+- **Exact heads.** p99 mass error 1.3e-7 of Mmax.
+- **Learned heads.** On 20k fresh pairs: heat R² 0.994, harvest-titer MAE
+  0.12 g/L, purity sign 0.996.
+- **Projection.** On 720 plant states with aggressive actions, an action
+  the APN certifies violates reactor or storage overflow in 0% of cases,
+  the heat cap in 0.15% and purity in 0.13%.
+- **Safety gradient.** One step raises 85% of violated margins.
+- **Latency.** p50 21 ms per projected step on the CPU. An already-safe
+  action costs one forward pass.
+
+Safe PPO's state estimator (`safety/estimator.py`) is not ported. It
+filters sensor noise, this observation has none, and with none it returns
+the reading.
+
+The previous shield (a learned inventory-margin network,
+`policy/apn_ppo_plant.pth`) is in git history (commit `badb970` and
+before). Its checkpoint is no longer loaded, and `saferl` / `meta`
+checkpoints trained against it must be retrained.
 
 ---
 
@@ -330,10 +372,10 @@ Against Safe PPO (`../Fermentation-PPO/agents/networks.py`), parameters:
 | per-reactor history (GRU 2 × 256, attention 64 × 4, skip 128) | 0.869M | 0.869M | 0.869M (frozen) |
 | policy head | 384 → 128 → 4: 0.050M | 3 × 256 FiLM residual trunk: 0.248M | 0.248M |
 | value | 384 → 128 → 1 per reactor: 0.050M | twin token-mixer Q, 3 × 1024 trunks: 9.548M | 9.548M |
-| learned shield | KineticNet (purity, heat heads): 0.144M | APN (inventory): 0.063M | the same APN |
+| APN learned heads | KineticNet (purity, heat heads): 0.144M | the same, refined on `saferl`'s states: 0.144M | the same, from `saferl`'s: 0.144M |
 | inference | — | — | encoder 0.125M, gate 0.018M, aux and fault-kind heads 0.040M |
 | acting (policy + inference) | 0.919M | 1.117M | 1.259M |
-| trained, in all | 1.112M | 10.728M | 10.910M |
+| trained, in all | 1.112M | 10.809M | 10.991M |
 
 The policy side matches Safe PPO's: the same history module on the same
 28-channel rows, with a wider head because z modulates it. The token width
@@ -506,7 +548,7 @@ by the study's own code, over several seeds.
 | `multitask` | `multitask=False` (nominal task only) | held-out selection on the undisturbed checks only |
 | `lagrangian` | `lagrangian=False` | none: the static shaping stays |
 | `mask` | `action_mask=False` | none, but the plant has no interlock, so unmasked flows reach the shield and the plant |
-| `apn` | `apn=False` | the mapping penalty |
+| `apn` | `apn=False` | L3, the safety gradient, the mapping penalty and the KineticNet refresh |
 | `warmstart` | `warm_start=None` (from scratch) | the anchor, L2-SP decay, actor warm-up, gate and no-regression selection |
 
 The gate has no switch of its own: it is on exactly when `z` and `warmstart`
@@ -541,7 +583,7 @@ into mixins, one module per concern.
 | `metarl/agent/pearl.py` | `PEARLAgent`: the PEARL/SAC agent and its rollout copies |
 | `metarl/agent/acting.py` / `learning.py` / `checkpoint.py` | its mixins: posterior and action selection (adaptation gate, APN hooks), the update, save / load / warm start |
 | `metarl/agent/networks.py` / `replay.py` / `common.py` | token actor and critics, GRU encoder, gate; per-task replay; devices and utilities |
-| `metarl/apn/network.py` / `data.py` / `train.py` | the shield: network and projection, margin label and sampler, training and validation |
+| `metarl/apn/` | Safe PPO's multi-head APN, ported: `constants`, `kinetic` (KineticNet), `apn` (heads, projection, safety loss), `adaptation` (L3), `plant_sim`, `data` / `train` / `refiner` / `validate` / `validation_plots` |
 | `metarl/training/config.py` | every setting of the study (`NET_*`, `SELECT_*`, fault ranges, scenarios, output paths) |
 | `metarl/training/cli.py` | the modes behind `python -m metarl` |
 | `metarl/training/arms.py` / `train.py` / `heldout.py` / `early_stopping.py` | arms and their agents, training, held-out checks and checkpoint selection, early stopping |
@@ -561,11 +603,20 @@ prints `ALL SMOKE CHECKS PASSED`, and checks parity with
 python tests/smoke_test.py
 ```
 
-Train the shared shield (also trained automatically when an arm needs it and
-the checkpoint is missing or stale):
+Train the APN's learned heads (KineticNet; also run automatically when an
+arm trains and `policy/apn_kinetic.pth` is missing), then check the whole
+APN against the real plant:
+
+```bash
+python -m metarl.apn.data
+```
 
 ```bash
 python -m metarl.apn.train
+```
+
+```bash
+python -m metarl.apn.validate
 ```
 
 Train `saferl`, then `meta`, then evaluate and run the latent gate:
@@ -593,7 +644,6 @@ $env:PLANT_SEED=1; $env:PLANT_RUN_TAG="seed1"; python -m metarl all
 |---|---|
 | `PLANT_SEED` | training and evaluation seed (default 0) |
 | `PLANT_RUN_TAG` | subfolder for checkpoints, logs and figures |
-| `PLANT_APN_PATH` | APN checkpoint path (default `policy/apn_ppo_plant.pth`; `policy/apn_plant.pth` is the previous plant's) |
 | `FERMENTATION_PPO_ROOT` | Fermentation-PPO checkout for the smoke test's parity check (default `../Fermentation-PPO`) |
 | `PLANT_HELDOUT_WORKERS` | held-out worker processes; `0` or `1` runs in-process |
 | `PLANT_COLLECT_WORKERS` | `0` collects training episodes in-process instead of in the worker pool |

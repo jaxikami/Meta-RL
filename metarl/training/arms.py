@@ -5,10 +5,11 @@ import json
 import os
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.layout import SHIELD_OBS_DIM, PRIVILEGED_STATE_DIM
+from metarl.env.layout import PRIVILEGED_STATE_DIM
 from metarl.agent.common import device
 from metarl.agent.pearl import PEARLAgent
-from metarl.training.config import (APN_PENALTY_WEIGHT, SEED, NORMALIZE_REWARDS,
+from metarl.training.config import (APN_PENALTY_WEIGHT, APN_SAFETY_GRAD_WEIGHT,
+                                    APN_ADAPTATION, SEED, NORMALIZE_REWARDS,
                                     REWARD_SCALE, USE_FILM,
                                     AUX_MODE, AUX_WEIGHT, AUX_SAMPLE_FRAC,
                                     META_AUX_STATE_TARGETS, NET_ACTOR_HIDDEN,
@@ -49,7 +50,8 @@ class ArmSpec:
             action_mask: Enable the structural stage mask.
             apn: Hard shield: executed actions are projected by the APN.
             blurb: One-line description.
-            apn_soft: Soft shield: mapping penalty only, never projected.
+            apn_soft: Soft shield: the APN's safety gradient and mapping
+                penalty only, never projected.
             warm_start: Key of an arm whose trained checkpoint this arm starts
                 from; it is then anchored to that policy, selected against it
                 (NO_REGRESS_*) and, with context, gated (GATE_*).
@@ -89,7 +91,7 @@ ARMS = {
         lagrangian=True, action_mask=True, apn=True, apn_soft=False,
         warm_start="saferl",
         blurb="meta-RL across fresh disturbed regimes: duals + stage mask + "
-              "inventory shield + latent task inference, from saferl's "
+              "action projection + latent task inference, from saferl's "
               "policy, which acts until the latent detects a fault"),
 }
 
@@ -121,28 +123,50 @@ def get_arm(arm):
     return ARMS[arm]
 
 
-def _load_apn_for(spec, obs_dim, action_dim, train_if_missing=False):
-    """Load the shared projection network when the arm calls for one."""
+def _train_kinetic():
+    """Generate the learned heads' data and fit KineticNet (Safe PPO's recipe)."""
+    from metarl.apn.data import DATA_PATH, generate
+    from metarl.apn.train import run_pretraining
+    if not os.path.exists(DATA_PATH):
+        generate(seed=SEED)
+    run_pretraining(seed=SEED)
+
+
+def _load_apn_for(spec, train_if_missing=False, quiet=False):
+    """The APN when the arm calls for one: Safe PPO's multi-head APN.
+
+    Without a trained KineticNet (``policy/apn_kinetic.pth``) it is trained
+    first when ``train_if_missing``; otherwise the APN runs its exact heads
+    only, as Safe PPO does.
+    """
     if not (spec.apn or spec.apn_soft):
         return None
-    if train_if_missing:
-        from metarl.apn.train import ensure_apn
-        return ensure_apn(obs_dim=obs_dim, action_dim=action_dim,
-                          seed=SEED).to(device)
-    from metarl.apn.network import load_apn
-    return load_apn(obs_dim=obs_dim, action_dim=action_dim, device=device,
-                    strict=True)
+    from metarl.apn.apn import KINETIC_PATH, MultiHeadAPN
+    if train_if_missing and not os.path.exists(KINETIC_PATH):
+        print(f"[apn] no KineticNet at {KINETIC_PATH}: generating its data "
+              f"and training it")
+        _train_kinetic()
+    apn = MultiHeadAPN().to(device)
+    if not apn.load_kinetic(map_location=device):
+        if not quiet:
+            print(f"WARNING: {KINETIC_PATH} not found (run python -m "
+                  f"metarl.apn.data, then python -m metarl.apn.train); the "
+                  f"APN runs its exact heads only.")
+        apn = MultiHeadAPN(use_kinetic=False).to(device)
+    return apn
 
 
-def _build_agent(env, arm, train_apn_if_missing=False):
+def _build_agent(env, arm, train_apn_if_missing=False, quiet=False):
     """Construct the agent for one arm."""
     spec = get_arm(arm)
-    apn = _load_apn_for(spec, SHIELD_OBS_DIM, env.actionDim,
-                        train_if_missing=train_apn_if_missing)
+    apn = _load_apn_for(spec, train_if_missing=train_apn_if_missing,
+                        quiet=quiet)
     kwargs = dict(reward_scale=REWARD_SCALE, normalize_rewards=NORMALIZE_REWARDS,
                   alpha_min=ALPHA_MIN,
                   use_film=USE_FILM, use_safeguard=spec.action_mask,
                   apn=apn, apn_penalty_weight=APN_PENALTY_WEIGHT,
+                  apn_safety_grad_weight=APN_SAFETY_GRAD_WEIGHT,
+                  apn_adaptation=APN_ADAPTATION,
                   apn_hard_project=spec.apn,
                   actor_hidden=NET_ACTOR_HIDDEN, critic_hidden=NET_CRITIC_HIDDEN,
                   critic_token_hidden=NET_CRITIC_TOKEN_HIDDEN,

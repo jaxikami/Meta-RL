@@ -48,6 +48,7 @@ def _z_rollout(env, agent, task, disturbance=None, z_mode="mean", fixed_z=None,
             safe_a, _ = agent.select_action(state, deterministic=True)
             gates.append(agent.last_gate)
             next_state, r, done, info = env.step(safe_a)
+            agent.observe_step(next_state, info)
             agent.update_context(state, safe_a, r, next_state)
             state = next_state
             total_r += r

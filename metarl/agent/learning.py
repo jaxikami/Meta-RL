@@ -2,8 +2,9 @@
 
 The actor's per-reactor history features, then the critics (whose loss also
 trains the history module unless it is frozen), encoder, auxiliary head and
-gate detector, then the actor (with the APN mapping penalty and the
-warm-start anchor; it reads the history detached), then the temperature.
+gate detector, then the actor (with the APN's safety gradient and mapping
+penalty and the warm-start anchor; it reads the history detached), then the
+temperature.
 """
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
@@ -17,9 +18,12 @@ from metarl.env.config import MIN_HARVEST_TITER, TITER_SCALE
 from metarl.env.faults import N_DISTURBANCE_KINDS
 from metarl.env.layout import ETHANOL_CHANNELS, STAGE_CHANNELS, reactor_action
 from metarl.env.plant import DISCHARGE_CUTOFF
-from metarl.apn.network import project_to_safe
 from metarl.agent.common import device, LOG_ALPHA_MAX, ENTROPY_TERM_CLIP
 from metarl.agent.replay import WINDOW_CHUNK_LEN, _to_device, _as_long
+
+# MultiHeadAPN.safety_loss()'s hinge, per sample so the gate can weight it.
+SAFETY_SHARPNESS = 50.0
+SAFETY_EPS = 1e-3
 
 # Pre-tanh outlet command whose flow fraction (tanh + 1) / 2 is half the cutoff.
 HOLD_PRE_TANH_TARGET = float(np.arctanh(DISCHARGE_CUTOFF - 1.0))
@@ -251,8 +255,8 @@ class LearningMixin:
         The lean agent's update: the sampled tasks are trained as ONE batch
         (one optimizer step per network and one Polyak update), the critic
         and encoder first (with the KL, auxiliary and gate losses), then the
-        actor (SAC loss, APN mapping penalty, warm-start anchor, all
-        gate-weighted behind the gate), then the temperature.
+        actor (SAC loss, APN safety gradient and mapping penalty, warm-start
+        anchor, all gate-weighted behind the gate), then the temperature.
 
         Returns:
             Dict of scalar diagnostics (empty when ``want_stats`` is False),
@@ -431,6 +435,7 @@ class LearningMixin:
         actor_loss = torch.full((), float("nan"), device=device)
         alpha_loss = torch.zeros((), device=device)
         map_pen = torch.zeros((), device=device)
+        safety_pen = torch.zeros((), device=device)
         anchor_pen = torch.zeros((), device=device)
         hold_pen = torch.zeros((), device=device)
         nan = torch.full((), float("nan"), device=device)
@@ -451,20 +456,35 @@ class LearningMixin:
             actor_loss = batch_mean(self.alpha.detach() * logp_pi
                                     - torch.min(q1_pi, q2_pi))
 
-            # ── 2b. Margin-weighted APN mapping penalty ──────────────────────
-            if self.apn is not None and self.apn_penalty_weight > 0.0:
-                with torch.no_grad():
-                    mask_pi = self._stage_mask(o)
-                    s_obs = self._shield_obs(self.apn, o)
-                    a_safe, _ = project_to_safe(self.apn, s_obs,
-                                                a_pi.detach(),
-                                                stage_mask=mask_pi)
-                    a_safe = self._apply_safety(o, a_safe, mask=mask_pi)
-                    margin_pi = self.apn(s_obs, a_pi.detach())
-                    w_unsafe = torch.clamp(-margin_pi, min=0.0) + 0.1
-                map_pen = batch_mean((a_pi - a_safe).pow(2).mean(dim=-1)
-                                     * w_unsafe)
-                actor_loss = actor_loss + self.apn_penalty_weight * map_pen
+            # ── 2b. APN safety gradient and mapping penalty ──────────────────
+            # Safe PPO's two terms, on the actor's deterministic action as it
+            # would be sent before projection: the hinge on every head's
+            # margin, backpropagated through the frozen APN, and the pull
+            # toward that action's projection, weighted by its worst margin.
+            # Off-policy, the projection is recomputed here (static buffers:
+            # L3 lives in the episode).
+            if self.apn is not None and (self.apn_penalty_weight > 0.0
+                                         or self.apn_safety_grad_weight > 0.0):
+                a_det, _, _ = self._safe_sample(o, feat_d, zd,
+                                                deterministic=True,
+                                                with_logprob=False,
+                                                gate=gate_act)
+                s_rows, a_rows = self._rows(o), self._rows(a_det)
+                if self.apn_safety_grad_weight > 0.0:
+                    m = self.apn.margins(s_rows, a_rows)
+                    hinge = F.softplus(SAFETY_SHARPNESS * (SAFETY_EPS - m)) / SAFETY_SHARPNESS
+                    safety_pen = batch_mean(hinge.mean(dim=-1))
+                    actor_loss = actor_loss + self.apn_safety_grad_weight * safety_pen
+                if self.apn_penalty_weight > 0.0:
+                    with torch.no_grad():
+                        m = self.apn.margins(s_rows, a_rows.detach())
+                        w_unsafe = torch.clamp(-m.min(dim=1).values, min=0.0) + 0.1
+                        a_safe, _ = self.apn.project(s_rows, a_rows.detach())
+                        a_safe = self._apply_safety(
+                            o, a_safe.reshape(a_det.shape))
+                    map_pen = batch_mean((a_det - a_safe).pow(2).mean(dim=-1)
+                                         * w_unsafe)
+                    actor_loss = actor_loss + self.apn_penalty_weight * map_pen
 
             # ── 2c. Anchor to the warm-start policy ──────────────────────────
             if self.anchor_actor is not None and self._anchor_active():
@@ -536,6 +556,7 @@ class LearningMixin:
             "aux_loss": float(aux_loss.detach()),
             "fault_cls_loss": float(fault_cls_loss.detach()),
             "map_loss": float(map_pen.detach()),
+            "safety_loss": float(safety_pen.detach()),
             "anchor_loss": float(anchor_pen.detach()),
             "hold_loss": float(hold_pen.detach()),
             "stall_frac": float(stall_any.mean()),

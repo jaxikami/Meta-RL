@@ -4,7 +4,8 @@ The lean study's agent (``MetaRL_Lean/agent_pearl.py``), with networks built
 for a plant of three reactors and a shared storage tank. One class serves
 every arm: ``use_context=False`` gives a non-adaptive agent (z == 0, no
 encoder), ``use_safeguard`` toggles the structural stage mask, and ``apn`` /
-``apn_hard_project`` attach the action-projection shield.
+``apn_hard_project`` attach Safe PPO's multi-head action projection network
+(``metarl.apn``: projection, L3 adaptation, safety gradient).
 
 Kept from the lean agent, unchanged in behaviour:
 
@@ -56,6 +57,7 @@ from metarl.agent.common import (device, ROLLOUT_DEVICE, _on_rollout_device,
                                  RunningMeanStd, RunningObsNorm, _adamw)
 from metarl.agent.networks import (RecurrentContextEncoder, TanhGaussianActor,
                                    Critic, AuxHead, AdaptGate)
+from metarl.apn.adaptation import AdaptiveBackoff, AdaptiveResidual
 from metarl.agent.acting import ActingMixin
 from metarl.agent.learning import LearningMixin
 from metarl.agent.checkpoint import CheckpointMixin
@@ -82,6 +84,7 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
                  use_film=True, aux_mode="reward", aux_weight=1.0,
                  aux_sample_frac=1.0,
                  apn=None, apn_penalty_weight=0.01, apn_hard_project=True,
+                 apn_safety_grad_weight=1.0, apn_adaptation=True,
                  actor_hidden=256, critic_hidden=1024, net_depth=3,
                  layer_norm=True, residual=True, obs_norm=True,
                  encoder_layer_norm=True, weight_decay=1e-2,
@@ -179,9 +182,22 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         self.ret_rms = RunningMeanStd(max_count=reward_window) if normalize_rewards else None
         self.use_context = use_context
         self.use_safeguard = use_safeguard
+        # The APN (``metarl.apn.apn.MultiHeadAPN``) is frozen; only its
+        # KineticNet moves, refreshed by ``refiner`` (training process only).
         self.apn = apn
+        if self.apn is not None:
+            self.apn.eval()
+            for p in self.apn.parameters():
+                p.requires_grad_(False)
         self.apn_penalty_weight = float(apn_penalty_weight)
+        self.apn_safety_grad_weight = float(apn_safety_grad_weight)
         self.apn_hard_project = bool(apn_hard_project)
+        self.apn_adaptation = bool(apn_adaptation)
+        self.refiner = None
+        self._refine_episodes = 0
+        self._shield_backoff = AdaptiveBackoff()
+        self._shield_residual = AdaptiveResidual(N_REACTORS)
+        self._shield_last = None
         self._proj_calls = self._proj_noop = self._proj_steps = 0
         self._proj_moved = 0
         self.use_film = use_film
@@ -411,6 +427,9 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
             "gate_sharpness": self.gate_sharpness,
             "ret_rms": (None if self.ret_rms is None else
                         (self.ret_rms.mean, self.ret_rms.var, self.ret_rms.count)),
+            # The shield as refined so far: a worker's is built from disk.
+            "apn_kinetic": (None if self.kinetic is None
+                            else to_np(self.kinetic)),
         }
 
     def load_rollout_weights(self, weights):
@@ -436,4 +455,64 @@ class PEARLAgent(ActingMixin, LearningMixin, CheckpointMixin):
         if self.ret_rms is not None and weights["ret_rms"] is not None:
             self.ret_rms.mean, self.ret_rms.var, self.ret_rms.count = (
                 float(v) for v in weights["ret_rms"])
+        if weights.get("apn_kinetic") is not None and self.kinetic is not None:
+            self.install_kinetic(as_t(weights["apn_kinetic"]))
         self._mark_rollout_stale()
+
+    # ------------------------------------------------- the APN's KineticNet
+
+    @property
+    def kinetic(self):
+        """The APN's KineticNet (its learned heads), or None."""
+        return None if self.apn is None else self.apn.kinetic
+
+    def install_kinetic(self, state_dict):
+        """Load KineticNet weights into the APN and its rollout copy."""
+        self.kinetic.load_state_dict(state_dict)
+        if self._apn_r is not self.apn:
+            self._apn_r.kinetic.load_state_dict(
+                {k: v.cpu() for k, v in state_dict.items()})
+
+    def enable_refiner(self, every, episodes_per_step, seed=0):
+        """Refresh KineticNet on this agent's own states while it trains.
+
+        Safe PPO's DAgger refresh (``metarl.apn.refiner``): it relabels the
+        policy's (state, action) pairs in the vectorized plant and fine-tunes
+        KineticNet on them every ``every`` refiner steps. A step is
+        ``episodes_per_step`` training episodes, Safe PPO's rollout per PPO
+        update. Only the training process refines; its workers receive the
+        weights with ``rollout_weights``.
+        """
+        if self.kinetic is None or every <= 0:
+            return
+        from metarl.apn.refiner import APNRefiner
+        self.refiner = APNRefiner(self.kinetic, device, every=int(every),
+                                  seed=seed)
+        self._refine_per_step = int(episodes_per_step)
+        self._refine_episodes = 0
+
+    def observe_episode(self, observations, actions):
+        """Hand one training episode's (state, executed action) to the refiner.
+
+        Args:
+            observations: Flat observations the actions were chosen on,
+                [T, STATE_DIM].
+            actions: Executed actions, [T, ACTION_DIM].
+
+        Returns:
+            True if KineticNet was refreshed.
+        """
+        if self.refiner is None:
+            return False
+        obs = np.asarray(observations, dtype=np.float32)
+        act = np.asarray(actions, dtype=np.float32)
+        self.refiner.add(obs.reshape(len(obs), N_REACTORS, -1),
+                         act.reshape(len(act), N_REACTORS, -1))
+        self._refine_episodes += 1
+        if self._refine_episodes % self._refine_per_step:
+            return False
+        if not self.refiner.step():
+            return False
+        if self._apn_r is not self.apn:
+            self.install_kinetic(self.kinetic.state_dict())
+        return True

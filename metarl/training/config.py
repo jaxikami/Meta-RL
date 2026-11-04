@@ -80,7 +80,20 @@ HELDOUT_Z_MODE = "mean"
 NORMALIZE_REWARDS = True
 REWARD_SCALE = 1.0
 RESET_LAMBDAS_PER_EPISODE = True
+
+# ─── The APN (Safe PPO's safety layer, metarl/apn) ───────────────────────────
+# Safe PPO's settings (agents/safe.py): the mapping penalty (MAPPING_COEF)
+# and the safety gradient (SAFETY_GRAD_COEF) in the actor's loss, and the
+# DAgger refresh of KineticNet every APN_REFINE_EVERY PPO updates
+# (REFINE_EVERY), a PPO update being APN_REFINE_EPISODES training episodes
+# (its update_timestep). Set for PPO's normalised-advantage loss, not
+# recalibrated for SAC's Q-scaled actor loss.
 APN_PENALTY_WEIGHT = 0.01
+APN_SAFETY_GRAD_WEIGHT = 1.0
+APN_REFINE_EVERY = 5
+APN_REFINE_EPISODES = 10
+# L3: buffers raised by the plant's alarms and the RLS mass-balance residual.
+APN_ADAPTATION = True
 
 # ─── Agent: posterior-collapse countermeasures (the lean study's) ────────────
 # AUX_MODE = "task" regresses the TRUE task descriptor from z: privileged,

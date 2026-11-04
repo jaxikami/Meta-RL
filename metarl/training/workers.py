@@ -34,7 +34,7 @@ def _worker_agent(arm, weights):
     """This worker's environment and agent for ``arm``, with ``weights`` installed."""
     if arm not in _WORKER_AGENTS:
         env = make_arm_env(ARMS[arm])
-        _WORKER_AGENTS[arm] = (env, _build_agent(env, arm))
+        _WORKER_AGENTS[arm] = (env, _build_agent(env, arm, quiet=True))
     env, agent = _WORKER_AGENTS[arm]
     agent.load_rollout_weights(weights)
     return env, agent

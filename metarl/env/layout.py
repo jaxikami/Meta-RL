@@ -11,7 +11,7 @@ environment's flattened action.
 import numpy as np
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.config import (N_REACTORS, N_SPECIES, I_ETH, R_STAGE,
+from metarl.env.config import (N_REACTORS, I_ETH, R_STAGE,
                                R_STORAGE, R_LF, R_C5, REACTOR_OBS_DIM)
 
 # ─── Observation layout (see config) ──────────────────────────────────────────
@@ -35,12 +35,6 @@ STORAGE_CHANNEL = reactor_channel(0, R_STORAGE)
 LF_CHANNEL = reactor_channel(0, R_LF)
 C5_CHANNEL = reactor_channel(0, R_C5)
 
-# The action projection network reads the whole observation but for the
-# species channels: none of its margins depends on them.
-SHIELD_OBS_DIM = STATE_DIM
-SHIELD_IGNORED_CHANNELS = tuple(reactor_channel(i, c) for i in range(N_REACTORS)
-                                for c in range(N_SPECIES))
-
 # Width of PlantFermentationEnv.privileged_state(): the observation, then
 # each reactor's lot in progress (mass, mean titer: the observation has no
 # lot channel), then the elapsed share of the episode.
@@ -48,7 +42,7 @@ PRIVILEGED_STATE_DIM = STATE_DIM + 2 * N_REACTORS + 1
 PRIV_LOT_MASS = STATE_DIM
 PRIV_LOT_TITER = STATE_DIM + N_REACTORS
 
-# Action dimensions the projection never moves: each reactor's stage clock.
+# Each reactor's stage clock (time multiplier).
 TIME_ACTION_DIMS = tuple(i * ACTION_DIM_PER_REACTOR for i in range(N_REACTORS))
 
 

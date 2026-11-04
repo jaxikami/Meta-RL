@@ -30,7 +30,8 @@ def _on_rollout_device(module):
     """Return ``module`` if it already lives on ROLLOUT_DEVICE, else a copy there."""
     if module is None:
         return None
-    if next(module.parameters()).device.type == ROLLOUT_DEVICE.type:
+    p = next(module.parameters(), None)
+    if p is None or p.device.type == ROLLOUT_DEVICE.type:
         return module
     return copy.deepcopy(module).to(ROLLOUT_DEVICE)
 

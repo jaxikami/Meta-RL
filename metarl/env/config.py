@@ -104,6 +104,26 @@ C_LF_BASE = get_C_LF()
 BASE_CREDITS = np.array([10.0, 60.0, 120.0, 70.0, 2.0])
 TIME_STEP_DURATION = 3600.0
 MAX_FLOW_OUT_REAC = 5000.0 / 3600.0
+# RK4 sub-steps per 1-hour inner step, and inner steps an action is held for.
+N_INNER_STEPS = 30
+CONTROL_ACTION_INTERVAL = 5
+
+# ─── Batch Recipe and Vessel Floors ───────────────────────────────────────────
+# Every batch starts from a 10 t charge inoculated with 1 t of 147 g/kg yeast.
+CHARGE_MASS_KG = 10000.0
+INIT_CELL_CONC = (1000 * 147.0) / 10000.0
+# A reactor drains at most down to this mass (CO2 loss during the step could
+# otherwise push it below the dry floor).
+DISCHARGE_FLOOR_KG = 50.0
+# Unload (stage 3) ends only once the reactor holds less than this.
+UNLOAD_COMPLETE_KG = 100.0
+# Reactor underflow (violation id 2) is measured against the dry floor.
+DRY_FLOOR_KG = 10.0
+
+# ─── Observation Normalisation (get_state_norm) ───────────────────────────────
+M_NORM = 220000.0                    # kg, reactor capacity
+FLF_NORM = 2487.0 / 3600.0 * 4.0     # kg/s, largest LF pump
+FC5_NORM = 628.0 / 3600.0 * 4.0      # kg/s, largest C5 pump
 
 # ─── Product Quality Specification ───────────────────────────────────────────
 # The Meta-RL plant's concentration constraints (same chemistry and units as

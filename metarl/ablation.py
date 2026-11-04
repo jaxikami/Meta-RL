@@ -66,9 +66,10 @@ Protocol:
     Every variant and the seed's saferl are evaluated on ``evaluate``'s
     scenarios and task pools (their first ``--eval-episodes`` tasks), so
     within a seed every result is paired per task.
-    Violations are events (see the README); severity is the worst exceedance
-    of each depth constraint over every scenario and episode, as a percentage
-    of its limit. Each delta against full is paired within a seed; a seed
+    The figures read the violation burden B and the net production Pi
+    (``metarl.training.metrics``; docs/evaluation_metrics.md); the CSV also
+    keeps violation events and each depth constraint's worst exceedance (% of
+    its limit). Each delta against full is paired within a seed; a seed
     counts as "worse" or "better" only when its paired 95% interval excludes
     zero and the gap is not negligible (the evaluation's SIG rule).
 
@@ -91,9 +92,9 @@ Outputs:
     results/log/<tag>/summary.csv          per (config, scenario): mean and
                                            std over seeds, paired deltas vs full
     results/plot/<tag>/ablation_curves.png     held-out learning curves vs full
-    results/plot/<tag>/ablation_final.png      violations and on-spec ethanol
-                                               per scenario, against full
-    results/plot/<tag>/ablation_severity.png   worst exceedance per constraint
+    results/plot/<tag>/ablation_final.png      violation burden and net
+                                               production per scenario,
+                                               against full
 
 A run whose record holds an evaluation is skipped, so re-running the same
 command resumes the study. A trained run without one (or evaluated with a
@@ -296,7 +297,9 @@ EVAL_KEYS = ("violations", "violations_std", "violations_median",
              "lot_pass_rate", "batches", "storage_min", "storage_max",
              "yield_per_feed", "z_snr", "proj_calls", "proj_moved_frac",
              "gate_pre", "gate_post", "fault_reactor_per_ep", "viol_per_ep",
-             "on_spec_ethanol_per_ep")
+             "on_spec_ethanol_per_ep", "burden", "burden_std",
+             "burden_by_constraint", "burden_per_ep", "score", "score_std",
+             "score_per_ep")
 
 
 def _compact(res):
@@ -407,9 +410,10 @@ def _run(name, eval_episodes, budget, eval_only):
              else f"trained in {record['train']['hours']:.2f} h "
                   f"({record['train']['iterations']} iterations)") + ":")
     for sc, e in record["eval"].items():
-        print(f"  {sc:<26}{e['violations']:>8.2f} viol/ep  "
+        print(f"  {sc:<26}{e['burden']:>8.2f} B  "
               f"{e['episodes_violated_pct']:>6.1f}% eps violated  "
-              f"{e['on_spec_ethanol']:>11.3e} on-spec eth")
+              f"{e['on_spec_ethanol']:>11.3e} on-spec eth  "
+              f"{e['score']:>11.3e} Pi")
 
 
 # ─── Scheduling (driver) ──────────────────────────────────────────────────────
@@ -516,8 +520,21 @@ def run_jobs(jobs, settings):
 
 # ─── Aggregation ──────────────────────────────────────────────────────────────
 
-SCENARIO_METRICS = ("violations", "episodes_violated_pct", "on_spec_ethanol",
-                    "mean_titer", "lot_pass_rate", "peak_violation_pct")
+SCENARIO_METRICS = ("burden", "score", "violations", "episodes_violated_pct",
+                    "on_spec_ethanol", "mean_titer", "lot_pass_rate",
+                    "peak_violation_pct")
+# Paired axes against full: per-episode key, and whether higher is better.
+# A higher-is-better delta reads as % of full's on-spec ethanol (net
+# production can sit near zero), a lower-is-better one in its own units.
+PAIRED_AXES = {"viol": ("viol_per_ep", False),
+               "eth": ("on_spec_ethanol_per_ep", True),
+               "burden": ("burden_per_ep", False),
+               "score": ("score_per_ep", True)}
+
+
+def _delta_key(axis):
+    """The summary field of one paired axis's mean delta against full."""
+    return f"d_{axis}_vs_full" + ("_pct" if PAIRED_AXES[axis][1] else "")
 TRAIN_METRICS = (("train_hours", "hours"), ("train_iterations", "iterations"))
 
 
@@ -550,34 +567,34 @@ def _paired_vs_full(runs, full_by_seed, scenario):
     """Per-seed paired deltas of a config against full on one scenario.
 
     Returns:
-        Dict: seeds paired, mean (over seeds) violation delta and relative
-        on-spec ethanol delta (variant - full), and how many seeds were
-        significantly worse or better on each axis.
+        Dict: per PAIRED_AXES axis, the mean (over seeds) delta variant - full
+        (``_delta_key``), and how many seeds were paired and significantly
+        worse or better. An axis a record predates is skipped.
     """
-    d_viol, d_eth = [], []
-    counts = {"viol_worse": 0, "viol_better": 0, "eth_worse": 0,
-              "eth_better": 0}
+    deltas = {axis: [] for axis in PAIRED_AXES}
+    counts = {f"seeds_{axis}_{k}": 0 for axis in PAIRED_AXES
+              for k in ("paired", "worse", "better")}
     for run in runs:
         ref = full_by_seed.get(run["seed"])
         if ref is None or scenario not in ref["eval"]:
             continue
         a, b = run["eval"][scenario], ref["eval"][scenario]
-        dv = _paired_delta(a["viol_per_ep"], b["viol_per_ep"])
-        de = _paired_delta(a["on_spec_ethanol_per_ep"],
-                           b["on_spec_ethanol_per_ep"])
-        if not (dv["paired"] and de["paired"]):
-            continue
-        d_viol.append(dv["mean"])
-        d_eth.append(100.0 * de["rel"] if np.isfinite(de["rel"]) else None)
-        sv, se = _verdict_sign(dv), _verdict_sign(de)
-        counts["viol_worse"] += sv > 0
-        counts["viol_better"] += sv < 0
-        counts["eth_worse"] += se < 0
-        counts["eth_better"] += se > 0
-    return {"paired_seeds": len(d_viol),
-            "d_viol_vs_full": _aggregate(d_viol)[0],
-            "d_eth_vs_full_pct": _aggregate(d_eth)[0],
-            **{f"seeds_{k}": v for k, v in counts.items()}}
+        for axis, (key, higher) in PAIRED_AXES.items():
+            if key not in a or key not in b:
+                continue
+            d = _paired_delta(a[key], b[key],
+                              ref=b["on_spec_ethanol"] if higher else None)
+            if not d["paired"]:
+                continue
+            deltas[axis].append((100.0 * d["rel"] if np.isfinite(d["rel"])
+                                 else None) if higher else d["mean"])
+            sign = _verdict_sign(d) * (1 if higher else -1)
+            counts[f"seeds_{axis}_paired"] += 1
+            counts[f"seeds_{axis}_worse"] += sign < 0
+            counts[f"seeds_{axis}_better"] += sign > 0
+    return {"paired_seeds": counts["seeds_viol_paired"],
+            **{_delta_key(axis): _aggregate(v)[0] for axis, v in deltas.items()},
+            **counts}
 
 
 def summary_rows(results):
@@ -599,8 +616,8 @@ def summary_rows(results):
                 row[f"{key}_mean"], row[f"{key}_std"] = _aggregate(
                     [r["train"].get(field) for r in runs])
             if name == "full":
-                row.update(paired_seeds=0, d_viol_vs_full=None,
-                           d_eth_vs_full_pct=None)
+                row.update(paired_seeds=0,
+                           **{_delta_key(axis): None for axis in PAIRED_AXES})
             else:
                 row.update(_paired_vs_full(runs, full_by_seed, sc))
             rows.append(row)
@@ -615,21 +632,6 @@ def summary_rows(results):
     return rows
 
 
-def severity_by_config(results):
-    """Worst exceedance per depth constraint over every scenario and episode.
-
-    Returns:
-        Dict config -> {constraint: (mean, std) over seeds}, in percent.
-    """
-    out = {}
-    for name, runs in results.items():
-        out[name] = {c: _aggregate([max(e["peak_pct"].get(c, 0.0)
-                                        for e in r["eval"].values())
-                                    for r in runs])
-                     for c in DEPTH_NAMES}
-    return out
-
-
 def _fmt(mean, std, spec):
     """Format 'mean +- std' for the console; '-' when unavailable."""
     if mean is None:
@@ -641,7 +643,7 @@ def _fmt(mean, std, spec):
 
 def _fmt_seeds(row, axis):
     """'worse/better/paired' seed counts on one axis, '-' for full."""
-    n = row.get("paired_seeds") or 0
+    n = row.get(f"seeds_{axis}_paired") or 0
     if not n:
         return "-"
     return f"{row[f'seeds_{axis}_worse']}/{row[f'seeds_{axis}_better']}/{n}"
@@ -659,9 +661,10 @@ def summarize(tag):
     plot_dir = os.path.join("results", "plot", tag)
     os.makedirs(log_dir, exist_ok=True)
     fields = (["config", "label", "scenario", "seeds", "eth_vs_full_pct",
-               "paired_seeds", "d_viol_vs_full", "seeds_viol_worse",
-               "seeds_viol_better", "d_eth_vs_full_pct", "seeds_eth_worse",
-               "seeds_eth_better"]
+               "paired_seeds"]
+              + [f for axis in PAIRED_AXES
+                 for f in (_delta_key(axis), f"seeds_{axis}_worse",
+                           f"seeds_{axis}_better")]
               + [f"{key}_{stat}" for key in SCENARIO_METRICS
                  + tuple(f"{c}_peak_pct" for c in DEPTH_NAMES)
                  + tuple(k for k, _ in TRAIN_METRICS)
@@ -678,31 +681,30 @@ def summarize(tag):
           f"paired, by the evaluation's SIG rule)\n{'=' * W}")
     for sc in dict.fromkeys(r["scenario"] for r in rows):
         print(f"\n  {sc}")
-        print(f"  {'Config':<34}{'Seeds':>5}{'Viol/ep':>16}{'Viol eps %':>14}"
-              f"{'On-spec eth (kg)':>24}{'vs Full':>9}{'dViol':>9}"
-              f"{'w/b/n':>8}{'dEth %':>9}{'w/b/n':>8}{'Iters':>12}")
+        print(f"  {'Config':<34}{'Seeds':>5}{'Burden B':>16}{'Viol eps %':>14}"
+              f"{'On-spec eth (kg)':>24}{'vs Full':>9}{'Pi (kg)':>24}"
+              f"{'dB':>9}{'w/b/n':>8}{'dPi %':>9}{'w/b/n':>8}{'Iters':>12}")
         for row in (r for r in rows if r["scenario"] == sc):
-            d_v, d_e = row["d_viol_vs_full"], row["d_eth_vs_full_pct"]
+            d_b, d_s = row["d_burden_vs_full"], row["d_score_vs_full_pct"]
             vs = row["eth_vs_full_pct"]
             print(f"  {row['label']:<34}{row['seeds']:>5}"
-                  f"{_fmt(row['violations_mean'], row['violations_std'], '.2f'):>16}"
+                  f"{_fmt(row['burden_mean'], row['burden_std'], '.2f'):>16}"
                   f"{_fmt(row['episodes_violated_pct_mean'], row['episodes_violated_pct_std'], '.1f'):>14}"
                   f"{_fmt(row['on_spec_ethanol_mean'], row['on_spec_ethanol_std'], '.3e'):>24}"
                   f"{'-' if vs is None else f'{vs:+.1f}%':>9}"
-                  f"{'-' if d_v is None else f'{d_v:+.2f}':>9}"
-                  f"{_fmt_seeds(row, 'viol'):>8}"
-                  f"{'-' if d_e is None else f'{d_e:+.1f}':>9}"
-                  f"{_fmt_seeds(row, 'eth'):>8}"
+                  f"{_fmt(row['score_mean'], row['score_std'], '.3e'):>24}"
+                  f"{'-' if d_b is None else f'{d_b:+.2f}':>9}"
+                  f"{_fmt_seeds(row, 'burden'):>8}"
+                  f"{'-' if d_s is None else f'{d_s:+.1f}':>9}"
+                  f"{_fmt_seeds(row, 'score'):>8}"
                   f"{_fmt(row['train_iterations_mean'], row['train_iterations_std'], '.0f'):>12}")
     print(f"{'=' * W}\n")
 
     plot_curves(_load_curves(results), os.path.join(plot_dir,
                                                     "ablation_curves.png"))
     plot_final(rows, os.path.join(plot_dir, "ablation_final.png"))
-    plot_severity(severity_by_config(results),
-                  os.path.join(plot_dir, "ablation_severity.png"))
-    print(f"wrote {csv_path} and ablation_curves.png, ablation_final.png, "
-          f"ablation_severity.png in {plot_dir}")
+    print(f"wrote {csv_path} and ablation_curves.png, ablation_final.png in "
+          f"{plot_dir}")
 
 
 # ─── Plotting ─────────────────────────────────────────────────────────────────
@@ -713,9 +715,6 @@ _REF = "#898781"
 _ACCENT = "#2a78d6"
 # Diverging pair, better than full -> no difference -> worse than full.
 _BETTER, _NEUTRAL, _WORSE = "#2a78d6", "#f0efec", "#e34948"
-# Sequential blue ramp (steps 100 -> 700) for magnitudes.
-_SEQUENTIAL = ("#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf",
-               "#184f95", "#0d366b")
 CURVE_KEYS = (("heldout_undisturbed_violations", "violation events / episode",
                1.0),
               ("heldout_undisturbed_on_spec_ethanol", "on-spec ethanol (1e7 kg)",
@@ -900,13 +899,13 @@ def _heatmap(ax, values, texts, rows, cols, cmap, norm):
 
 def _consistent(row, axis):
     """Whether every paired seed was significant in the same direction."""
-    n = row.get("paired_seeds") or 0
+    n = row.get(f"seeds_{axis}_paired") or 0
     return bool(n) and (row[f"seeds_{axis}_worse"] == n
                         or row[f"seeds_{axis}_better"] == n)
 
 
 def plot_final(rows, out_path):
-    """Violations and on-spec ethanol per config and scenario, against full.
+    """Violation burden and net production per config and scenario, vs full.
 
     Each cell prints the mean over seeds and the paired delta against full
     (``*``: significant in the same direction in every seed); its color is
@@ -926,13 +925,13 @@ def plot_final(rows, out_path):
     worse_down = LinearSegmentedColormap.from_list(
         "abl_eth", (_WORSE, _NEUTRAL, _BETTER))
     panels = (
-        ("violations", "d_viol_vs_full", "viol", 1.0, "{:.2f}", "{:+.2f}",
-         worse_up, 0.5, "VIOLATION EVENTS PER EPISODE (lower is better)",
-         "paired change vs Full (events / episode)"),
-        ("on_spec_ethanol", "d_eth_vs_full_pct", "eth", 1e-7, "{:.2f}",
+        ("burden", "d_burden_vs_full", "burden", 1.0, "{:.1f}", "{:+.1f}",
+         worse_up, 1.0, "VIOLATION BURDEN B PER EPISODE (lower is better)",
+         "paired change vs Full (B / episode)"),
+        ("score", "d_score_vs_full_pct", "score", 1e-7, "{:.2f}",
          "{:+.1f}%", worse_down, 2.0,
-         "ON-SPEC ETHANOL, 1e7 kg (higher is better)",
-         "paired change vs Full (%)"),
+         "NET PRODUCTION Pi, 1e7 kg (higher is better)",
+         "paired change vs Full\n(% of Full's on-spec ethanol)"),
     )
     fig, axs = plt.subplots(2, 1, figsize=(max(9.0, 1.15 * len(scenarios) + 3.5),
                                            2 * (1.6 + 0.5 * len(configs))),
@@ -973,41 +972,6 @@ def plot_final(rows, out_path):
                  "delta vs Full beneath (* = significant in every seed)",
                  fontweight="bold", fontsize=12, color=PLOT_INK)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def plot_severity(severity, out_path):
-    """Worst exceedance of each depth constraint per config (% of its limit)."""
-    plt = _pyplot()
-    if plt is None:
-        return
-    from matplotlib.colors import LinearSegmentedColormap, PowerNorm
-    from metarl.training.plots import PLOT_INK, PLOT_INK2
-    configs = list(severity)
-    values = np.array([[severity[c][k][0] if severity[c][k][0] is not None
-                        else np.nan for k in DEPTH_NAMES] for c in configs])
-    texts = [["-" if not np.isfinite(v) else f"{v:.1f}" for v in row]
-             for row in values]
-    finite = values[np.isfinite(values)]
-    vmax = float(finite.max()) if finite.size and finite.max() > 0 else 1.0
-    cmap = LinearSegmentedColormap.from_list("abl_sev", _SEQUENTIAL)
-    norm = PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax)
-    fig, ax = plt.subplots(figsize=(max(8.0, 1.3 * len(DEPTH_NAMES) + 4.0),
-                                    1.8 + 0.5 * len(configs)))
-    fig.patch.set_facecolor(_SURFACE)
-    mesh = _heatmap(ax, values, texts, [config_label(c) for c in configs],
-                    [k.replace("_", " ") for k in DEPTH_NAMES], cmap, norm)
-    cb = fig.colorbar(mesh, ax=ax, fraction=0.03, pad=0.015)
-    cb.set_label("worst exceedance (% of the limit, square-root scale)",
-                 fontsize=8.5, color=PLOT_INK2)
-    cb.outline.set_visible(False)
-    cb.ax.tick_params(labelsize=8, colors=PLOT_INK2, length=0)
-    ax.set_title("WORST VIOLATION SEVERITY over every scenario and episode "
-                 "(mean over seeds)", fontsize=11, color=PLOT_INK,
-                 fontweight="bold", pad=10, loc="left")
-    fig.tight_layout()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)

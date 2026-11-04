@@ -461,11 +461,14 @@ picked iteration 590 on one high 10-task undisturbed ethanol reading, which
 also stopped training early; the final checkpoint (≈1090) is better on the
 faults (5 wins at 590).
 
-Figures (`results/plot/[tag]/`) are the lean set (`compare_safety`,
-`compare_episodes_violated`, `compare_production`, `compare_quality`,
-`compare_adapt`, `violation_mix_*`, `violation_severity`, `distributions`,
-`disturbance_response`, `training_curves`), plus **`compare_reactors.png`**
-(on-spec ethanol and violation events per reactor). The disturbance-response
+Figures (`results/plot/[tag]/`): **`compare_score`** (net production Π)
+and **`compare_burden`** (violation burden B per scenario and its make-up by
+constraint), which replace the event-count, episodes-violated, violation-mix
+and severity figures; then `compare_production`, `compare_quality`,
+`compare_adapt` (paired B, on-spec ethanol and Π), `distributions`,
+`disturbance_response`, `training_curves` and `compare_reactors.png`
+(on-spec ethanol and violation events per reactor). B and Π are defined in
+[docs/evaluation_metrics.md](docs/evaluation_metrics.md). The disturbance-response
 panels show the faulted reactor's actuator and add the storage trajectory.
 `eval.json` records per-reactor on-spec ethanol, batches, actuator means and
 violation events, the storage range and each episode's faulted reactor.
@@ -500,7 +503,8 @@ study's protocol, early stopping included; `--budget N` instead runs each for
 exactly N iterations. Evaluation uses `evaluate`'s scenarios and tasks, so
 deltas against `full` are paired per task within a seed. Outputs:
 `results/log/ablation/summary.csv` and `ablation_curves.png`,
-`ablation_final.png`, `ablation_severity.png` in `results/plot/ablation/`.
+`ablation_final.png` (B and Π per config and scenario, paired against
+`full`) in `results/plot/ablation/`.
 Leave-one-out over three seeds is 21 meta-sized runs plus three `saferl` runs.
 
 ---

@@ -73,7 +73,7 @@ from metarl.env.layout import (STATE_DIM, ACTION_DIM, SHIELD_OBS_DIM,
                                reactor_channel, reactor_action)
 from metarl.env.faults import (VALID_DISTURBANCES, DISTURBANCE_KIND_INDEX,
                                PLANT_DISTURBANCES)
-from metarl.env.plant import DISCHARGE_CUTOFF, FermentationPlant
+from metarl.env.plant import DEPTH_GAIN, DISCHARGE_CUTOFF, FermentationPlant
 from metarl.env.adapter import PlantFermentationEnv
 from metarl.agent.common import device, LATENT_DIM
 from metarl.agent.networks import token_index
@@ -1245,9 +1245,18 @@ def check_branched_rollouts_and_pool():
         scratch = rollout_deterministic(env, agent, tasks[1],
                                         disturbance=scen.get(n), index=1)
         for k in ("reward", "violations", "on_spec_ethanol", "proj",
-                  "viol_depth_sum"):
+                  "viol_depth_sum", "burden", "smoothing", "score"):
             assert scratch[k] == row[k], (n, k, scratch[k], row[k])
         assert np.array_equal(scratch["act_traj"], row["act_traj"]), n
+        # Burden = events + DEPTH_GAIN x depth area; net production prices
+        # it and the wear at the reward's rates.
+        n_ev = sum(row["viol_by_constraint"].values())
+        assert n_ev == row["violations"], (n, n_ev, row["violations"])
+        area = sum(row["viol_depth_sum"].values())
+        assert np.isclose(row["burden"], n_ev + DEPTH_GAIN * area), n
+        assert np.isclose(row["score"], row["on_spec_ethanol"] - (
+            VIOLATION_SPIKE * row["burden"] + row["smoothing"])
+            / PROD_REWARD_PER_ETH), n
     # The held-out score that selection and early stopping read.
     ho = blended_heldout_score(env, agent, tasks)
     assert np.isfinite(ho["score"]) and set(ho["panel"]) and np.isclose(

@@ -1,11 +1,56 @@
-"""Latent separability, gate openings and paired statistics."""
+"""Violation burden, net production, latent separability, gate openings and
+paired statistics."""
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
 import numpy as np
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.config import N_REACTORS
+from metarl.env.config import N_REACTORS, PROD_REWARD_PER_ETH, VIOLATION_SPIKE
+from metarl.env.plant import DEPTH_GAIN
 from metarl.training.config import _T95, PRACTICAL_MIN_REL_EFFECT
+
+
+def violation_burden(counts, depth_sums):
+    """Severity-weighted violation-hours of one episode, per constraint.
+
+    B_c = N_c + DEPTH_GAIN * A_c. N_c counts constraint c's events (one per
+    inner hour and instance, one per rejected lot for purity, one per episode
+    for mass balance): how often. A_c sums their relative depths past the
+    limit, the area under the exceedance curve in limit-hours: how badly.
+    DEPTH_GAIN is the slope at the limit of the spike the environment prices
+    a violation with, 1 + DEPTH_GAIN * d / (1 + d), so a shallow violation
+    weighs here what it costs in the reward and a deep one more (d / (1 + d)
+    <= d keeps the reward bounded; a report should not be).
+
+    Args:
+        counts: {constraint: N_c}.
+        depth_sums: {constraint: A_c}; constraints without a depth (5, 6)
+            may be missing.
+
+    Returns:
+        {constraint: B_c} over the keys of ``counts``.
+    """
+    return {c: float(n) + DEPTH_GAIN * float(depth_sums.get(c, 0.0))
+            for c, n in counts.items()}
+
+
+def net_production(on_spec_eth, burden, smoothing):
+    """On-spec ethanol net of violations and actuator wear, in ethanol.
+
+    Pi = E_on - (VIOLATION_SPIKE * B + R_smooth) / PROD_REWARD_PER_ETH: every
+    term at the environment's own reward rate, so no weight is chosen here.
+    The arm-specific terms of the reward (the learned Lagrange multipliers)
+    and its shaping (soft walls, barriers) are left out, which is what makes
+    it comparable across arms where the return is not. The raw-material
+    penalty is left out too: ~1e-7 ethanol an episode, against ~2e6 of wear.
+
+    Args:
+        on_spec_eth: Released, on-spec ethanol of the episode.
+        burden: ``violation_burden`` summed over constraints.
+        smoothing: The reward's flow-change penalty over the episode.
+    """
+    return float(on_spec_eth) - (VIOLATION_SPIKE * float(burden)
+                                 + float(smoothing)) / PROD_REWARD_PER_ETH
 
 
 def latent_separability(z_mus, z_sigma_sq):

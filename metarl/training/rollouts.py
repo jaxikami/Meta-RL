@@ -11,6 +11,7 @@ import torch
 from metarl.env.config import standardize_context, N_REACTORS
 from metarl.env.layout import ACTION_DIM, ACTION_DIM_PER_REACTOR
 from metarl.training.config import CONSTRAINT_NAMES, DEPTH_CONSTRAINTS
+from metarl.training.metrics import violation_burden, net_production
 from metarl.training.tasks import (as_fault_schedule, apply_fault_schedule,
                                    maybe_schedule_disturbance)
 
@@ -142,7 +143,8 @@ def _start_episode(env, agent, task, disturbance, index=0):
             # The shield's counters at the start, so the episode's own are
             # the difference at its end.
             "proj0": np.asarray(agent.proj_counts()),
-            "total_v": 0, "acts": [], "r_traj": [], "v_traj": [],
+            "total_v": 0, "smoothing": 0.0,
+            "acts": [], "r_traj": [], "v_traj": [],
             "act_traj": [], "probe_traj": [], "storage_traj": [],
             "gate_traj": [], "stage_traj": [],
             "viol_by_constraint": {cid: 0 for cid in CONSTRAINT_IDS},
@@ -174,6 +176,7 @@ def _advance(env, agent, ep, stop_at=None):
         ep["state"], ep["done"], ep["info"] = next_state, done, info
         ep["total_r"] += r
         ep["total_v"] += int(info["violation_events"])
+        ep["smoothing"] += float(info.get("smoothing", 0.0))
         for cid, n in info.get("violation_counts", {}).items():
             if int(cid) in ep["viol_by_constraint"]:
                 ep["viol_by_constraint"][int(cid)] += int(n)
@@ -197,6 +200,8 @@ def _advance(env, agent, ep, stop_at=None):
 def _episode_metrics(env, agent, ep):
     """Summarise a finished deterministic episode."""
     info, acts = ep["info"], ep["acts"]
+    burden = violation_burden(ep["viol_by_constraint"], ep["viol_depth_sum"])
+    on_spec = float(info.get("on_spec_ethanol", 0.0))
     probe = {}
     if ep["probe_traj"]:
         for k in ep["probe_traj"][0]:
@@ -208,9 +213,14 @@ def _episode_metrics(env, agent, ep):
         "viol_by_reactor": ep["viol_by_reactor"].astype(float).tolist(),
         "viol_depth_sum": ep["viol_depth_sum"],
         "viol_depth_max": ep["viol_depth_max"],
+        "burden_by_constraint": burden,
+        "burden": float(sum(burden.values())),
+        # The reward's flow-change penalty over the episode (reward units).
+        "smoothing": ep["smoothing"],
+        "score": net_production(on_spec, sum(burden.values()), ep["smoothing"]),
         "feasible": 1.0 if env.time_step_count >= env.max_steps else 0.0,
         "ethanol": float(env.product_eth),
-        "on_spec_ethanol": float(info.get("on_spec_ethanol", 0.0)),
+        "on_spec_ethanol": on_spec,
         "reactor_on_spec_ethanol": [float(v) for v in info.get(
             "reactor_on_spec_ethanol", np.zeros(N_REACTORS))],
         "product_mass": float(env.product_mass),

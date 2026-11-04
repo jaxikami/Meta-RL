@@ -120,6 +120,9 @@ def _aggregate_rows(rows, disturbance, interval, z_label, trace_probe=None):
     mean_v = pad_mean([r["viol_traj"] for r in rows])
     by_c = {cid: [float(r["viol_by_constraint"].get(cid, 0)) for r in rows]
             for cid in CONSTRAINT_NAMES}
+    burden_c = {cid: [float(r["burden_by_constraint"].get(cid, 0.0))
+                      for r in rows]
+                for cid in CONSTRAINT_NAMES}
 
     out = {
         "z_mode": z_label,
@@ -132,6 +135,17 @@ def _aggregate_rows(rows, disturbance, interval, z_label, trace_probe=None):
         "violations_worst": float(np.max(col("violations"))),
         "episodes_violated": int(np.sum(col("violations") > 0)),
         "episodes": len(rows),
+        # Violation burden (metrics.violation_burden) and net production
+        # (metrics.net_production): the two numbers a report leads with.
+        "burden": float(np.mean(col("burden"))),
+        "burden_std": float(np.std(col("burden"))),
+        "burden_p90": float(np.percentile(col("burden"), 90)),
+        "burden_by_constraint": {CONSTRAINT_NAMES[cid]: float(np.mean(v))
+                                 for cid, v in burden_c.items()},
+        "score": float(np.mean(col("score"))),
+        "score_std": float(np.std(col("score"))),
+        # The reward's flow-change penalty over an episode (reward units).
+        "smoothing": float(np.mean(col("smoothing"))),
         "feasible_rate": float(np.mean(col("feasible"))),
         "viol_by_constraint": {CONSTRAINT_NAMES[cid]: float(np.mean(v))
                                for cid, v in by_c.items()},
@@ -184,6 +198,8 @@ def _aggregate_rows(rows, disturbance, interval, z_label, trace_probe=None):
                             if shield["proj_calls"] else None),
         "fault_reactor_per_ep": [(-1 if t is None else int(t)) for t in targets],
         "viol_per_ep": col("violations").tolist(),
+        "burden_per_ep": col("burden").tolist(),
+        "score_per_ep": col("score").tolist(),
         "reward_per_ep": col("reward").tolist(),
         "ethanol_per_ep": col("ethanol").tolist(),
         "on_spec_ethanol_per_ep": col("on_spec_ethanol").tolist(),
@@ -374,14 +390,31 @@ def _scenario_rows(envs, agents, arms, groups, scenarios, n_eps):
     return out
 
 
+def _score_delta(a, b):
+    """Paired net-production gap a - b, relative to b's on-spec ethanol.
+
+    Net production can sit near zero, so b's gross output is the scale the
+    relative gap and the negligibility rule read.
+    """
+    return _paired_delta(a.get("score_per_ep", []), b.get("score_per_ep", []),
+                         ref=b.get("on_spec_ethanol"))
+
+
 def _eval_verdict(res, arm_a, arm_b):
-    """One contrast's paired verdict on one scenario, on both axes."""
+    """One contrast's paired verdict on one scenario, on both axes.
+
+    Safety is the violation burden, output the on-spec ethanol; ``d_score``
+    is the net-production gap that folds both (and actuator wear) into one.
+    """
     a, b = res[arm_a], res[arm_b]
     d_viol = _paired_delta(b.get("viol_per_ep", []), a.get("viol_per_ep", []))
+    d_burden = _paired_delta(b.get("burden_per_ep", []),
+                             a.get("burden_per_ep", []))
     d_eth = _paired_delta(a.get("on_spec_ethanol_per_ep", []),
                           b.get("on_spec_ethanol_per_ep", []))
+    d_score = _score_delta(a, b)
     d_titer = a["mean_titer"] - b["mean_titer"]
-    sv, sp = _verdict_sign(d_viol), _verdict_sign(d_eth)
+    sv, sp = _verdict_sign(d_burden), _verdict_sign(d_eth)
     if sv > 0 and sp > 0:
         verdict = f"{arm_a} better (both axes)"
     elif sv > 0 and sp == 0:
@@ -403,8 +436,8 @@ def _eval_verdict(res, arm_a, arm_b):
     if sv > 0 and b["on_spec_ethanol"] > 0 and \
             a["on_spec_ethanol"] < 0.5 * b["on_spec_ethanol"]:
         verdict += " [!] <50% output"
-    return {"d_viol": d_viol, "d_eth": d_eth, "d_titer": d_titer,
-            "verdict": verdict}
+    return {"d_viol": d_viol, "d_burden": d_burden, "d_eth": d_eth,
+            "d_score": d_score, "d_titer": d_titer, "verdict": verdict}
 
 
 def _eval_summary(results, arms):
@@ -415,10 +448,29 @@ def _eval_summary(results, arms):
                 for name, res in results.items()}
         for label, arm_a, arm_b, _ in usable
     }
-    out = {"contrasts": contrasts}
+    out = {"contrasts": contrasts, "headline": _headline(results, arms)}
     if "meta" in arms:
         snr = float(np.mean([res["meta"]["z_snr"] for res in results.values()]))
         out.update(z_snr_mean=snr, z_snr_pass=bool(snr >= Z_INFORM_MIN_SNR))
+    return out
+
+
+def _headline(results, arms):
+    """Per arm, burden, on-spec ethanol and net production over scenarios.
+
+    Each scenario weighs equally. ``scenarios_score_better`` counts the
+    scenarios on which the arm's net production is significantly above every
+    other arm's, paired over the same episodes.
+    """
+    out = {arm: {k: float(np.mean([res[arm][k] for res in results.values()]))
+                 for k in ("burden", "on_spec_ethanol", "score")}
+           for arm in arms}
+    for arm in arms:
+        out[arm]["scenarios_score_better"] = int(sum(
+            all(_verdict_sign(_score_delta(res[arm], res[o])) > 0
+                for o in arms if o != arm)
+            for res in results.values()))
+    out["scenarios"] = len(results)
     return out
 
 
@@ -435,17 +487,28 @@ def _print_eval(results, summary):
         snr, ok = summary["z_snr_mean"], summary["z_snr_pass"]
         print(f"\nlatent separability: mean SNR {snr:.2f} "
               f"({'>= ' if ok else '< '}{Z_INFORM_MIN_SNR})")
+    print("\nB: violation burden, violation-hours + DEPTH_GAIN x exceedance "
+          "area (lower is better).  Pi: net production, on-spec ethanol less "
+          "violations and wear at the reward's rates (higher is better).")
     print(f"\n{'scenario':<26}" + "".join(
-        f"{a + ' viol':>14}{a + ' on-spec':>16}" for a in arms))
+        f"{a + ' B':>12}{a + ' on-spec':>16}{a + ' Pi':>14}" for a in arms))
     for name, res in results.items():
         print(f"{name:<26}" + "".join(
-            f"{res[a]['violations']:>14.2f}{res[a]['on_spec_ethanol']:>16.3e}"
-            for a in arms))
+            f"{res[a]['burden']:>12.2f}{res[a]['on_spec_ethanol']:>16.3e}"
+            f"{res[a]['score']:>14.3e}" for a in arms))
+    head = summary["headline"]
+    print(f"{'mean over scenarios':<26}" + "".join(
+        f"{head[a]['burden']:>12.2f}{head[a]['on_spec_ethanol']:>16.3e}"
+        f"{head[a]['score']:>14.3e}" for a in arms))
+    print("Pi significantly higher on " + ", ".join(
+        f"{a}: {head[a]['scenarios_score_better']}" for a in arms)
+        + f" of {head['scenarios']} scenarios")
     for label, per_scenario in summary["contrasts"].items():
         print(f"\n{label}:")
         for name, v in per_scenario.items():
             print(f"  {name:<26}{v['verdict']:<30}"
-                  f"viol {_fmt_delta(v['d_viol']):<22}"
-                  f"eth {_fmt_delta_sci(v['d_eth'])}")
+                  f"B {_fmt_delta(v['d_burden']):<22}"
+                  f"eth {_fmt_delta_sci(v['d_eth']):<26}"
+                  f"Pi {_fmt_delta_sci(v['d_score'])}")
     print(f"\nfull per-scenario tables: eval.json  |  figures: {PLOT_DIR}  |  "
           f"redraw figures only: python -m metarl plot_eval")

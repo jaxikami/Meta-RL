@@ -503,7 +503,6 @@ class LearningMixin:
             self._apn_actor_terms(actor_loss, b.o, b.feat_d, zd, gate_act,
                                   batch_mean))
 
-        # Anchor to the warm-start policy.
         if self.anchor_actor is not None and self._anchor_on:
             anchor_pen, gap_nominal, gap_fault = self._anchor_terms(
                 b.o, b.feat_d, zd, b.fault_code, gate=gate_act, weight=w_gate,

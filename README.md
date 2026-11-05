@@ -282,7 +282,7 @@ PPO's settings:
   and re-locates a storage or cooling capacity a fault moved from the
   alarm's depth. `AdaptiveResidual` fits the exact heads' mass-balance
   residual (pump gain, leak, downstream draw) by RLS.
-- **The actor's terms** (`metarl/agent/learning.py`). These are Safe PPO's
+- **The actor's terms** (`metarl/agent/shield.py`). These are Safe PPO's
   safety gradient (the hinge on every head's margin, weight
   `APN_SAFETY_GRAD_WEIGHT = 1.0`) and its mapping penalty (the pull toward
   the projected action, weighted by the worst margin,
@@ -581,7 +581,7 @@ into mixins, one module per concern.
 | `metarl/env/adapter.py` | `PlantFermentationEnv`: the environment behind the agent's interface (flat views, tasks, fault tracking, privileged state, per-reactor ledger) |
 | `metarl/env/layout.py` / `faults.py` | observation and action indices and the stage mask; fault kind codes, aliases and presets |
 | `metarl/agent/pearl.py` | `PEARLAgent`: the PEARL/SAC agent and its rollout copies |
-| `metarl/agent/acting.py` / `learning.py` / `checkpoint.py` | its mixins: posterior and action selection (adaptation gate, APN hooks), the update, save / load / warm start |
+| `metarl/agent/acting.py` / `shield.py` / `learning.py` / `checkpoint.py` | its mixins: posterior and action selection (adaptation gate), the APN (projection, L3, KineticNet refresh, the actor's safety terms), the update, save / load / warm start |
 | `metarl/agent/networks.py` / `replay.py` / `common.py` | token actor and critics, GRU encoder, gate; per-task replay; devices and utilities |
 | `metarl/apn/` | Safe PPO's multi-head APN, ported: `constants`, `kinetic` (KineticNet), `apn` (heads, projection, safety loss), `adaptation` (L3), `plant_sim`, `data` / `train` / `refiner` / `validate` / `validation_plots` |
 | `metarl/training/config.py` | every setting of the study (`NET_*`, `SELECT_*`, fault ranges, scenarios, output paths) |
@@ -590,7 +590,7 @@ into mixins, one module per concern.
 | `metarl/training/tasks.py` / `rollouts.py` / `workers.py` | task pools and fault schedules; training and deterministic (branched) episodes; the worker processes that run them |
 | `metarl/training/evaluate.py` / `z_informativeness.py` | evaluation and the latent gate |
 | `metarl/training/metrics.py` / `plots.py` / `logs.py` | statistics, figures, JSON logs |
-| `metarl/ablation.py` | ablation study of the meta arm's components (`python -m metarl.ablation`) |
+| `metarl/ablation.py` / `ablation_plots.py` | ablation study of the meta arm's components (`python -m metarl.ablation`); its figures |
 | `tests/smoke_test.py` | fast CPU check of every code path and the design properties |
 
 ## How to run

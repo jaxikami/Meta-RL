@@ -233,8 +233,8 @@ class CheckpointMixin:
 
         Loads the actor, both critics and the target critic, the temperature,
         the reward scaler, the observation statistics and the APN's refined
-        KineticNet of a checkpoint with the same ``net_config`` (a context-free agent's, whose encoder options
-        are not compared). FiLM projection weights stay at zero, so this agent
+        KineticNet of a checkpoint with the same ``net_config`` (a
+        context-free agent's, whose encoder options are not compared). FiLM projection weights stay at zero, so this agent
         acts exactly as the source for every z until training grows them.
         With the gate, the loaded policy is also its frozen base (and the
         anchor).

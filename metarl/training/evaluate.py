@@ -27,8 +27,7 @@ from metarl.training.arms import (ARMS, ARM_ORDER, CONTRASTS, arm_paths,
                                   _load_preferring_best, check_holdout)
 from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool,
                                    as_fault_schedule, pattern_schedule)
-from metarl.training.rollouts import (rollout_deterministic,
-                                      scenario_rollouts)
+from metarl.training.rollouts import scenario_rollouts
 from metarl.training.workers import RolloutPool
 from metarl.training.metrics import (latent_separability, gate_opening,
                                      gate_opening_in_stage, _finite_mean,
@@ -37,6 +36,10 @@ from metarl.training.metrics import (latent_separability, gate_opening,
 from metarl.training.logs import _json_default
 from metarl.training.plots import (_plot_comparison, _plot_tiers,
                                    plot_training_curves, scenario_probe)
+
+# The evaluation's task pools (``eval_task_pools``).
+EVAL_ID_SEED = 12345
+EVAL_OOD_SEED = 99999
 
 
 def _recovery_metrics(reward_traj, viol_traj, onset_outer, win=10):
@@ -67,23 +70,65 @@ def _recovery_metrics(reward_traj, viol_traj, onset_outer, win=10):
     }
 
 
-def _eval_agent_on_tasks(env, agent, tasks, disturbance=None, z_mode=None,
-                         trace_probe=None):
-    """Roll out one arm over a task list and aggregate both metric axes.
+def _z_label(agent):
+    """What a report records as an agent's z mode."""
+    return EVAL_Z_MODE if agent.use_context else "n/a (z=0)"
 
-    A "rotate" fault resolves per episode index, so every arm faults the same
-    reactor on the same task.
 
-    Returns:
-        Dict of aggregated metrics plus per-episode arrays for paired tests.
-    """
-    mode = z_mode if z_mode is not None else EVAL_Z_MODE
-    rows = [rollout_deterministic(env, agent, t, z_mode=mode,
-                                  disturbance=disturbance, index=i)
-            for i, t in enumerate(tasks)]
-    return _aggregate_rows(rows, disturbance, env.control_action_interval,
-                           mode if agent.use_context else "n/a (z=0)",
-                           trace_probe)
+def _fault_targets(disturbance, n):
+    """Per episode, the reactor its first fault hits (None: none or plant-wide)."""
+    targets = []
+    for i in range(n):
+        sched = as_fault_schedule(disturbance, i)
+        targets.append(sched[0]["reactor"] if sched else None)
+    return targets
+
+
+def _pad_mean(seqs, length):
+    """Per-step mean over episodes of series up to ``length`` long (NaN-padded)."""
+    m = np.full((len(seqs), length), np.nan)
+    for i, s in enumerate(seqs):
+        m[i, :len(s)] = s
+    return np.nanmean(m, axis=0)
+
+
+def _traces(rows, targets, trace_probe):
+    """Each episode's probed actuator, disturbed quantity and storage."""
+    key, _, a_idx = DISTURB_PROBES[trace_probe][:3]
+
+    def actuator(r, t):
+        act = r["act_traj"].reshape(-1, N_REACTORS, ACTION_DIM_PER_REACTOR)
+        return act[:, :, a_idx].mean(axis=1) if t is None else act[:, t, a_idx]
+
+    def quantity(r, t):
+        q = r["probe_traj"][key]
+        if q.ndim == 1:
+            return q
+        return q.mean(axis=1) if t is None else q[:, t]
+
+    return {
+        "probe": key,
+        "reactor": [(-1 if t is None else int(t)) for t in targets],
+        "act": [np.round(actuator(r, t), 4).tolist()
+                for r, t in zip(rows, targets)],
+        "quantity": [[float(f"{v:.5g}") for v in quantity(r, t)]
+                     for r, t in zip(rows, targets)],
+        "storage": [np.round(r["storage_traj"], 1).tolist() for r in rows],
+    }
+
+
+def _gate_openings(rows, targets, split):
+    """Mean gate opening before and after the outer step ``split`` (None: no gate)."""
+    out = {}
+    for k, lo, hi in (("gate_pre", 0, split + 1), ("gate_post", split + 1, None)):
+        v = _finite_mean([gate_opening(r["gate_traj"], lo, hi) for r in rows])
+        out[k] = v if np.isfinite(v) else None
+    for k, stage in (("gate_post_ferment", 2), ("gate_post_unload", 3)):
+        v = _finite_mean([gate_opening_in_stage(r["gate_traj"], r["stage_traj"],
+                                                stage, t, split + 1)
+                          for r, t in zip(rows, targets)])
+        out[k] = v if np.isfinite(v) else None
+    return out
 
 
 def _aggregate_rows(rows, disturbance, interval, z_label, trace_probe=None):
@@ -97,12 +142,7 @@ def _aggregate_rows(rows, disturbance, interval, z_label, trace_probe=None):
         trace_probe: ``DISTURB_PROBES`` key to trace, or None.
     """
     calls, _, _, moved = np.sum([r["proj"] for r in rows], axis=0)
-    shield = {"proj_calls": int(calls),
-              "proj_moved_frac": moved / max(calls, 1)}
-    targets = []
-    for i in range(len(rows)):
-        sched = as_fault_schedule(disturbance, i)
-        targets.append(sched[0]["reactor"] if sched else None)
+    targets = _fault_targets(disturbance, len(rows))
 
     def col(k):
         return np.array([r[k] for r in rows], dtype=float)
@@ -110,17 +150,9 @@ def _aggregate_rows(rows, disturbance, interval, z_label, trace_probe=None):
     z_mus = np.stack([r["z_mu"] for r in rows])
     sep = latent_separability(z_mus, [r["z_sigma_sq"] for r in rows])
     acts = np.stack([r["act_mean"] for r in rows])            # (E, N, 3)
-
     L = max(len(r["reward_traj"]) for r in rows)
-
-    def pad_mean(seqs):
-        m = np.full((len(seqs), L), np.nan)
-        for i, s in enumerate(seqs):
-            m[i, :len(s)] = s
-        return np.nanmean(m, axis=0)
-
-    mean_r = pad_mean([r["reward_traj"] for r in rows])
-    mean_v = pad_mean([r["viol_traj"] for r in rows])
+    mean_r = _pad_mean([r["reward_traj"] for r in rows], L)
+    mean_v = _pad_mean([r["viol_traj"] for r in rows], L)
     by_c = {cid: [float(r["viol_by_constraint"].get(cid, 0)) for r in rows]
             for cid in CONSTRAINT_NAMES}
     burden_c = {cid: [float(r["burden_by_constraint"].get(cid, 0.0))
@@ -196,9 +228,8 @@ def _aggregate_rows(rows, disturbance, interval, z_label, trace_probe=None):
         "z_snr": sep["snr"],
         "z_snr_mean_ratio": sep["mean_ratio"],
         "z_abs_mean": float(np.mean(np.abs(z_mus))),
-        "proj_calls": int(shield["proj_calls"]),
-        "proj_moved_frac": (float(shield["proj_moved_frac"])
-                            if shield["proj_calls"] else None),
+        "proj_calls": int(calls),
+        "proj_moved_frac": float(moved / max(calls, 1)) if calls else None,
         "fault_reactor_per_ep": [(-1 if t is None else int(t)) for t in targets],
         "viol_per_ep": col("violations").tolist(),
         "burden_per_ep": col("burden").tolist(),
@@ -213,44 +244,15 @@ def _aggregate_rows(rows, disturbance, interval, z_label, trace_probe=None):
         "viol_traj": mean_v.tolist(),
     }
     if trace_probe is not None:
-        a_idx = DISTURB_PROBES[trace_probe][2]
-        key = DISTURB_PROBES[trace_probe][0]
-
-        def actuator(r, t):
-            act = r["act_traj"].reshape(-1, N_REACTORS, ACTION_DIM_PER_REACTOR)
-            return act[:, :, a_idx].mean(axis=1) if t is None else act[:, t, a_idx]
-
-        def quantity(r, t):
-            q = r["probe_traj"][key]
-            if q.ndim == 1:
-                return q
-            return q.mean(axis=1) if t is None else q[:, t]
-
-        out["traces"] = {
-            "probe": key,
-            "reactor": [(-1 if t is None else int(t)) for t in targets],
-            "act": [np.round(actuator(r, t), 4).tolist()
-                    for r, t in zip(rows, targets)],
-            "quantity": [[float(f"{v:.5g}") for v in quantity(r, t)]
-                         for r, t in zip(rows, targets)],
-            "storage": [np.round(r["storage_traj"], 1).tolist() for r in rows],
-        }
+        out["traces"] = _traces(rows, targets, trace_probe)
     sched0 = as_fault_schedule(disturbance, 0)
     split = (int(min(d["onset"] for d in sched0) // interval)
              if sched0 else L // 2)
-    for k, lo, hi in (("gate_pre", 0, split + 1), ("gate_post", split + 1, None)):
-        v = _finite_mean([gate_opening(r["gate_traj"], lo, hi) for r in rows])
-        out[k] = v if np.isfinite(v) else None
-    for k, stage in (("gate_post_ferment", 2), ("gate_post_unload", 3)):
-        v = _finite_mean([gate_opening_in_stage(r["gate_traj"], r["stage_traj"],
-                                                stage, t, split + 1)
-                          for r, t in zip(rows, targets)])
-        out[k] = v if np.isfinite(v) else None
+    out.update(_gate_openings(rows, targets, split))
     if sched0:
         out["onset_outer"] = split
         out["recovery"] = _recovery_metrics(mean_r, mean_v, split)
     return out
-
 
 def eval_fault_scenarios(onset, horizon=None):
     """The disturbed evaluation scenarios, exactly as ``evaluate`` runs them.
@@ -325,6 +327,68 @@ def scenario_tier(base, dist, holdout=META_HOLDOUT_KINDS):
     return "T3" if kinds & set(holdout) else base
 
 
+def eval_task_pools(n):
+    """``evaluate``'s first ``n`` in-distribution and out-of-distribution tasks."""
+    return (make_task_pool(n, seed=EVAL_ID_SEED, ood=False),
+            make_task_pool(n, seed=EVAL_OOD_SEED, ood=True))
+
+
+def eval_scenarios(id_tasks, ood_tasks, onset, horizon, tiers=True):
+    """Every scenario ``evaluate`` runs, in report order.
+
+    Args:
+        id_tasks, ood_tasks: The task pools (``eval_task_pools``).
+        onset: First inner step of the step / spike / gradual faults.
+        horizon: Episode length in inner steps.
+        tiers: Include tier 2's extrapolations and tier 4's combinations;
+            without them, the undisturbed pools and the fault grid.
+
+    Returns:
+        Dict name -> {"tasks", "dist" (fault schedule or None), "tier"}.
+    """
+    scenarios = {
+        "in_distribution": {"tasks": id_tasks, "dist": None, "tier": "T1"},
+        "out_of_distribution": {"tasks": ood_tasks, "dist": None,
+                                "tier": "T2"},
+    }
+    for name, dist in eval_fault_scenarios(onset, horizon).items():
+        scenarios[name] = {"tasks": id_tasks, "dist": dist,
+                           "tier": scenario_tier("T1", dist)}
+    if tiers:
+        for name, (base, dist) in eval_tier_scenarios(onset, horizon).items():
+            scenarios[name] = {"tasks": id_tasks, "dist": dist,
+                               "tier": scenario_tier(base, dist)}
+    return scenarios
+
+
+def scenario_groups(scenarios):
+    """(tasks, scenario names) per task pool, in first-appearance order.
+
+    Each task runs every scenario of its group from one undisturbed prefix
+    (``scenario_rollouts``).
+    """
+    groups = {}
+    for name, sc in scenarios.items():
+        groups.setdefault(id(sc["tasks"]), (sc["tasks"], []))[1].append(name)
+    return list(groups.values())
+
+
+def _by_scenario(names, task_rows):
+    """Per-task rows over ``names`` regrouped as {name: rows in task order}."""
+    return {name: [r[k] for r in task_rows] for k, name in enumerate(names)}
+
+
+def scenario_rows_in_process(env, agent, groups, scenarios):
+    """One arm's episode rows on every scenario, in this process: {name: rows}."""
+    out = {}
+    for tasks, names in groups:
+        dists = [scenarios[n]["dist"] for n in names]
+        out.update(_by_scenario(names, [
+            scenario_rollouts(env, agent, t, dists, EVAL_Z_MODE, index=i)
+            for i, t in enumerate(tasks)]))
+    return out
+
+
 def evaluate():
     """Compare both arms on every scenario, on both metric axes.
 
@@ -350,36 +414,18 @@ def evaluate():
         _load_preferring_best(agents[name], best_path, final_path, name)
     env = envs[arms[-1]]
 
-    id_tasks = make_task_pool(EVAL_EPISODES, seed=12345, ood=False)
-    ood_tasks = make_task_pool(EVAL_EPISODES, seed=99999, ood=True)
-    onset = env.max_steps // 2
-    scenarios = {
-        "in_distribution": {"tasks": id_tasks, "dist": None, "tier": "T1"},
-        "out_of_distribution": {"tasks": ood_tasks, "dist": None,
-                                "tier": "T2"},
-    }
-    for name, dist in eval_fault_scenarios(onset, env.max_steps).items():
-        scenarios[name] = {"tasks": id_tasks, "dist": dist,
-                           "tier": scenario_tier("T1", dist)}
-    for name, (base, dist) in eval_tier_scenarios(onset,
-                                                  env.max_steps).items():
-        scenarios[name] = {"tasks": id_tasks, "dist": dist,
-                           "tier": scenario_tier(base, dist)}
-
-    # Scenarios grouped by task pool: each group is one job per task.
-    groups = [(id_tasks, [n for n, sc in scenarios.items()
-                          if sc["tasks"] is id_tasks]),
-              (ood_tasks, ["out_of_distribution"])]
-    n_eps = sum(len(t) * len(names) for t, names in groups) * len(arms)
-    rows = _scenario_rows(envs, agents, arms, groups, scenarios, n_eps)
+    id_tasks, ood_tasks = eval_task_pools(EVAL_EPISODES)
+    scenarios = eval_scenarios(id_tasks, ood_tasks, env.max_steps // 2,
+                               env.max_steps)
+    rows = _scenario_rows(envs, agents, arms, scenario_groups(scenarios),
+                          scenarios)
 
     results = {}
     for name, sc in scenarios.items():
         results[name] = {
             arm: _aggregate_rows(
                 rows[arm][name], sc["dist"],
-                envs[arm].control_action_interval,
-                EVAL_Z_MODE if agents[arm].use_context else "n/a (z=0)",
+                envs[arm].control_action_interval, _z_label(agents[arm]),
                 trace_probe=scenario_probe(name))
             for arm in arms
         }
@@ -401,56 +447,49 @@ def evaluate():
     return results
 
 
-def _scenario_rows(envs, agents, arms, groups, scenarios, n_eps):
+def _scenario_rows(envs, agents, arms, groups, scenarios):
     """Every arm's episode rows on every scenario: {arm: {scenario: rows}}.
 
     Args:
-        groups: (tasks, scenario names) pairs; every scenario of a group runs
-            on its tasks.
-        n_eps: Total episodes, for the progress line.
+        groups: (tasks, scenario names) pairs (``scenario_groups``).
     """
-    plan = []                                   # (arm, tasks, names, traced)
-    for arm in arms:
-        for tasks, names in groups:
-            plan.append((arm, tasks, names,
-                         [scenario_probe(n) is not None for n in names]))
-
-    def schedules(names):
-        return [scenarios[n]["dist"] for n in names]
-
+    n_eps = sum(len(t) * len(names) for t, names in groups) * len(arms)
     t0 = time.time()
-    per_task = None
+    out = None
     if EVAL_WORKERS > 1:
-        pool = None
-        try:
-            pool = RolloutPool(None, EVAL_WORKERS)
-            print(f"[eval] {n_eps} episodes in {EVAL_WORKERS} worker "
-                  f"processes ...")
-            futures = [pool.scenarios_async(agents[arm], tasks,
-                                            schedules(names), EVAL_Z_MODE,
-                                            traced, arm=arm)
-                       for arm, tasks, names, traced in plan]
-            per_task = [[f.result() for f in fs] for fs in futures]
-        except Exception as exc:                          # pragma: no cover
-            print(f"[eval] worker pool failed ({exc!r}); running in-process")
-            per_task = None
-        finally:
-            if pool is not None:
-                pool.close()
-    if per_task is None:
+        out = _scenario_rows_pooled(agents, arms, groups, scenarios, n_eps)
+    if out is None:
         print(f"[eval] {n_eps} episodes in-process ...")
-        per_task = [[scenario_rollouts(envs[arm], agents[arm], t,
-                                       schedules(names), EVAL_Z_MODE, index=i)
-                     for i, t in enumerate(tasks)]
-                    for arm, tasks, names, _ in plan]
+        out = {arm: scenario_rows_in_process(envs[arm], agents[arm], groups,
+                                             scenarios)
+               for arm in arms}
     print(f"[eval] rollouts done in {time.time() - t0:.0f}s")
-
-    out = {arm: {} for arm in arms}
-    for (arm, _, names, _), task_rows in zip(plan, per_task):
-        for k, name in enumerate(names):
-            out[arm][name] = [r[k] for r in task_rows]
     return out
 
+
+def _scenario_rows_pooled(agents, arms, groups, scenarios, n_eps):
+    """``_scenario_rows`` in ``EVAL_WORKERS`` processes; None if the pool fails."""
+    plan = [(arm, tasks, names) for arm in arms for tasks, names in groups]
+    pool = None
+    try:
+        pool = RolloutPool(None, EVAL_WORKERS)
+        print(f"[eval] {n_eps} episodes in {EVAL_WORKERS} worker "
+              f"processes ...")
+        futures = [pool.scenarios_async(
+            agents[arm], tasks, [scenarios[n]["dist"] for n in names],
+            EVAL_Z_MODE, [scenario_probe(n) is not None for n in names],
+            arm=arm) for arm, tasks, names in plan]
+        per_task = [[f.result() for f in fs] for fs in futures]
+    except Exception as exc:                              # pragma: no cover
+        print(f"[eval] worker pool failed ({exc!r}); running in-process")
+        return None
+    finally:
+        if pool is not None:
+            pool.close()
+    out = {arm: {} for arm in arms}
+    for (arm, _, names), task_rows in zip(plan, per_task):
+        out[arm].update(_by_scenario(names, task_rows))
+    return out
 
 def _score_delta(a, b):
     """Paired net-production gap a - b, relative to b's on-spec ethanol.

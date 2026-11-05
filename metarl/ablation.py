@@ -65,8 +65,9 @@ Protocol:
     PPO study does; saferl keeps the study's protocol either way.
 
     Every variant and the seed's saferl are evaluated on ``evaluate``'s
-    scenarios and task pools (their first ``--eval-episodes`` tasks), so
-    within a seed every result is paired per task.
+    undisturbed pools and fault grid (the first ``--eval-episodes`` tasks of
+    its pools, every scenario of a task branched from one undisturbed
+    prefix), so within a seed every result is paired per task.
     The figures read the violation burden B and the net production Pi
     (``metarl.training.metrics``; docs/evaluation_metrics.md); the CSV also
     keeps violation events and each depth constraint's worst exceedance (% of
@@ -145,9 +146,6 @@ DEFAULT_SEEDS = [0, 1, 2]
 # The reference row: the seed's saferl, also every warm-started variant's
 # source.
 REFERENCE = "saferl"
-# ``evaluate``'s task pools.
-EVAL_ID_SEED = 12345
-EVAL_OOD_SEED = 99999
 DEPTH_NAMES = tuple(CONSTRAINT_NAMES[c] for c in DEPTH_CONSTRAINTS)
 
 
@@ -325,25 +323,25 @@ def evaluate_run(spec, n_episodes):
     Returns:
         Dict scenario name -> compact results.
     """
-    from metarl.training.tasks import seed_everything, make_arm_env, make_task_pool
-    from metarl.training.evaluate import (_eval_agent_on_tasks,
-                                          eval_fault_scenarios)
+    from metarl.training.tasks import seed_everything, make_arm_env
+    from metarl.training.evaluate import (eval_task_pools, eval_scenarios,
+                                          scenario_groups,
+                                          scenario_rows_in_process,
+                                          _aggregate_rows, _z_label)
     seed_everything(SEED)
     env = make_arm_env(spec)
     agent = _build_agent(env, spec)
     final_path, best_path = arm_paths(spec)
     _load_preferring_best(agent, best_path, final_path, spec.name, strict=True)
-    id_tasks = make_task_pool(n_episodes, seed=EVAL_ID_SEED, ood=False)
-    ood_tasks = make_task_pool(n_episodes, seed=EVAL_OOD_SEED, ood=True)
-    scenarios = {"in_distribution": (id_tasks, None),
-                 "out_of_distribution": (ood_tasks, None)}
-    for name, dist in eval_fault_scenarios(env.max_steps // 2).items():
-        scenarios[name] = (id_tasks, dist)
-    out = {}
-    for name, (tasks, dist) in scenarios.items():
-        print(f"[eval] {spec.name}: {name} ...", flush=True)
-        out[name] = _compact(_eval_agent_on_tasks(env, agent, tasks, dist))
-    return out
+    scenarios = eval_scenarios(*eval_task_pools(n_episodes),
+                               env.max_steps // 2, env.max_steps, tiers=False)
+    print(f"[eval] {spec.name}: {len(scenarios)} scenarios ...", flush=True)
+    rows = scenario_rows_in_process(env, agent, scenario_groups(scenarios),
+                                    scenarios)
+    return {name: _compact(_aggregate_rows(
+                rows[name], sc["dist"], env.control_action_interval,
+                _z_label(agent)))
+            for name, sc in scenarios.items()}
 
 
 def _new_record(name, spec, budget):

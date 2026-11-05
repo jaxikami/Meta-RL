@@ -7,6 +7,9 @@ penalty and the warm-start anchor; it reads the history detached), then the
 temperature.
 """
 
+# ─── Standard Library ─────────────────────────────────────────────────────────
+from dataclasses import dataclass
+
 # ─── Third-Party ──────────────────────────────────────────────────────────────
 import numpy as np
 import torch
@@ -53,6 +56,27 @@ def window_resets(lo, hi, rows):
     k, p = np.nonzero(lo < rows)
     reset[k, lo[k, p]] = True
     return reset
+
+
+@dataclass
+class _Batch:
+    """One update's sample on the training device, with z and history features."""
+    o: torch.Tensor
+    a: torch.Tensor
+    r: torch.Tensor           # scaled by ret_rms and reward_scale
+    o2: torch.Tensor
+    d: torch.Tensor
+    ctx: torch.Tensor         # the true task descriptor
+    fault_code: torch.Tensor
+    fault: torch.Tensor       # 1.0 where a fault acts
+    priv: torch.Tensor
+    priv2: torch.Tensor
+    z: torch.Tensor
+    mu: torch.Tensor
+    kl: torch.Tensor
+    feat: torch.Tensor        # with a graph unless the history is frozen
+    feat2: torch.Tensor
+    feat_d: torch.Tensor
 
 
 class LearningMixin:
@@ -264,7 +288,37 @@ class LearningMixin:
                         and self._n_updates % self.encoder_update_every == 0)
         tasks = np.random.choice(ready, size=min(meta_batch, len(ready)),
                                  replace=False)
+        b = self._sample_batch(replay, tasks, batch_size, context_size,
+                               step_encoder)
 
+        # gate_open: the learned detector's opening (what deployment acts
+        # through); gate_act: the opening the training rollouts acted through
+        # (fully open under train_gate_open).
+        gate_open = gate_act = None
+        if self.adapt_gate:
+            with torch.no_grad():
+                gate_open = self._gate_open(self.gate, b.z.detach())
+                gate_act = (torch.ones_like(gate_open) if self.train_gate_open
+                            else gate_open)
+        # The hold rule reads the privileged titer: only arms that store it.
+        hold_on = self.hold_penalty_weight > 0.0 or self.hold_gate_target
+        stalled = (self._stall_flags(b.o, b.priv) if hold_on
+                   else torch.zeros(b.o.shape[0], 1, device=b.o.device))
+        stall_any = stalled.amax(dim=-1)
+
+        critic_terms = self._critic_step(b, gate_act, stall_any, step_encoder)
+        actor_terms = (self._actor_step(b, gate_act, stalled, stall_any)
+                       if train_actor else self._idle_actor_terms())
+        self._polyak_update()
+        self._mark_rollout_stale()
+        if not want_stats:
+            return {}
+        return self._update_stats(b, critic_terms, actor_terms, gate_open,
+                                  stall_any)
+
+    def _sample_batch(self, replay, tasks, batch_size, context_size,
+                      step_encoder):
+        """Sample causal windows of every task, then z and the history features."""
         # Causal windows for every arm: the policy is recurrent.
         chunk = max(1, min([WINDOW_CHUNK_LEN]
                            + [replay.size(t) for t in tasks]))
@@ -301,235 +355,237 @@ class LearningMixin:
                              "features: freeze the history module (a warm "
                              "start does)")
         feat, feat2 = self._history_features(rows, lo, hi, o, o2, reset)
-        feat2 = feat2.detach()
-        feat_d = feat.detach()
-        priv, priv2 = priv.float(), priv2.float()
         fault_code = fault_code.float()
-        ctx_true, fault = ctx_true.float(), (fault_code > 0).float()
         r = r.float()
         if self.ret_rms is not None:
             r = r / self.ret_rms.std
         r = r * self.reward_scale
+        return _Batch(o=o, a=a, r=r, o2=o2, d=d, ctx=ctx_true.float(),
+                      fault_code=fault_code, fault=(fault_code > 0).float(),
+                      priv=priv.float(), priv2=priv2.float(), z=z, mu=mu,
+                      kl=kl, feat=feat, feat2=feat2.detach(),
+                      feat_d=feat.detach())
 
-        # gate_open: the learned detector's opening (what deployment acts
-        # through); gate_act: the opening the training rollouts acted through
-        # (fully open under train_gate_open).
-        gate_open = gate_act = None
-        if self.adapt_gate:
-            with torch.no_grad():
-                gate_open = self._gate_open(self.gate, z.detach())
-                gate_act = (torch.ones_like(gate_open) if self.train_gate_open
-                            else gate_open)
+    def _aux_loss(self, b):
+        """The auxiliary head's regression from z (and partly from mu)."""
+        if self.aux_mode == "reward":
+            aux_target = b.r.detach()
 
-        # ── 1. Critic (+ encoder + KL + auxiliary + gate detector) ───────────
+            def aux_err(latent):
+                pred = self.aux(latent, b.o, b.a).squeeze(-1)
+                return F.mse_loss(pred, aux_target)
+        else:
+            aux_target = b.ctx
+            if self.aux_state_targets:
+                aux_target = torch.cat(
+                    [b.ctx] + [((b.priv[:, c] - m) / s).unsqueeze(-1)
+                               for c, m, s in self.aux_state_targets],
+                    dim=-1)
+
+            def aux_err(latent):
+                return F.mse_loss(self.aux(latent), aux_target)
+        aux_loss = torch.zeros((), device=device)
+        f = self.aux_sample_frac
+        if f < 1.0:
+            aux_loss = aux_loss + (1.0 - f) * aux_err(b.mu)
+        if f > 0.0:
+            aux_loss = aux_loss + f * aux_err(b.z)
+        return aux_loss
+
+    def _fault_cls_loss(self, mu, fault_code):
+        """Which fault kind acts (0: none), from the posterior mean.
+
+        Each class present in the batch weighs the same, so the rare kinds
+        shape the encoder as much as the undisturbed majority.
+        """
+        k = self.fault_head.net[-1].out_features
+        tgt = fault_code.long().clamp(0, k - 1)
+        ce = F.cross_entropy(self.fault_head(mu), tgt, reduction="none")
+        onehot = F.one_hot(tgt, k).to(ce.dtype)
+        count = onehot.sum(dim=0)
+        per_class = (onehot * ce.unsqueeze(-1)).sum(dim=0) / count.clamp(min=1.0)
+        present = (count > 0).to(ce.dtype)
+        return (per_class * present).sum() / present.sum()
+
+    def _critic_step(self, b, gate_act, stall_any, step_encoder):
+        """Step the critics, history, encoder, aux head, gate and fault head.
+
+        Returns:
+            Dict of the critic-side losses.
+        """
         with torch.no_grad():
-            a2, logp2, _ = self._safe_sample(o2, feat2, z.detach(),
+            a2, logp2, _ = self._safe_sample(b.o2, b.feat2, b.z.detach(),
                                              gate=gate_act)
             q1_t, q2_t = self.critic_target(
-                feat2, a2, self._critic_cond(z.detach(), ctx_true, priv2))
+                b.feat2, a2, self._critic_cond(b.z.detach(), b.ctx, b.priv2))
             entropy_term = torch.clamp(self.alpha.detach() * logp2,
                                        -ENTROPY_TERM_CLIP, ENTROPY_TERM_CLIP)
             if gate_act is not None:
                 entropy_term = gate_act * entropy_term
-            target = r + (1.0 - d) * self.gamma * (
+            target = b.r + (1.0 - b.d) * self.gamma * (
                 torch.min(q1_t, q2_t) - entropy_term)
         # z is NOT detached here: this is the encoder's Bellman gradient; nor
         # are the history features, unless the history module is frozen.
-        q1, q2 = self.critic(feat, a, self._critic_cond(z, ctx_true, priv))
+        q1, q2 = self.critic(b.feat, b.a, self._critic_cond(b.z, b.ctx, b.priv))
         critic_loss = (F.smooth_l1_loss(q1, target, beta=1.0)
                        + F.smooth_l1_loss(q2, target, beta=1.0))
-
-        aux_loss = torch.zeros((), device=device)
-        if self.aux is not None:
-            if self.aux_mode == "reward":
-                aux_target = r.detach()
-
-                def aux_err(latent):
-                    pred = self.aux(latent, o, a).squeeze(-1)
-                    return F.mse_loss(pred, aux_target)
-            else:
-                aux_target = ctx_true
-                if self.aux_state_targets:
-                    aux_target = torch.cat(
-                        [ctx_true] + [((priv[:, c] - m) / s).unsqueeze(-1)
-                                      for c, m, s in self.aux_state_targets],
-                        dim=-1)
-
-                def aux_err(latent):
-                    return F.mse_loss(self.aux(latent), aux_target)
-            f = self.aux_sample_frac
-            if f < 1.0:
-                aux_loss = aux_loss + (1.0 - f) * aux_err(mu)
-            if f > 0.0:
-                aux_loss = aux_loss + f * aux_err(z)
-
-        # The hold rule reads the privileged titer: only arms that store it.
-        hold_on = self.hold_penalty_weight > 0.0 or self.hold_gate_target
-        stalled = (self._stall_flags(o, priv) if hold_on
-                   else torch.zeros(o.shape[0], 1, device=o.device))
-        stall_any = stalled.amax(dim=-1)
-        gate_loss = torch.zeros((), device=device)
+        zero = torch.zeros((), device=device)
+        aux_loss = self._aux_loss(b) if self.aux is not None else zero
+        gate_loss = fault_cls_loss = zero
         if self.adapt_gate:
-            gate_target = (torch.maximum(fault, stall_any)
-                           if self.hold_gate_target else fault)
-            gate_loss = F.binary_cross_entropy_with_logits(self.gate(mu),
+            gate_target = (torch.maximum(b.fault, stall_any)
+                           if self.hold_gate_target else b.fault)
+            gate_loss = F.binary_cross_entropy_with_logits(self.gate(b.mu),
                                                            gate_target)
-
-        # Which fault kind acts (0: none), from the posterior mean. Each class
-        # present in the batch weighs the same, so the rare kinds shape the
-        # encoder as much as the undisturbed majority.
-        fault_cls_loss = torch.zeros((), device=device)
         if self.fault_head is not None:
-            k = self.fault_head.net[-1].out_features
-            tgt = fault_code.long().clamp(0, k - 1)
-            ce = F.cross_entropy(self.fault_head(mu), tgt, reduction="none")
-            onehot = F.one_hot(tgt, k).to(ce.dtype)
-            count = onehot.sum(dim=0)
-            per_class = (onehot * ce.unsqueeze(-1)).sum(dim=0) / count.clamp(min=1.0)
-            present = (count > 0).to(ce.dtype)
-            fault_cls_loss = (per_class * present).sum() / present.sum()
+            fault_cls_loss = self._fault_cls_loss(b.mu, b.fault_code)
 
         critic_obj = critic_loss
         if self.use_context:
-            critic_obj = critic_obj + self.kl_lambda * kl
+            critic_obj = critic_obj + self.kl_lambda * b.kl
         if self.aux is not None:
             critic_obj = critic_obj + self.aux_weight * aux_loss
-            self.aux_opt.zero_grad()
         if self.adapt_gate:
             critic_obj = critic_obj + self.gate_weight * gate_loss
-            self.gate_opt.zero_grad()
         if self.fault_head is not None:
             critic_obj = critic_obj + self.fault_cls_weight * fault_cls_loss
-            self.fault_head_opt.zero_grad()
-        self.critic_opt.zero_grad()
+        # (module, optimizer) pairs this loss steps, each clipped to norm 5.
+        stepped = [(self.critic, self.critic_opt)]
         if not self.history_frozen:
-            self.history_opt.zero_grad()
+            stepped.append((self.actor.history, self.history_opt))
         if step_encoder:
-            self.encoder_opt.zero_grad()
-        critic_obj.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), 5.0)
-        self.critic_opt.step()
-        if not self.history_frozen:
-            nn.utils.clip_grad_norm_(self.actor.history.parameters(), 5.0)
-            self.history_opt.step()
-        if step_encoder:
-            nn.utils.clip_grad_norm_(self.encoder.parameters(), 5.0)
-            self.encoder_opt.step()
+            stepped.append((self.encoder, self.encoder_opt))
         if self.aux is not None:
-            nn.utils.clip_grad_norm_(self.aux.parameters(), 5.0)
-            self.aux_opt.step()
+            stepped.append((self.aux, self.aux_opt))
         if self.adapt_gate:
-            nn.utils.clip_grad_norm_(self.gate.parameters(), 5.0)
-            self.gate_opt.step()
+            stepped.append((self.gate, self.gate_opt))
         if self.fault_head is not None:
-            nn.utils.clip_grad_norm_(self.fault_head.parameters(), 5.0)
-            self.fault_head_opt.step()
+            stepped.append((self.fault_head, self.fault_head_opt))
+        for _, opt in stepped:
+            opt.zero_grad()
+        critic_obj.backward()
+        for net, opt in stepped:
+            nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+            opt.step()
+        return {"critic_loss": critic_loss, "aux_loss": aux_loss,
+                "gate_loss": gate_loss, "fault_cls_loss": fault_cls_loss}
 
-        actor_loss = torch.full((), float("nan"), device=device)
-        alpha_loss = torch.zeros((), device=device)
-        map_pen = torch.zeros((), device=device)
-        safety_pen = torch.zeros((), device=device)
-        anchor_pen = torch.zeros((), device=device)
-        hold_pen = torch.zeros((), device=device)
+    @staticmethod
+    def _idle_actor_terms():
+        """``_actor_step``'s diagnostics on an update that leaves the actor be."""
+        zero = torch.zeros((), device=device)
         nan = torch.full((), float("nan"), device=device)
-        gap_nominal = gap_fault = nan
-        if train_actor:
-            # ── 2. Actor (z detached; the actor does not shape inference) ─────
-            zd = z.detach()
-            w_gate = (None if gate_act is None
-                      else gate_act / gate_act.sum().clamp(min=1.0))
+        return {"actor_loss": nan, "alpha_loss": zero, "map_loss": zero,
+                "safety_loss": zero, "anchor_loss": zero, "hold_loss": zero,
+                "anchor_gap_nominal": nan, "anchor_gap_fault": nan}
 
-            def batch_mean(x):
-                return x.mean() if w_gate is None else (w_gate * x).sum()
+    def _actor_step(self, b, gate_act, stalled, stall_any):
+        """Step the actor (z detached: it does not shape inference), then alpha.
 
-            a_pi, logp_pi, n_active = self._safe_sample(o, feat_d, zd,
-                                                        gate=gate_act)
-            q1_pi, q2_pi = self.critic(feat_d, a_pi,
-                                       self._critic_cond(zd, ctx_true, priv))
-            actor_loss = batch_mean(self.alpha.detach() * logp_pi
-                                    - torch.min(q1_pi, q2_pi))
+        Returns:
+            Dict of the actor-side losses and the anchor's gaps.
+        """
+        terms = self._idle_actor_terms()
+        zd = b.z.detach()
+        w_gate = (None if gate_act is None
+                  else gate_act / gate_act.sum().clamp(min=1.0))
 
-            # ── 2b. APN safety gradient and mapping penalty ──────────────────
-            actor_loss, safety_pen, map_pen = self._apn_actor_terms(
-                actor_loss, o, feat_d, zd, gate_act, batch_mean)
+        def batch_mean(x):
+            return x.mean() if w_gate is None else (w_gate * x).sum()
 
-            # ── 2c. Anchor to the warm-start policy ──────────────────────────
-            if self.anchor_actor is not None and self._anchor_on:
-                anchor_pen, gap_nominal, gap_fault = self._anchor_terms(
-                    o, feat_d, zd, fault_code, gate=gate_act, weight=w_gate,
-                    stall=stall_any if self.hold_penalty_weight > 0.0 else None)
-                actor_loss = actor_loss + anchor_pen
+        a_pi, logp_pi, n_active = self._safe_sample(b.o, b.feat_d, zd,
+                                                    gate=gate_act)
+        q1_pi, q2_pi = self.critic(b.feat_d, a_pi,
+                                   self._critic_cond(zd, b.ctx, b.priv))
+        actor_loss = batch_mean(self.alpha.detach() * logp_pi
+                                - torch.min(q1_pi, q2_pi))
+        actor_loss, terms["safety_loss"], terms["map_loss"] = (
+            self._apn_actor_terms(actor_loss, b.o, b.feat_d, zd, gate_act,
+                                  batch_mean))
 
-            # ── 2d. Hold rule: keep the outlet shut on a below-spec batch ────
-            # Applied to the ungated actor so the actor itself learns it. Any
-            # discharge above DISCHARGE_CUTOFF drains (and violates every inner
-            # step), so the hinge acts on the pre-tanh mean until the command
-            # is below half the cutoff, averaged over the stalled entries only.
-            if self.hold_penalty_weight > 0.0:
-                out_dims = [reactor_action(i, 3) for i in range(stalled.shape[1])]
-                pre = self.actor(feat_d, zd)[0][:, out_dims]
-                excess = F.relu(pre - HOLD_PRE_TANH_TARGET)
-                hold_pen = (stalled * excess).sum() / stalled.sum().clamp(min=1.0)
-                actor_loss = actor_loss + self.hold_penalty_weight * hold_pen
+        # Anchor to the warm-start policy.
+        if self.anchor_actor is not None and self._anchor_on:
+            anchor_pen, gap_nominal, gap_fault = self._anchor_terms(
+                b.o, b.feat_d, zd, b.fault_code, gate=gate_act, weight=w_gate,
+                stall=stall_any if self.hold_penalty_weight > 0.0 else None)
+            actor_loss = actor_loss + anchor_pen
+            terms.update(anchor_loss=anchor_pen, anchor_gap_nominal=gap_nominal,
+                         anchor_gap_fault=gap_fault)
 
-            self.actor_opt.zero_grad()
-            actor_loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), 5.0)
-            self.actor_opt.step()
-            if self._actor_decay_ref is not None:
-                self._decay_toward_source()
+        # Hold rule: keep the outlet shut on a below-spec batch. Applied to
+        # the ungated actor so the actor itself learns it. Any discharge above
+        # DISCHARGE_CUTOFF drains (and violates every inner step), so the
+        # hinge acts on the pre-tanh mean until the command is below half the
+        # cutoff, averaged over the stalled entries only.
+        if self.hold_penalty_weight > 0.0:
+            out_dims = [reactor_action(i, 3) for i in range(stalled.shape[1])]
+            pre = self.actor(b.feat_d, zd)[0][:, out_dims]
+            excess = F.relu(pre - HOLD_PRE_TANH_TARGET)
+            hold_pen = (stalled * excess).sum() / stalled.sum().clamp(min=1.0)
+            actor_loss = actor_loss + self.hold_penalty_weight * hold_pen
+            terms["hold_loss"] = hold_pen
 
-            # ── 3. Temperature (target entropy over ACTIVE dimensions) ───────
-            alpha_loss = -batch_mean(self.log_alpha
-                                     * (logp_pi.detach()
-                                        + self._entropy_per_dim
-                                        * n_active.detach()))
-            self.alpha_opt.zero_grad()
-            alpha_loss.backward()
-            self.alpha_opt.step()
-            with torch.no_grad():
-                self.log_alpha.clamp_(self._log_alpha_min, LOG_ALPHA_MAX)
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), 5.0)
+        self.actor_opt.step()
+        if self._actor_decay_ref is not None:
+            self._decay_toward_source()
+        terms["actor_loss"] = actor_loss
 
-        # ── Polyak target update ─────────────────────────────────────────────
+        # Temperature: the target entropy counts the ACTIVE dimensions only.
+        alpha_loss = -batch_mean(self.log_alpha
+                                 * (logp_pi.detach()
+                                    + self._entropy_per_dim
+                                    * n_active.detach()))
+        self.alpha_opt.zero_grad()
+        alpha_loss.backward()
+        self.alpha_opt.step()
         with torch.no_grad():
-            p_list = list(self.critic.parameters())
-            tp_list = list(self.critic_target.parameters())
-            torch._foreach_mul_(tp_list, 1.0 - self.tau)
-            torch._foreach_add_(tp_list, p_list, alpha=self.tau)
+            self.log_alpha.clamp_(self._log_alpha_min, LOG_ALPHA_MAX)
+        terms["alpha_loss"] = alpha_loss
+        return terms
 
-        self._mark_rollout_stale()
-        if not want_stats:
-            return {}
+    @torch.no_grad()
+    def _polyak_update(self):
+        p_list = list(self.critic.parameters())
+        tp_list = list(self.critic_target.parameters())
+        torch._foreach_mul_(tp_list, 1.0 - self.tau)
+        torch._foreach_add_(tp_list, p_list, alpha=self.tau)
+
+    @torch.no_grad()
+    def _update_stats(self, b, critic_terms, actor_terms, gate_open,
+                      stall_any):
+        """The update's scalar diagnostics."""
+        nan = torch.full((), float("nan"), device=device)
         gate_nominal = gate_fault = nan
         if gate_open is not None:
-            with torch.no_grad():
-                n_f = fault.sum()
-                n_n = fault.numel() - n_f
-                gate_fault = torch.where(
-                    n_f > 0, (gate_open * fault).sum() / n_f.clamp(min=1.0),
-                    nan)
-                gate_nominal = torch.where(
-                    n_n > 0,
-                    (gate_open * (1.0 - fault)).sum() / n_n.clamp(min=1.0),
-                    nan)
+            n_f = b.fault.sum()
+            n_n = b.fault.numel() - n_f
+            gate_fault = torch.where(
+                n_f > 0, (gate_open * b.fault).sum() / n_f.clamp(min=1.0), nan)
+            gate_nominal = torch.where(
+                n_n > 0, (gate_open * (1.0 - b.fault)).sum() / n_n.clamp(min=1.0),
+                nan)
+        c, a = critic_terms, actor_terms
         return {
-            "gate_loss": float(gate_loss.detach()),
+            "gate_loss": float(c["gate_loss"]),
             "gate_nominal": float(gate_nominal),
             "gate_fault": float(gate_fault),
-            "critic_loss": float(critic_loss.detach()),
-            "actor_loss": float(actor_loss.detach()),
-            "alpha_loss": float(alpha_loss.detach()),
-            "kl": float(kl.detach()),
-            "aux_loss": float(aux_loss.detach()),
-            "fault_cls_loss": float(fault_cls_loss.detach()),
-            "map_loss": float(map_pen.detach()),
-            "safety_loss": float(safety_pen.detach()),
-            "anchor_loss": float(anchor_pen.detach()),
-            "hold_loss": float(hold_pen.detach()),
+            "critic_loss": float(c["critic_loss"]),
+            "actor_loss": float(a["actor_loss"]),
+            "alpha_loss": float(a["alpha_loss"]),
+            "kl": float(b.kl),
+            "aux_loss": float(c["aux_loss"]),
+            "fault_cls_loss": float(c["fault_cls_loss"]),
+            "map_loss": float(a["map_loss"]),
+            "safety_loss": float(a["safety_loss"]),
+            "anchor_loss": float(a["anchor_loss"]),
+            "hold_loss": float(a["hold_loss"]),
             "stall_frac": float(stall_any.mean()),
-            "anchor_gap_nominal": float(gap_nominal),
-            "anchor_gap_fault": float(gap_fault),
+            "anchor_gap_nominal": float(a["anchor_gap_nominal"]),
+            "anchor_gap_fault": float(a["anchor_gap_fault"]),
             # |posterior mean|, not |sample|.
-            "z_norm": float(mu.detach().abs().mean()),
-            "alpha": float(self.alpha.detach().item()),
+            "z_norm": float(b.mu.abs().mean()),
+            "alpha": float(self.alpha.item()),
         }

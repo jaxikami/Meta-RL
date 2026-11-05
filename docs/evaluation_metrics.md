@@ -1,7 +1,7 @@
 # Evaluation metrics: violation burden and net production
 
-Two numbers summarise an evaluation. The **violation burden** $B$ combines
-how often and how badly constraints are violated. The **net production**
+Two numbers summarise an evaluation. The **violation burden** $B$ measures
+how far and for how long constraints are exceeded. The **net production**
 $\Pi$ combines $B$ with output and actuator wear. Both are computed per
 episode in `metarl/training/metrics.py` (`violation_burden`,
 `net_production`) and reported in `eval.json` (`burden`, `score`, and their
@@ -25,47 +25,47 @@ exceedance of the limit:
 | 9 | heat-removal capacity | $(Q - Q_{\text{cap}})/Q_{\text{cap}}$ |
 | 5, 6 | numerical instability, mass-balance drift | no depth (event only) |
 
-The burden of an episode is
+The burden of an episode is the exceedance area
 
 $$
-B \;=\; \sum_{c}\sum_{i}\sum_{t}\Big(\mathbb{1}[\delta_{c,i,t}>0] \;+\; G\,\delta_{c,i,t}\Big)
-\;=\; \underbrace{N}_{\text{violation-hours}} \;+\; G\,\underbrace{A}_{\text{exceedance area}},
-\qquad G = 4 .
+B \;=\; A \;=\; \sum_{c}\sum_{i}\sum_{t}\delta_{c,i,t} ,
 $$
 
-In continuous time this is $\int \big(\mathbb{1}[\delta(t)>0] + G\,\delta(t)\big)\,dt$:
-the area under the exceedance curve with a unit step at the limit.
+in continuous time $\int \delta(t)\,dt$: the area under the exceedance curve.
+The number of violation events $N$ is not part of $B$. It is still reported
+next to it (`violations`, `viol_by_constraint`).
 
-**Why both terms.** The area $A$ alone gives a shallow violation almost no
-weight. Fifty hours at 1 % over the limit would score 0.5, the same as one
-hour at 50 % over. The count $N$ alone ignores depth. With both, each
-violation-hour costs at least 1, and depth adds to that.
-
-**Why $G = 4$.** The environment prices a violation event with the spike
-$1 + G\,\delta/(1+\delta)$, with `DEPTH_GAIN` $= G = 4$. Near the limit this
-is $1 + G\delta$, which is the summand of $B$. A shallow violation therefore
-weighs in $B$ what it costs in the reward. Deeper, $\delta/(1+\delta) \le
-\delta$, so $B$ is an upper bound on the reward's price. The reward saturates
-in depth to keep training stable. A safety report should not saturate. No
-weight is chosen for the report itself.
+**Area only.** $B$ weighs each violation-hour by how far past the limit it
+went, so a shallow violation weighs little: fifty hours at 1 % over the
+limit score 0.5, the same as one hour at 50 % over. Constraints 5 and 6 have
+no depth, so they add nothing to $B$ and appear only in the event counts.
 
 **Properties.**
-- $B = 0$ if and only if the episode has no violation.
-- $B$ grows with how often, how long and how deep the violations are.
+- $B = 0$ when no limit with a depth is exceeded. Events of constraints 5
+  and 6 leave it at 0.
+- $B$ grows with how long and how deep the exceedances are.
 - $B$ is additive over constraints and time, so it splits into
   per-constraint parts. The stacked panel of `compare_burden` shows this
   split.
-- $B$ is dimensionless, in violation-hours at the limit.
+- $B$ is dimensionless, in limit-hours: one unit is one hour spent 100 %
+  past a limit, or ten hours spent 10 % past it.
 
 ## 2. Net production
 
 $$
-\Pi \;=\; E_{\text{on}} \;-\; \frac{\kappa\,B \;+\; R_{\text{sm}}}{\rho}
+\Pi \;=\; E_{\text{on}} \;-\; \frac{\kappa G\,B \;+\; R_{\text{sm}}}{\rho}
 $$
 
 - $E_{\text{on}}$: released, on-spec ethanol (kg). A rejected lot earns
   nothing, so product quality is already in this term.
-- $\kappa$ = `VIOLATION_SPIKE` = 0.1: reward per unit of $B$ at the limit.
+- $\kappa G$: the reward's price per unit of exceedance area.
+  $\kappa$ = `VIOLATION_SPIKE` = 0.1 and $G$ = `DEPTH_GAIN` = 4. The
+  environment prices a violation event at $\kappa\,(1 + G\,\delta/(1+\delta))$,
+  and its depth part is $\kappa G\delta$ near the limit. $\Pi$ charges the
+  area at that slope. Deeper, $\delta/(1+\delta) \le \delta$, so $\Pi$
+  charges more than the reward does: the reward saturates in depth to keep
+  training stable, and a safety report should not saturate. The fixed
+  $\kappa$ per event is not charged, because $B$ has no count.
 - $R_{\text{sm}} = \sum_k \sum_i c_s \,\overline{(u_{i,k}-u_{i,k-1})^2}$: the
   reward's flow-change penalty ($c_s = 0.005$). This is the action-smoothness
   term the project asks to report next to violations.
@@ -79,24 +79,25 @@ barriers). That is why $\Pi$ can be compared across arms when the return
 cannot. The reward's raw-material term is left out because it is about
 $10^{-7}$ kg per episode, against about $2\times10^6$ kg of wear.
 
-**Scale.** $\kappa/\rho = 2\times10^6$ kg per unit of $B$. A nominal
-episode makes about $7.5\times10^7$ kg on spec, so about 37 units of $B$
+**Scale.** $\kappa G/\rho = 8\times10^6$ kg per unit of $B$. A nominal
+episode makes about $7.5\times10^7$ kg on spec, so about 9.4 units of $B$
 cancel its whole output, and $\Pi < 0$ whenever
-$B > E_{\text{on}}/(2\times10^6)$. A negative $\Pi$ means the episode's
-violations cost more than its product at the reward's rate. This is the
-same rate the held-out selection score uses (`heldout.violation_price`).
+$B > E_{\text{on}}/(8\times10^6)$. A negative $\Pi$ means the episode's
+violations cost more than its product at the reward's rate. The held-out
+selection score prices violation events instead, at $\kappa/\rho = 2\times10^6$
+kg per event (`heldout.violation_price`).
 
-**Robustness to the price.** The ranking of two arms can depend on
-$\kappa$. Report the break-even price
+**Robustness to the price.** The ranking of two arms can depend on the
+price per unit of $B$, $\lambda = \kappa G$. Report the break-even price
 
 $$
-\kappa^{*} \;=\; \rho\,\frac{\Delta E_{\text{on}} - \Delta R_{\text{sm}}/\rho}{\Delta B},
+\lambda^{*} \;=\; \rho\,\frac{\Delta E_{\text{on}} - \Delta R_{\text{sm}}/\rho}{\Delta B},
 \qquad \Delta x = x_{\text{meta}} - x_{\text{saferl}},
 $$
 
 the violation price at which the two arms tie. If $\Delta E_{\text{on}}$ and
 $-\Delta B$ have the same sign, one arm dominates at every price, and
-$\kappa$ does not matter.
+$\lambda$ does not matter.
 
 ## 3. Reporting
 

@@ -41,6 +41,7 @@ Run from the repository root:
     python tests/smoke_test.py           # prints "ALL SMOKE CHECKS PASSED"
 """
 
+import contextlib
 import os
 import sys
 import tempfile
@@ -170,6 +171,16 @@ def _pol_open_loop(obs, clocks=(1.0, 0.8, 0.6), s_cap=0.85):
 def _pol_full_throttle(obs):
     """Every pump and valve fully open, unit clocks (the stage mask applies)."""
     return np.tile([T1, 1.0, 1.0, 1.0], N_REACTORS)
+
+
+@contextlib.contextmanager
+def _raises(exc, what):
+    """Fail with ``what`` unless the block raises ``exc``."""
+    try:
+        yield
+    except exc:
+        return
+    raise AssertionError(what)
 
 
 def _run(env, policy, task=None, faults=(), record=None):
@@ -502,18 +513,10 @@ def check_fault_targeting():
     g = task["flow"]["feed_gain"]
     assert np.isclose(env.feed_gain[0], 1.2 * g[0]) and np.allclose(env.feed_gain[1:], g[1:])
     for kind in PLANT_DISTURBANCES:
-        try:
+        with _raises(ValueError, f"{kind} accepted a reactor"):
             env.schedule_disturbance(kind, 3, 0.5, reactor=0)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"{kind} accepted a reactor")
-    try:
+    with _raises(ValueError, "an unknown kind was accepted"):
         env.schedule_disturbance("mass_drift", 3, 0.5)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("an unknown kind was accepted")
     # A neutral magnitude never raises the flag.
     env.clear_disturbances()
     env.set_task(nominal_task())
@@ -725,11 +728,8 @@ def check_eval_tiers():
     assert scenario_tier("T1", None, ("leak",)) == "T1"
     assert _holdout_kinds(" kinetics_decay, leak,leak") == (
         "disturb_kinetics_decay", "leak")
-    try:
+    with _raises(ValueError, "an unknown held-out kind was accepted"):
         _holdout_kinds("leek")
-        raise AssertionError("an unknown held-out kind was accepted")
-    except ValueError:
-        pass
     code = ("from metarl.training import config as c; "
             "assert 'leak' not in c.META_DISTURB_KINDS; "
             "assert all(d[0] != 'leak' for d in c.HELDOUT_DISTURBANCES); "
@@ -1057,12 +1057,8 @@ def check_recurrent_encoder():
     assert torch.all(mu[starts] == 0) and torch.all(sig[starts] == 1)
     assert not torch.allclose(mu, torch.zeros_like(mu)), "the GRU is inert"
     _, rows_s, lo_s, hi_s = replay.sample_windows(0, n, 4, chunk_len=n, starts=[0])
-    try:
+    with _raises(ValueError, "a window shorter than an episode was accepted"):
         agent._window_posterior(rows_s, lo_s, hi_s)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("a window shorter than an episode was accepted")
     # Meta-arm training: privileged replay, task-aware critics, titer targets.
     tagent = _ctx_agent()
     assert tagent.aux.net[-1].out_features == TASK_CONTEXT_DIM + N_REACTORS
@@ -1210,7 +1206,8 @@ def check_warm_start_and_gate():
         seen.clear()
         rollout_deterministic(env, teach, sample_task(rng),
                               disturbance=[("leak", 20, 0.01, 0)])
-        assert seen and all(g < 1e-3 for _, _, g in seen),             "a deterministic rollout acted through the training gate"
+        assert seen and all(g < 1e-3 for _, _, g in seen), \
+            "a deterministic rollout acted through the training gate"
         del teach.select_action
         # The encoder steps on every third update only.
         e0 = [p.detach().clone() for p in teach.encoder.parameters()]
@@ -1218,7 +1215,8 @@ def check_warm_start_and_gate():
             st = teach.update(treplay, meta_batch=1, batch_size=16,
                               context_size=CTX)
         assert all(torch.equal(p0, p)
-                   for p0, p in zip(e0, teach.encoder.parameters())),             "the encoder stepped off its interval"
+                   for p0, p in zip(e0, teach.encoder.parameters())), \
+            "the encoder stepped off its interval"
         st = teach.update(treplay, meta_batch=1, batch_size=16, context_size=CTX)
         assert not all(torch.equal(p0, p)
                        for p0, p in zip(e0, teach.encoder.parameters()))
@@ -1245,12 +1243,8 @@ def check_warm_start_and_gate():
                     assert torch.equal(t_a.cpu(), t_b.cpu()), net
         # A different architecture is refused.
         small = PEARLAgent(STATE_DIM, ACTION_DIM, critic_hidden=64)
-        try:
+        with _raises(ValueError, "warm start across architectures accepted"):
             small.warm_start_from(path)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("warm start across architectures accepted")
     print("  warm start and adaptation gate OK (source policy and critics for "
           "every z; shut gate = source, open = actor; held actor; training "
           "rollouts act through the actor, deterministic ones through the "

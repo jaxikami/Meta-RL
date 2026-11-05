@@ -1401,14 +1401,15 @@ def check_branched_rollouts_and_pool():
                   "viol_depth_sum", "burden", "smoothing", "score"):
             assert scratch[k] == row[k], (n, k, scratch[k], row[k])
         assert np.array_equal(scratch["act_traj"], row["act_traj"]), n
-        # Burden = events + DEPTH_GAIN x depth area; net production prices
-        # it and the wear at the reward's rates.
+        # Burden = the depth area alone; net production prices it at the
+        # reward's depth slope and the wear at the reward's rate.
         n_ev = sum(row["viol_by_constraint"].values())
         assert n_ev == row["violations"], (n, n_ev, row["violations"])
         area = sum(row["viol_depth_sum"].values())
-        assert np.isclose(row["burden"], n_ev + DEPTH_GAIN * area), n
+        assert np.isclose(row["burden"], area), n
+        assert all(row["burden_by_constraint"][c] == 0.0 for c in (5, 6)), n
         assert np.isclose(row["score"], row["on_spec_ethanol"] - (
-            VIOLATION_SPIKE * row["burden"] + row["smoothing"])
+            VIOLATION_SPIKE * DEPTH_GAIN * row["burden"] + row["smoothing"])
             / PROD_REWARD_PER_ETH), n
     # The held-out score that selection and early stopping read.
     ho = blended_heldout_score(env, agent, tasks)

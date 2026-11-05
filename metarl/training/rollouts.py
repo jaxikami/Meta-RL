@@ -206,7 +206,7 @@ def _advance(env, agent, ep, stop_at=None):
 def _episode_metrics(env, agent, ep):
     """Summarise a finished deterministic episode."""
     info, acts = ep["info"], ep["acts"]
-    burden = violation_burden(ep["viol_by_constraint"], ep["viol_depth_sum"])
+    burden = violation_burden(ep["viol_depth_sum"], ep["viol_by_constraint"])
     on_spec = float(info.get("on_spec_ethanol", 0.0))
     probe = {}
     if ep["probe_traj"]:

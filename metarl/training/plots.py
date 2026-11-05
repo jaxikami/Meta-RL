@@ -117,8 +117,8 @@ def _plot_adapt(results, names, labels, INK, INK2, GRID, plt):
         return np.asarray(r.get(key, []), dtype=float)
 
     panels = (
-        ("burden", "Violation burden avoided per episode (violation-hours + "
-                   "depth-weighted exceedance area)", "saferl - meta  (B)",
+        ("burden", "Violation burden avoided per episode (exceedance area "
+                   "past the limits, limit-hours)", "saferl - meta  (B)",
          lambda v: f"{v:+.1f}"),
         ("eth", "On-spec ethanol gained", "meta - saferl  (% of saferl)",
          lambda v: f"{v:+.1f}%"),

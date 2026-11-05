@@ -610,8 +610,8 @@ def _print_eval(results, summary):
         snr, ok = summary["z_snr_mean"], summary["z_snr_pass"]
         print(f"\nlatent separability: mean SNR {snr:.2f} "
               f"({'>= ' if ok else '< '}{Z_INFORM_MIN_SNR})")
-    print("\nB: violation burden, violation-hours + DEPTH_GAIN x exceedance "
-          "area (lower is better).  Pi: net production, on-spec ethanol less "
+    print("\nB: violation burden, exceedance area past the limits in "
+          "limit-hours (lower is better).  Pi: net production, on-spec ethanol less "
           "violations and wear at the reward's rates (higher is better).")
     print(f"\n{'scenario':<26}" + "".join(
         f"{a + ' B':>12}{a + ' on-spec':>16}{a + ' Pi':>14}" for a in arms))

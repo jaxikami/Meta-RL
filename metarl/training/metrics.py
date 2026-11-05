@@ -10,35 +10,36 @@ from metarl.env.plant import DEPTH_GAIN
 from metarl.training.config import _T95, PRACTICAL_MIN_REL_EFFECT
 
 
-def violation_burden(counts, depth_sums):
-    """Severity-weighted violation-hours of one episode, per constraint.
+def violation_burden(depth_sums, constraints):
+    """Exceedance area of one episode, per constraint.
 
-    B_c = N_c + DEPTH_GAIN * A_c. N_c counts constraint c's events (one per
-    inner hour and instance, one per rejected lot for purity, one per episode
-    for mass balance): how often. A_c sums their relative depths past the
-    limit, the area under the exceedance curve in limit-hours: how badly.
-    DEPTH_GAIN is the slope at the limit of the spike the environment prices
-    a violation with, 1 + DEPTH_GAIN * d / (1 + d), so a shallow violation
-    weighs here what it costs in the reward and a deep one more (d / (1 + d)
-    <= d keeps the reward bounded; a report should not be).
+    B_c = A_c: the relative depths past the limit summed over constraint c's
+    events (one per inner hour and instance, one per rejected lot for
+    purity), the area under the exceedance curve in limit-hours. The event
+    counts are not part of it (they are reported as ``violations``), so
+    constraints without a depth (5, 6) contribute nothing.
 
     Args:
-        counts: {constraint: N_c}.
-        depth_sums: {constraint: A_c}; constraints without a depth (5, 6)
-            may be missing.
+        depth_sums: {constraint: A_c}; constraints without a depth may be
+            missing.
+        constraints: The constraints to report, the keys of the result.
 
     Returns:
-        {constraint: B_c} over the keys of ``counts``.
+        {constraint: B_c}.
     """
-    return {c: float(n) + DEPTH_GAIN * float(depth_sums.get(c, 0.0))
-            for c, n in counts.items()}
+    return {c: float(depth_sums.get(c, 0.0)) for c in constraints}
 
 
 def net_production(on_spec_eth, burden, smoothing):
     """On-spec ethanol net of violations and actuator wear, in ethanol.
 
-    Pi = E_on - (VIOLATION_SPIKE * B + R_smooth) / PROD_REWARD_PER_ETH: every
-    term at the environment's own reward rate, so no weight is chosen here.
+    Pi = E_on - (VIOLATION_SPIKE * DEPTH_GAIN * B + R_smooth) /
+    PROD_REWARD_PER_ETH: every term at the environment's own reward rate, so
+    no weight is chosen here. The environment prices a violation d past its
+    limit at VIOLATION_SPIKE * (1 + DEPTH_GAIN * d / (1 + d)), whose depth
+    part is VIOLATION_SPIKE * DEPTH_GAIN * d near the limit; the area B is
+    charged at that slope, and deeper than the reward's saturation (a report
+    should not saturate).
     The arm-specific terms of the reward (the learned Lagrange multipliers)
     and its shaping (soft walls, barriers) are left out, which is what makes
     it comparable across arms where the return is not. The raw-material
@@ -49,7 +50,7 @@ def net_production(on_spec_eth, burden, smoothing):
         burden: ``violation_burden`` summed over constraints.
         smoothing: The reward's flow-change penalty over the episode.
     """
-    return float(on_spec_eth) - (VIOLATION_SPIKE * float(burden)
+    return float(on_spec_eth) - (VIOLATION_SPIKE * DEPTH_GAIN * float(burden)
                                  + float(smoothing)) / PROD_REWARD_PER_ETH
 
 

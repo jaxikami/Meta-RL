@@ -18,3 +18,7 @@ extend-exclude = [
     "metarl/apn/validate.py",
     "metarl/apn/validation_plots.py",
 ]
+
+[lint.per-file-ignores]
+# The smoke test puts the repo root on sys.path before importing metarl.
+"tests/smoke_test.py" = ["E402"]

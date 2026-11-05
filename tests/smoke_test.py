@@ -65,8 +65,7 @@ from metarl.env.config import (N_REACTORS, nominal_task, sample_task,
                                CTX_KIN, CTX_DOWNSTREAM, CTX_TURNAROUND,
                                CTX_STORAGE_CAP, CTX_COOLING_CAP,
                                REACTOR_FLOW_SCALE, REACTOR_OBS_DIM,
-                               PRODUCT_MASS_SCALE, TITER_SCALE,
-                               get_main_reactor_config)
+                               PRODUCT_MASS_SCALE, TITER_SCALE)
 from metarl.env.kinetics import integrate_rk4
 from metarl.env.layout import (STATE_DIM, ACTION_DIM,
                                STORAGE_CHANNEL, PRIVILEGED_STATE_DIM,
@@ -562,7 +561,7 @@ def check_discharge_cutoff_and_batch_boundary():
     env = PlantFermentationEnv()
     env.set_task(nominal_task())
     env.clear_disturbances()
-    obs = env.reset()
+    env.reset()
     env.current_stage[0] = 3
     env.M[0] = 100000.0
     act = np.tile([T1, -1, -1, -1.0], N_REACTORS)

@@ -9,9 +9,11 @@ import os
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from metarl.env.layout import LOT_TITER_PRIV_CHANNELS, ACTION_DIM
-from metarl.env.disturbances import (EVAL_DISTURBANCES, EVAL_ONSET,
-                                     EVAL_SPIKE_H, EVAL_GRADUAL_H,
-                                     EVAL_RECURRENT_WINDOWS, FAULT_PATTERNS)
+from metarl.env.disturbances import EVAL_ONSET
+# Re-exported for evaluate, tasks and the smoke test.
+from metarl.env.disturbances import (  # noqa: F401
+    EVAL_DISTURBANCES, EVAL_SPIKE_H, EVAL_GRADUAL_H, EVAL_RECURRENT_WINDOWS,
+    FAULT_PATTERNS)
 from metarl.env.faults import DISTURBANCE_ALIASES, VALID_DISTURBANCES
 
 MODE = "all"

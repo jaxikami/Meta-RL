@@ -182,9 +182,6 @@ class LearningMixin:
         """The per-kind post-fault anchor weights (index 0 = pre-fault)."""
         return self._anchor_kind_np.copy()
 
-    def _anchor_active(self):
-        return self._anchor_on
-
     @torch.no_grad()
     def _decay_toward_source(self):
         """Turn this step's AdamW decay into decay toward the loaded weights (L2-SP)."""
@@ -487,7 +484,7 @@ class LearningMixin:
                     actor_loss = actor_loss + self.apn_penalty_weight * map_pen
 
             # ── 2c. Anchor to the warm-start policy ──────────────────────────
-            if self.anchor_actor is not None and self._anchor_active():
+            if self.anchor_actor is not None and self._anchor_on:
                 anchor_pen, gap_nominal, gap_fault = self._anchor_terms(
                     o, feat_d, zd, fault_code, gate=gate_act, weight=w_gate,
                     stall=stall_any if self.hold_penalty_weight > 0.0 else None)

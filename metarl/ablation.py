@@ -1048,7 +1048,7 @@ def main(argv=None):
               f"train, {len(todo) - n_train} to evaluate "
               f"({len(status) - len(todo)} already complete) ---")
         print(f"  configs: {', '.join(names)}")
-        print(f"  training: " + (f"{args.budget} iterations per variant, early "
+        print("  training: " + (f"{args.budget} iterations per variant, early "
                                  f"stopping off" if args.budget else
                                  "the study's protocol (early stopping on)")
               + f"; evaluation: {args.eval_episodes} tasks per scenario")

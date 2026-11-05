@@ -12,7 +12,7 @@ import numpy as np
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from metarl.env.config import (N_REACTORS, I_ETH, R_STAGE,
-                               R_STORAGE, R_LF, R_C5, REACTOR_OBS_DIM)
+                               R_STORAGE, REACTOR_OBS_DIM)
 
 # ─── Observation layout (see config) ──────────────────────────────────────────
 STATE_DIM = N_REACTORS * REACTOR_OBS_DIM               # 84
@@ -32,8 +32,6 @@ def reactor_channel(i, offset):
 
 # The plant-wide channels are repeated in every row; reactor 0's copy is read.
 STORAGE_CHANNEL = reactor_channel(0, R_STORAGE)
-LF_CHANNEL = reactor_channel(0, R_LF)
-C5_CHANNEL = reactor_channel(0, R_C5)
 
 # Width of PlantFermentationEnv.privileged_state(): the observation, then
 # each reactor's lot in progress (mass, mean titer: the observation has no

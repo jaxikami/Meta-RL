@@ -40,7 +40,6 @@ class FiLM(nn.Module):
         return h * (1.0 + gamma) + beta
 
 
-
 def token_index():
     """Observation channels of each reactor's token, shape (N_REACTORS, 28).
 

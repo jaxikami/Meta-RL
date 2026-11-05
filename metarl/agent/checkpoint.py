@@ -119,6 +119,24 @@ class CheckpointMixin:
             return
         self.install_kinetic(ckpt["apn_kinetic"])
 
+    def _restore_alpha_and_ret_rms(self, ckpt):
+        """Restore the temperature and, if both sides have one, the reward scaler."""
+        with torch.no_grad():
+            self.log_alpha.copy_(ckpt["log_alpha"].to(device))
+        if "ret_rms" in ckpt and self.ret_rms is not None:
+            mean, var, count = ckpt["ret_rms"]
+            self.ret_rms.mean = float(mean)
+            self.ret_rms.var = float(var)
+            self.ret_rms.count = float(min(count, self.ret_rms.max_count))
+
+    def _safety_flag_mismatches(self, ckpt, keys):
+        """(key, checkpoint value, this agent's) for each safety flag that differs."""
+        have = {"use_safeguard": self.use_safeguard,
+                "uses_apn": self.apn is not None,
+                "apn_hard_project": self.apn_hard_project}
+        return [(k, ckpt[k], have[k]) for k in keys
+                if ckpt.get(k) is not None and bool(ckpt[k]) != bool(have[k])]
+
     @staticmethod
     def _torch_load_safe(path):
         """Load a checkpoint, preferring the restricted unpickler."""
@@ -173,13 +191,7 @@ class CheckpointMixin:
                   f"(task={stored_ctc}, plant state={stored_cpd} ch); critics "
                   f"not loaded (acting and evaluation use only the actor and "
                   f"encoder)")
-        with torch.no_grad():
-            self.log_alpha.copy_(ckpt["log_alpha"].to(device))
-        if "ret_rms" in ckpt and self.ret_rms is not None:
-            mean, var, count = ckpt["ret_rms"]
-            self.ret_rms.mean = float(mean)
-            self.ret_rms.var = float(var)
-            self.ret_rms.count = float(min(count, self.ret_rms.max_count))
+        self._restore_alpha_and_ret_rms(ckpt)
         if self.use_context and "encoder" in ckpt:
             self.encoder.load_state_dict(ckpt["encoder"])
         if self.aux is not None and "aux" in ckpt:
@@ -207,14 +219,11 @@ class CheckpointMixin:
                       f"(was {self.gate_sharpness})")
                 self.gate_sharpness = float(stored)
         self._restore_kinetic(path, ckpt)
-        for key, have in (("use_safeguard", self.use_safeguard),
-                          ("uses_apn", self.apn is not None),
-                          ("apn_hard_project", self.apn_hard_project)):
-            want = ckpt.get(key)
-            if want is not None and bool(want) != bool(have):
-                print(f"[!] {path}: checkpoint has {key}={want} but this agent "
-                      f"was built with {key}={have}. The arm's safety stack "
-                      f"does not match its weights.")
+        for key, want, have in self._safety_flag_mismatches(
+                ckpt, ("use_safeguard", "uses_apn", "apn_hard_project")):
+            print(f"[!] {path}: checkpoint has {key}={want} but this agent "
+                  f"was built with {key}={have}. The arm's safety stack "
+                  f"does not match its weights.")
         self._mark_rollout_stale()
         self.clear_z()
 
@@ -259,20 +268,12 @@ class CheckpointMixin:
             module.load_state_dict(_film_padded(
                 ckpt[key], module.state_dict(), f"{path} [{key}]",
                 self._z_dim))
-        with torch.no_grad():
-            self.log_alpha.copy_(ckpt["log_alpha"].to(device))
-        if "ret_rms" in ckpt and self.ret_rms is not None:
-            mean, var, count = ckpt["ret_rms"]
-            self.ret_rms.mean = float(mean)
-            self.ret_rms.var = float(var)
-            self.ret_rms.count = float(min(count, self.ret_rms.max_count))
+        self._restore_alpha_and_ret_rms(ckpt)
         self._restore_kinetic(path, ckpt)
-        for key, have in (("use_safeguard", self.use_safeguard),
-                          ("uses_apn", self.apn is not None)):
-            want = ckpt.get(key)
-            if want is not None and bool(want) != bool(have):
-                print(f"[info] warm start from {path}: the source ran with "
-                      f"{key}={want}, this agent runs with {key}={have}")
+        for key, want, have in self._safety_flag_mismatches(
+                ckpt, ("use_safeguard", "uses_apn")):
+            print(f"[info] warm start from {path}: the source ran with "
+                  f"{key}={want}, this agent runs with {key}={have}")
         self.set_anchor_weights(pre=float(anchor_weight))
         self.anchor_fault_frac = float(anchor_fault_frac)
         self.anchor_fault_dim_scale = torch.as_tensor(

@@ -121,9 +121,9 @@ class PEARLAgent(ActingMixin, ShieldMixin, LearningMixin, CheckpointMixin):
         the encoder on one update in that many (the heads and critics on
         every one), so it revisits each stored episode fewer times.
         """
-        if float(explore_noise_beta) < 0.0:
-            raise ValueError(f"explore_noise_beta must be >= 0, got "
-                             f"{explore_noise_beta}")
+        self._check_args(explore_noise_beta, adapt_gate, use_context,
+                         critic_privileged_dim, aux_state_targets, aux_mode,
+                         aux_sample_frac, encoder_update_every)
         self.explore_noise_beta = float(explore_noise_beta)
         self._explore_seq = None
         self._explore_t = 0
@@ -134,28 +134,10 @@ class PEARLAgent(ActingMixin, ShieldMixin, LearningMixin, CheckpointMixin):
         # without context), so a context-free source and a context agent
         # have identically shaped actors and critics.
         self._z_dim = max(1, int(latent_dim))
-        if adapt_gate and not use_context:
-            raise ValueError("adapt_gate needs a context agent: the gate "
-                             "reads the latent")
-        if int(critic_privileged_dim) < 0:
-            raise ValueError(f"critic_privileged_dim must be >= 0, got "
-                             f"{critic_privileged_dim}")
         self.critic_task_context = bool(critic_task_context)
         self.critic_privileged_dim = int(critic_privileged_dim)
         self.aux_state_targets = tuple(
             (int(c), float(m), float(s)) for c, m, s in (aux_state_targets or ()))
-        if self.aux_state_targets:
-            if aux_mode != "task" or not use_context:
-                raise ValueError("aux_state_targets needs a context agent "
-                                 "with aux_mode='task'")
-            if not self.critic_privileged_dim:
-                raise ValueError("aux_state_targets reads the stored "
-                                 "privileged state: set critic_privileged_dim")
-            bad = [c for c, _, s in self.aux_state_targets
-                   if not 0 <= c < self.critic_privileged_dim or s <= 0.0]
-            if bad:
-                raise ValueError(f"aux_state_targets: channels {bad} are out "
-                                 f"of range or have a non-positive scale")
         self.adapt_gate = bool(adapt_gate)
         self.gate_weight = float(gate_weight)
         self.gate_sharpness = float(gate_sharpness)
@@ -188,9 +170,6 @@ class PEARLAgent(ActingMixin, ShieldMixin, LearningMixin, CheckpointMixin):
         self.aux_mode = aux_mode if use_context else "none"
         self.aux_weight = float(aux_weight)
         self.aux_sample_frac = float(aux_sample_frac)
-        if not 0.0 <= self.aux_sample_frac <= 1.0:
-            raise ValueError(f"aux_sample_frac must be in [0, 1], got "
-                             f"{aux_sample_frac}")
 
         self.z_mode = "sample"
         self.z_hold_after = 10
@@ -298,9 +277,6 @@ class PEARLAgent(ActingMixin, ShieldMixin, LearningMixin, CheckpointMixin):
         self.fault_head_opt = (torch.optim.Adam(self.fault_head.parameters(),
                                                 lr=lr)
                                if self.fault_head is not None else None)
-        if int(encoder_update_every) < 1:
-            raise ValueError(f"encoder_update_every must be >= 1, got "
-                             f"{encoder_update_every}")
         self.encoder_update_every = int(encoder_update_every)
         self._n_updates = 0
 
@@ -352,6 +328,40 @@ class PEARLAgent(ActingMixin, ShieldMixin, LearningMixin, CheckpointMixin):
         self._share_check = True
 
         self.clear_z()
+
+    @staticmethod
+    def _check_args(explore_noise_beta, adapt_gate, use_context,
+                    critic_privileged_dim, aux_state_targets, aux_mode,
+                    aux_sample_frac, encoder_update_every):
+        """Raise ValueError on an inconsistent constructor argument."""
+        if float(explore_noise_beta) < 0.0:
+            raise ValueError(f"explore_noise_beta must be >= 0, got "
+                             f"{explore_noise_beta}")
+        if adapt_gate and not use_context:
+            raise ValueError("adapt_gate needs a context agent: the gate "
+                             "reads the latent")
+        if int(critic_privileged_dim) < 0:
+            raise ValueError(f"critic_privileged_dim must be >= 0, got "
+                             f"{critic_privileged_dim}")
+        if aux_state_targets:
+            if aux_mode != "task" or not use_context:
+                raise ValueError("aux_state_targets needs a context agent "
+                                 "with aux_mode='task'")
+            if not int(critic_privileged_dim):
+                raise ValueError("aux_state_targets reads the stored "
+                                 "privileged state: set critic_privileged_dim")
+            bad = [int(c) for c, _, s in aux_state_targets
+                   if not 0 <= int(c) < int(critic_privileged_dim)
+                   or float(s) <= 0.0]
+            if bad:
+                raise ValueError(f"aux_state_targets: channels {bad} are out "
+                                 f"of range or have a non-positive scale")
+        if not 0.0 <= float(aux_sample_frac) <= 1.0:
+            raise ValueError(f"aux_sample_frac must be in [0, 1], got "
+                             f"{aux_sample_frac}")
+        if int(encoder_update_every) < 1:
+            raise ValueError(f"encoder_update_every must be >= 1, got "
+                             f"{encoder_update_every}")
 
     def param_counts(self):
         """Trainable parameter counts per network, for logging."""

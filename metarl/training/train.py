@@ -2,6 +2,7 @@
 
 # ─── Standard Library ─────────────────────────────────────────────────────────
 import os
+from dataclasses import dataclass, field
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
 import numpy as np
@@ -154,52 +155,92 @@ class _Collector:
         return out
 
 
-def _train(arm):
-    """Train one arm; every switch comes from its ``ArmSpec``.
+LOG_KEYS = ("iter", "avg_reward", "avg_violations", "critic_loss",
+            "actor_loss", "kl", "aux_loss", "fault_cls_loss", "map_loss",
+            "safety_loss", "anchor_loss",
+            "alpha", "anchor_gap_nominal", "anchor_gap_fault",
+            "gate_loss", "gate_nominal", "gate_fault", "hold_loss", "stall_frac",
+            "z_norm", "proj_noop_frac", "proj_mean_steps",
+            "heldout_iter", "heldout_violations", "heldout_reward",
+            "heldout_on_spec_ethanol", "heldout_purity_rate",
+            "heldout_z_snr", "heldout_score",
+            "heldout_undisturbed_violations", "heldout_undisturbed_reward",
+            "heldout_undisturbed_on_spec_ethanol",
+            "heldout_undisturbed_score",
+            "heldout_disturbed_violations", "heldout_disturbed_reward",
+            "heldout_disturbed_on_spec_ethanol", "heldout_disturbed_score",
+            "heldout_viol_worst", "heldout_undisturbed_viol_worst",
+            "heldout_disturbed_viol_worst",
+            "heldout_gate_violations", "heldout_gate_viol_worst",
+            "heldout_panel", "heldout_undisturbed_per_task",
+            "heldout_regressions", "heldout_anchor_weight",
+            "heldout_anchor_kind_weights", "heldout_gate_late")
 
-    Returns:
-        The trained agent.
-    """
-    spec = get_arm(arm)
-    label, use_context = spec.label, spec.use_context
-    n_collect = (META_COLLECT_EPISODES_PER_ITER if spec.multitask
-                 else COLLECT_EPISODES_PER_ITER)
-    seed_everything(SEED)
-    env = make_arm_env(spec)
-    agent = _build_agent(env, spec, train_apn_if_missing=True)
-    agent.enable_refiner(APN_REFINE_EVERY, APN_REFINE_EPISODES, seed=SEED)
-    replay = MultiTaskReplayBuffer(env.stateDim, env.actionDim,
-                                   priv_dim=agent.critic_privileged_dim)
-    rng = np.random.default_rng(SEED + 1)
-    if spec.multitask:
-        write_holdout()
-        if META_HOLDOUT_KINDS:
-            print(f"  held out of training (tier 3): "
-                  f"{', '.join(META_HOLDOUT_KINDS)}")
+# Held-out results logged at every check, as "heldout_<key>".
+_HELDOUT_STATS = ("violations", "reward", "on_spec_ethanol", "score",
+                  "purity_rate", "z_snr", "undisturbed_violations",
+                  "undisturbed_reward", "undisturbed_on_spec_ethanol",
+                  "undisturbed_score", "disturbed_violations",
+                  "disturbed_reward", "disturbed_on_spec_ethanol",
+                  "disturbed_score", "viol_worst",
+                  "undisturbed_viol_worst", "disturbed_viol_worst",
+                  "gate_violations", "gate_viol_worst")
 
-    pool = (make_task_pool(N_TRAIN_TASKS, seed=0) if spec.multitask
-            else [nominal_task()])
-    fresh_tasks = spec.multitask
-    task_rng = np.random.default_rng(SEED + 2)
 
-    def draw_task(tid):
-        """The task for one training episode stored in bucket ``tid``."""
-        return sample_task(task_rng) if fresh_tasks else pool[tid]
+@dataclass
+class _Selection:
+    """The best held-out check so far, and how many checks each gate rejected."""
+    viol: float = float("inf")
+    eth: float = -float("inf")
+    iteration: "int | None" = None
+    score: float = float("nan")
+    panel_viol: float = float("nan")
+    worst: float = float("inf")
+    feasible: bool = False
+    tail_rejects: int = 0
+    regress_rejects: int = 0
+    regress_causes: dict = field(default_factory=dict)
 
-    strat = MagnitudeStratifier()
-    corner = make_corner_tasks()
-    heldout = make_task_pool(HELDOUT_EVAL_TASKS, seed=HELDOUT_TASK_SEED) + corner
-    if corner:
-        print(f"  held-out pool: {HELDOUT_EVAL_TASKS} random + {len(corner)} "
-              f"corner (risk " + ", ".join(f"{corner_risk(t):.2f}" for t in corner)
-              + ")")
+    def consider(self, ho, regress, it):
+        """Judge one held-out check; True when it is the new best.
 
+        A check is feasible when its gated mean and worst-episode violations
+        pass and it regresses nowhere. The best is the highest-scoring
+        feasible check, or, before any check was feasible, the one with the
+        fewest gated violations.
+        """
+        gate_v, gate_w = ho["gate_violations"], ho["gate_viol_worst"]
+        mean_ok = gate_v <= SELECT_MAX_VIOL
+        tail_ok = gate_w <= SELECT_MAX_WORST_VIOL
+        feasible = mean_ok and tail_ok and not regress
+        if mean_ok and not tail_ok:
+            self.tail_rejects += 1
+        if mean_ok and tail_ok and regress:
+            self.regress_rejects += 1
+            for cause in regress:
+                self.regress_causes[cause] = self.regress_causes.get(cause, 0) + 1
+        if feasible:
+            better = (not self.feasible) or ho["score"] > self.score
+        else:
+            better = (not self.feasible) and gate_v < self.viol
+        if better:
+            self.feasible = self.feasible or feasible
+            self.viol, self.eth, self.score, self.iteration = (
+                gate_v, ho["on_spec_ethanol"], ho["score"], it)
+            self.worst = gate_w
+            self.panel_viol = ho["disturbed_violations"]
+        return better
+
+
+def _print_header(spec, env, agent, n_tasks, n_collect):
+    """The arm, its networks and the plant, before training."""
+    use_context = spec.use_context
     pc = agent.param_counts()
     dev_name = (f"{device} ({torch.cuda.get_device_name(device)})"
                 if device.type == "cuda" else str(device))
-    print(f"\n{'=' * 78}\nTRAIN {label}  ({spec.blurb})\n"
+    print(f"\n{'=' * 78}\nTRAIN {spec.label}  ({spec.blurb})\n"
           f"  {spec.summary()}  "
-          f"tasks={'fresh per episode' if fresh_tasks else len(pool)}"
+          f"tasks={'fresh per episode' if spec.multitask else n_tasks}"
           f"  film={USE_FILM}  aux={AUX_MODE if use_context else 'n/a'}  "
           f"device={dev_name}\n"
           f"  net: {N_REACTORS} reactor tokens, {NET_MIXER_LAYERS} attention "
@@ -220,115 +261,113 @@ def _train(arm):
           f"observed exactly; control interval "
           f"{env.control_action_interval} h")
 
-    actor_warmup = max(1, META_ACTOR_WARMUP_ITERS) if spec.warm_start else 0
-    src = None
-    if spec.warm_start:
-        src_final, src_best = arm_paths(spec.warm_start)
-        src = next((p for p in (src_best, src_final) if os.path.exists(p)),
-                   None)
-        if src is None:
-            raise SystemExit(
-                f"[{label}] warm start needs a trained {spec.warm_start} "
-                f"checkpoint ({src_best} or {src_final}). Train "
-                f"{spec.warm_start} first ('all' trains it before "
-                f"{spec.name}), or set warm_start=None in "
-                f"ARMS['{spec.name}'].")
-        try:
-            agent.warm_start_from(src, anchor_weight=META_ANCHOR_WEIGHT,
-                                  anchor_fault_frac=META_ANCHOR_FAULT_FRAC,
-                                  decay_to_source=True,
-                                  anchor_fault_dims=META_ANCHOR_FAULT_DIMS)
-        except ValueError as exc:
-            raise SystemExit(
-                f"[{label}] {exc} Run `python -m metarl "
-                f"train_{spec.warm_start}` first, or `all`.") from None
-        agent.freeze_obs_norm()
-        if FINETUNE_FROM and spec.use_context:
-            agent.load(FINETUNE_FROM)
-            actor_warmup = 0
-            print(f"  fine-tuning from {FINETUNE_FROM} (no actor warm-up)")
-        if HOLD_PENALTY_WEIGHT > 0.0 and spec.use_context:
-            agent.hold_penalty_weight = HOLD_PENALTY_WEIGHT
-            agent.hold_margin = HOLD_MARGIN
-            agent.hold_gate_target = HOLD_GATE_TARGET and agent.adapt_gate
-            print(f"  hold rule: penalty {HOLD_PENALTY_WEIGHT:g}, margin "
-                  f"{HOLD_MARGIN:g}, gate target {agent.hold_gate_target}")
-        print(f"  warm start: {src}; actor held for {actor_warmup} "
-              f"iteration(s), anchor weight {META_ANCHOR_WEIGHT:g} "
-              f"(x{META_ANCHOR_FAULT_FRAC:g} after a fault), adapted per fault "
-              f"kind; no-regression selection on")
-        print(f"  adapting actor: weight decay toward {spec.warm_start}; "
-              f"exploration noise "
-              + ("white" if agent.explore_noise_beta == 0.0 else
-                 f"colored (1/f^{agent.explore_noise_beta:g})"))
-        if agent.adapt_gate:
-            print(f"  adaptation gate: {spec.warm_start}'s policy acts until "
-                  f"a detector on z (fitted to the privileged fault flag, "
-                  f"weight {GATE_LOSS_WEIGHT:g}) opens it; sharpness "
-                  f"{GATE_SHARPNESS:g}"
-                  + ("; training rollouts act through the actor everywhere "
-                     "(gate open)" if agent.train_gate_open else ""))
-        if agent.fault_head is not None:
-            print(f"  fault-kind classifier on z: class-balanced, weight "
-                  f"{agent.fault_cls_weight:g} (privileged target, training "
-                  f"only)")
-        if spec.use_context:
-            print(f"  {n_collect} episodes per iteration; encoder steps on "
-                  f"1 update in {agent.encoder_update_every}")
 
-    no_regress = bool(spec.warm_start)
-    ref_score = None
-    if no_regress:
-        src_spec = get_arm(spec.warm_start)
-        ref_agent = _build_agent(env, src_spec)
-        ref_agent.load(src)
-        print(f"  scoring the no-regression reference ({src_spec.name}, "
-              f"apn={'on' if src_spec.apn else 'off'}) ...")
-        ref_score = blended_heldout_score(env, ref_agent, heldout,
-                                          z_mode=HELDOUT_Z_MODE,
-                                          disturbed=spec.multitask)
-        del ref_agent
-        print(f"  reference: undisturbed {ref_score['undisturbed_violations']:.2f}"
-              f" viol / {ref_score['undisturbed_on_spec_ethanol']:.3e} on-spec "
-              f"eth; panel {ref_score['disturbed_violations']:.2f} viol / "
-              f"{ref_score['disturbed_on_spec_ethanol']:.3e} on-spec eth; "
-              f"plant score {ref_score['score']:.4e}")
+def _warm_start(spec, agent, n_collect):
+    """Load the warm-start source and set the adaptation options.
 
-    gate_skip = set()
-    if ref_score is not None:
-        for name, p in ref_score["panel"].items():
-            if (name.split("@")[0] in GATE_FAULT_KINDS
-                    and (p["violations"] > SELECT_MAX_VIOL
-                         or p["viol_worst"] > SELECT_MAX_WORST_VIOL)):
-                gate_skip.add(name)
-        if gate_skip:
-            print(f"  {spec.warm_start} fails the absolute gate on "
-                  + ", ".join(f"{n} ({ref_score['panel'][n]['violations']:.1f}"
-                              f" mean, {ref_score['panel'][n]['viol_worst']:.0f}"
-                              f" worst)" for n in sorted(gate_skip))
-                  + "; judged there against it by NO_REGRESS instead")
+    Returns:
+        Tuple (source checkpoint path or None, actor warm-up iterations).
+    """
+    if not spec.warm_start:
+        return None, 0
+    label = spec.label
+    actor_warmup = max(1, META_ACTOR_WARMUP_ITERS)
+    src_final, src_best = arm_paths(spec.warm_start)
+    src = next((p for p in (src_best, src_final) if os.path.exists(p)), None)
+    if src is None:
+        raise SystemExit(
+            f"[{label}] warm start needs a trained {spec.warm_start} "
+            f"checkpoint ({src_best} or {src_final}). Train "
+            f"{spec.warm_start} first ('all' trains it before "
+            f"{spec.name}), or set warm_start=None in "
+            f"ARMS['{spec.name}'].")
+    try:
+        agent.warm_start_from(src, anchor_weight=META_ANCHOR_WEIGHT,
+                              anchor_fault_frac=META_ANCHOR_FAULT_FRAC,
+                              decay_to_source=True,
+                              anchor_fault_dims=META_ANCHOR_FAULT_DIMS)
+    except ValueError as exc:
+        raise SystemExit(
+            f"[{label}] {exc} Run `python -m metarl "
+            f"train_{spec.warm_start}` first, or `all`.") from None
+    agent.freeze_obs_norm()
+    if FINETUNE_FROM and spec.use_context:
+        agent.load(FINETUNE_FROM)
+        actor_warmup = 0
+        print(f"  fine-tuning from {FINETUNE_FROM} (no actor warm-up)")
+    if HOLD_PENALTY_WEIGHT > 0.0 and spec.use_context:
+        agent.hold_penalty_weight = HOLD_PENALTY_WEIGHT
+        agent.hold_margin = HOLD_MARGIN
+        agent.hold_gate_target = HOLD_GATE_TARGET and agent.adapt_gate
+        print(f"  hold rule: penalty {HOLD_PENALTY_WEIGHT:g}, margin "
+              f"{HOLD_MARGIN:g}, gate target {agent.hold_gate_target}")
+    print(f"  warm start: {src}; actor held for {actor_warmup} "
+          f"iteration(s), anchor weight {META_ANCHOR_WEIGHT:g} "
+          f"(x{META_ANCHOR_FAULT_FRAC:g} after a fault), adapted per fault "
+          f"kind; no-regression selection on")
+    print(f"  adapting actor: weight decay toward {spec.warm_start}; "
+          f"exploration noise "
+          + ("white" if agent.explore_noise_beta == 0.0 else
+             f"colored (1/f^{agent.explore_noise_beta:g})"))
+    if agent.adapt_gate:
+        print(f"  adaptation gate: {spec.warm_start}'s policy acts until "
+              f"a detector on z (fitted to the privileged fault flag, "
+              f"weight {GATE_LOSS_WEIGHT:g}) opens it; sharpness "
+              f"{GATE_SHARPNESS:g}"
+              + ("; training rollouts act through the actor everywhere "
+                 "(gate open)" if agent.train_gate_open else ""))
+    if agent.fault_head is not None:
+        print(f"  fault-kind classifier on z: class-balanced, weight "
+              f"{agent.fault_cls_weight:g} (privileged target, training "
+              f"only)")
+    if spec.use_context:
+        print(f"  {n_collect} episodes per iteration; encoder steps on "
+              f"1 update in {agent.encoder_update_every}")
+    return src, actor_warmup
 
-    log_keys = ("iter", "avg_reward", "avg_violations", "critic_loss",
-                "actor_loss", "kl", "aux_loss", "fault_cls_loss", "map_loss",
-                "safety_loss", "anchor_loss",
-                "alpha", "anchor_gap_nominal", "anchor_gap_fault",
-                "gate_loss", "gate_nominal", "gate_fault", "hold_loss", "stall_frac",
-                "z_norm", "proj_noop_frac", "proj_mean_steps",
-                "heldout_iter", "heldout_violations", "heldout_reward",
-                "heldout_on_spec_ethanol", "heldout_purity_rate",
-                "heldout_z_snr", "heldout_score",
-                "heldout_undisturbed_violations", "heldout_undisturbed_reward",
-                "heldout_undisturbed_on_spec_ethanol",
-                "heldout_undisturbed_score",
-                "heldout_disturbed_violations", "heldout_disturbed_reward",
-                "heldout_disturbed_on_spec_ethanol", "heldout_disturbed_score",
-                "heldout_viol_worst", "heldout_undisturbed_viol_worst",
-                "heldout_disturbed_viol_worst",
-                "heldout_gate_violations", "heldout_gate_viol_worst",
-                "heldout_panel", "heldout_undisturbed_per_task",
-                "heldout_regressions", "heldout_anchor_weight",
-                "heldout_anchor_kind_weights", "heldout_gate_late")
-    log = {k: [] for k in log_keys}
+
+def _noregress_reference(spec, env, src, heldout):
+    """The warm-start source's held-out score, as it runs, for no-regression."""
+    src_spec = get_arm(spec.warm_start)
+    ref_agent = _build_agent(env, src_spec)
+    ref_agent.load(src)
+    print(f"  scoring the no-regression reference ({src_spec.name}, "
+          f"apn={'on' if src_spec.apn else 'off'}) ...")
+    ref = blended_heldout_score(env, ref_agent, heldout, z_mode=HELDOUT_Z_MODE,
+                                disturbed=spec.multitask)
+    print(f"  reference: undisturbed {ref['undisturbed_violations']:.2f}"
+          f" viol / {ref['undisturbed_on_spec_ethanol']:.3e} on-spec "
+          f"eth; panel {ref['disturbed_violations']:.2f} viol / "
+          f"{ref['disturbed_on_spec_ethanol']:.3e} on-spec eth; "
+          f"plant score {ref['score']:.4e}")
+    return ref
+
+
+def _gate_skip(spec, ref_score):
+    """Panel checks the source itself fails the absolute gate on.
+
+    Those are judged against the source by NO_REGRESS instead.
+    """
+    skip = set()
+    if ref_score is None:
+        return skip
+    for name, p in ref_score["panel"].items():
+        if (name.split("@")[0] in GATE_FAULT_KINDS
+                and (p["violations"] > SELECT_MAX_VIOL
+                     or p["viol_worst"] > SELECT_MAX_WORST_VIOL)):
+            skip.add(name)
+    if skip:
+        print(f"  {spec.warm_start} fails the absolute gate on "
+              + ", ".join(f"{n} ({ref_score['panel'][n]['violations']:.1f}"
+                          f" mean, {ref_score['panel'][n]['viol_worst']:.0f}"
+                          f" worst)" for n in sorted(skip))
+              + "; judged there against it by NO_REGRESS instead")
+    return skip
+
+
+def _new_log(spec, gate_skip, src, ref_score):
+    """An empty training log (``LOG_KEYS``) with the run's settings."""
+    log = {k: [] for k in LOG_KEYS}
     log["arm"] = spec.name
     log["config"] = spec.summary()
     log["gate_skipped"] = sorted(gate_skip)
@@ -340,24 +379,30 @@ def _train(arm):
                 for k in ("violations", "on_spec_ethanol", "score",
                           "viol_per_task", "eth_per_task")},
             "panel": ref_score["panel"]}
+    return log
 
-    workers = None
-    if HELDOUT_WORKERS > 1:
-        try:
-            workers = RolloutPool(spec, HELDOUT_WORKERS)
-            print(f"  held-out checks: {HELDOUT_WORKERS} worker processes"
-                  + ("; training episodes collected there too, during the "
-                     "updates" if COLLECT_IN_WORKERS else ""))
-        except Exception as exc:                          # pragma: no cover
-            print(f"  held-out checks: worker pool unavailable ({exc!r}); "
-                  f"running in-process")
-    collector = _Collector(env, agent, replay, spec, draw_task, strat, rng,
-                           workers if COLLECT_IN_WORKERS else None)
-    collector.finish(collector.start(
-        [tid for tid in range(len(pool))
-         for _ in range(WARMUP_EPISODES_PER_TASK)]))
 
-    stopper = EarlyStopper(
+def _open_workers(spec):
+    """The held-out (and collection) worker pool, or None to run in-process."""
+    if HELDOUT_WORKERS <= 1:
+        return None
+    try:
+        workers = RolloutPool(spec, HELDOUT_WORKERS)
+    except Exception as exc:                              # pragma: no cover
+        print(f"  held-out checks: worker pool unavailable ({exc!r}); "
+              f"running in-process")
+        return None
+    print(f"  held-out checks: {HELDOUT_WORKERS} worker processes"
+          + ("; training episodes collected there too, during the "
+             "updates" if COLLECT_IN_WORKERS else ""))
+    return workers
+
+
+def _early_stopper():
+    """The early stopper, or None when ``EARLY_STOP_ENABLED`` is off."""
+    if not EARLY_STOP_ENABLED:
+        return None
+    return EarlyStopper(
         min_checks=EARLY_STOP_MIN_ITERS, patience=EARLY_STOP_PATIENCE,
         min_rel_delta=EARLY_STOP_MIN_REL_DELTA, rel_floor=EARLY_STOP_REL_FLOOR,
         max_viol=SELECT_MAX_VIOL, max_worst_viol=SELECT_MAX_WORST_VIOL,
@@ -365,25 +410,113 @@ def _train(arm):
         diverge_viol_floor=EARLY_STOP_DIVERGE_VIOL_FLOOR,
         diverge_rel_drop=EARLY_STOP_DIVERGE_REL_DROP,
         diverge_patience=EARLY_STOP_DIVERGE_PATIENCE,
-        diverge_min_checks=EARLY_STOP_DIVERGE_MIN_CHECKS,
-    ) if EARLY_STOP_ENABLED else None
+        diverge_min_checks=EARLY_STOP_DIVERGE_MIN_CHECKS)
 
-    best_viol, best_eth, best_iter = float("inf"), -float("inf"), None
-    best_score = best_panel_viol = float("nan")
-    best_feasible = False
-    best_worst = float("inf")
-    tail_rejects = 0
+
+def _log_heldout(log, ho, it):
+    """Append one held-out check's results to ``log`` (the regression-free part)."""
+    for k in _HELDOUT_STATS:
+        log[f"heldout_{k}"].append(ho[k])
+    log["heldout_undisturbed_per_task"].append(
+        {"viol": ho["undisturbed_viol_per_task"],
+         "eth": ho["undisturbed_eth_per_task"]})
+    log["heldout_iter"].append(it)
+
+
+def _postfix(spec, agent, stats, pstats, avg_r, avg_v, ho, regress, stopper):
+    """The progress bar's fields."""
+    post = {"Rwd": f"{avg_r:.1f}", "Viol": f"{avg_v:.1f}",
+            "hoV": f"{ho['gate_violations']:.1f}",
+            "hoW": f"{ho['gate_viol_worst']:.0f}"}
+    if os.environ.get("PLANT_VERBOSE_PBAR", "0") == "1":
+        post.update({"QL": f"{stats['critic_loss']:.1f}",
+                     "a": f"{stats['alpha']:.2f}"})
+        if spec.use_context:
+            post.update({"snr": f"{ho['z_snr']:.2f}",
+                         "KL": f"{stats['kl']:.3f}",
+                         "aux": f"{stats['aux_loss']:.3f}"})
+        if spec.apn:
+            post.update({"Pok": f"{pstats['proj_noop_frac']:.2f}"})
+    if spec.warm_start and agent.adapt_gate:
+        post.update({"gate": f"{stats['gate_nominal']:.2f}/"
+                             f"{stats['gate_fault']:.2f}"})
+    if spec.warm_start:
+        post.update({"reg": str(len(regress))})
+    if stopper is not None:
+        post.update({"Pat": stopper.patience_bar()})
+    return post
+
+
+def _train(arm):
+    """Train one arm; every switch comes from its ``ArmSpec``.
+
+    Returns:
+        The trained agent.
+    """
+    spec = get_arm(arm)
+    label = spec.label
+    n_collect = (META_COLLECT_EPISODES_PER_ITER if spec.multitask
+                 else COLLECT_EPISODES_PER_ITER)
+    seed_everything(SEED)
+    env = make_arm_env(spec)
+    agent = _build_agent(env, spec, train_apn_if_missing=True)
+    agent.enable_refiner(APN_REFINE_EVERY, APN_REFINE_EPISODES, seed=SEED)
+    replay = MultiTaskReplayBuffer(env.stateDim, env.actionDim,
+                                   priv_dim=agent.critic_privileged_dim)
+    rng = np.random.default_rng(SEED + 1)
+    if spec.multitask:
+        write_holdout()
+        if META_HOLDOUT_KINDS:
+            print(f"  held out of training (tier 3): "
+                  f"{', '.join(META_HOLDOUT_KINDS)}")
+
+    pool = (make_task_pool(N_TRAIN_TASKS, seed=0) if spec.multitask
+            else [nominal_task()])
+    task_rng = np.random.default_rng(SEED + 2)
+
+    def draw_task(tid):
+        """The task for one training episode stored in bucket ``tid``.
+
+        Multitask arms draw a fresh prior task; the buckets only shard the
+        replay.
+        """
+        return sample_task(task_rng) if spec.multitask else pool[tid]
+
+    strat = MagnitudeStratifier()
+    corner = make_corner_tasks()
+    heldout = make_task_pool(HELDOUT_EVAL_TASKS, seed=HELDOUT_TASK_SEED) + corner
+    if corner:
+        print(f"  held-out pool: {HELDOUT_EVAL_TASKS} random + {len(corner)} "
+              f"corner (risk " + ", ".join(f"{corner_risk(t):.2f}" for t in corner)
+              + ")")
+
+    _print_header(spec, env, agent, len(pool), n_collect)
+    src, actor_warmup = _warm_start(spec, agent, n_collect)
+    no_regress = bool(spec.warm_start)
+    ref_score = (_noregress_reference(spec, env, src, heldout) if no_regress
+                 else None)
+    gate_skip = _gate_skip(spec, ref_score)
+    log = _new_log(spec, gate_skip, src, ref_score)
+
+    workers = _open_workers(spec)
+    collector = _Collector(env, agent, replay, spec, draw_task, strat, rng,
+                           workers if COLLECT_IN_WORKERS else None)
+    collector.finish(collector.start(
+        [tid for tid in range(len(pool))
+         for _ in range(WARMUP_EPISODES_PER_TASK)]))
+    stopper = _early_stopper()
+
+    best = _Selection()
     regress = []
     loaded_misses = None
-    regress_rejects, regress_causes = 0, {}
     reward_hist, viol_hist = [], []
-    ho = {"violations": float("nan"), "z_snr": float("nan")}
-    gate_v = gate_w = float("nan")
+    ho = {"violations": float("nan"), "z_snr": float("nan"),
+          "gate_violations": float("nan"), "gate_viol_worst": float("nan")}
     final_path, best_path = arm_paths(spec)
 
     pbar = _trange(1, META_ITERATIONS + 1)
     for it in pbar:
-        if use_context:
+        if spec.use_context:
             agent.kl_lambda = META_KL_LAMBDA * (1.0 if FINETUNE_FROM else min(1.0, it / KL_ANNEAL_ITERS))
 
         # This iteration's episodes run with the weights from before its
@@ -435,19 +568,7 @@ def _train(arm):
                                            disturbed=spec.multitask,
                                            gate_skip=gate_skip)
             fresh = True
-            for k in ("violations", "reward", "on_spec_ethanol", "score",
-                      "purity_rate", "z_snr", "undisturbed_violations",
-                      "undisturbed_reward", "undisturbed_on_spec_ethanol",
-                      "undisturbed_score", "disturbed_violations",
-                      "disturbed_reward", "disturbed_on_spec_ethanol",
-                      "disturbed_score", "viol_worst",
-                      "undisturbed_viol_worst", "disturbed_viol_worst",
-                      "gate_violations", "gate_viol_worst"):
-                log[f"heldout_{k}"].append(ho[k])
-            log["heldout_undisturbed_per_task"].append(
-                {"viol": ho["undisturbed_viol_per_task"],
-                 "eth": ho["undisturbed_eth_per_task"]})
-            log["heldout_iter"].append(it)
+            _log_heldout(log, ho, it)
             regress = []
             if no_regress:
                 regress = _regressions(ho, ref_score)
@@ -467,33 +588,14 @@ def _train(arm):
             log["heldout_gate_late"].append(
                 {"undisturbed": ho["undisturbed_gate_late"],
                  **{n: p["gate_late"] for n, p in ho.get("panel", {}).items()}})
-            gate_v, gate_w = ho["gate_violations"], ho["gate_viol_worst"]
-            mean_ok = gate_v <= SELECT_MAX_VIOL
-            tail_ok = gate_w <= SELECT_MAX_WORST_VIOL
-            feasible = mean_ok and tail_ok and not regress
-            if mean_ok and not tail_ok:
-                tail_rejects += 1
-            if mean_ok and tail_ok and regress:
-                regress_rejects += 1
-                for cause in regress:
-                    regress_causes[cause] = regress_causes.get(cause, 0) + 1
-            if feasible:
-                better = (not best_feasible) or ho["score"] > best_score
-            else:
-                better = (not best_feasible) and gate_v < best_viol
-            if better:
-                best_feasible = best_feasible or feasible
-                best_viol, best_eth, best_score, best_iter = (
-                    gate_v, ho["on_spec_ethanol"], ho["score"], it)
-                best_worst = gate_w
-                best_panel_viol = ho["disturbed_violations"]
+            if best.consider(ho, regress, it):
                 os.makedirs(POLICY_DIR, exist_ok=True)
                 agent.save(best_path)
 
         if stopper is not None and fresh and (it == 1 or not held):
             stop, reason = stopper.should_stop(
-                it, ho["reward"], gate_v, gate_w, ho["score"],
-                extra_ok=not regress)
+                it, ho["reward"], ho["gate_violations"], ho["gate_viol_worst"],
+                ho["score"], extra_ok=not regress)
 
         if stats is not None:
             pstats = agent.proj_stats() if spec.apn else {
@@ -501,25 +603,8 @@ def _train(arm):
             _log_update(log, it, avg_r, avg_v, stats, pstats,
                         agent.adapt_gate)
             if hasattr(pbar, "set_postfix"):
-                post = {"Rwd": f"{avg_r:.1f}", "Viol": f"{avg_v:.1f}",
-                        "hoV": f"{gate_v:.1f}", "hoW": f"{gate_w:.0f}"}
-                if os.environ.get("PLANT_VERBOSE_PBAR", "0") == "1":
-                    post.update({"QL": f"{stats['critic_loss']:.1f}",
-                                 "a": f"{stats['alpha']:.2f}"})
-                    if spec.use_context:
-                        post.update({"snr": f"{ho['z_snr']:.2f}",
-                                     "KL": f"{stats['kl']:.3f}",
-                                     "aux": f"{stats['aux_loss']:.3f}"})
-                    if spec.apn:
-                        post.update({"Pok": f"{pstats['proj_noop_frac']:.2f}"})
-                if spec.warm_start and agent.adapt_gate:
-                    post.update({"gate": f"{stats['gate_nominal']:.2f}/"
-                                         f"{stats['gate_fault']:.2f}"})
-                if spec.warm_start and no_regress:
-                    post.update({"reg": str(len(regress))})
-                if stopper is not None:
-                    post.update({"Pat": stopper.patience_bar()})
-                pbar.set_postfix(post)
+                pbar.set_postfix(_postfix(spec, agent, stats, pstats, avg_r,
+                                          avg_v, ho, regress, stopper))
 
         if it % 100 == 0:
             os.makedirs(POLICY_DIR, exist_ok=True)
@@ -536,6 +621,13 @@ def _train(arm):
     agent.save(final_path)
     _write_log(log, label)
     plot_training_curves()
+    _print_summary(spec, agent, best, ref_score, gate_skip, log, ho)
+    return agent
+
+
+def _print_summary(spec, agent, best, ref_score, gate_skip, log, ho):
+    """What selection picked, what each gate rejected, and warnings."""
+    label, no_regress = spec.label, bool(spec.warm_start)
     if spec.multitask:
         gated = [k + (f" (vs {spec.warm_start})"
                       if any(n.startswith(k + "@") for n in gate_skip) else "")
@@ -543,30 +635,31 @@ def _train(arm):
         gate_src = "undisturbed + " + "/".join(gated)
     else:
         gate_src = "undisturbed"
-    print(f"[{label}] best held-out ({gate_src} gate): violations={best_viol:.2f} "
-          f"worst-episode={best_worst:.1f} on-spec ethanol={best_eth:.3e} "
-          f"plant score={best_score:.4e}"
-          + (f" panel violations={best_panel_viol:.2f}" if spec.multitask else "")
-          + f" at iter {best_iter}")
+    print(f"[{label}] best held-out ({gate_src} gate): violations={best.viol:.2f} "
+          f"worst-episode={best.worst:.1f} on-spec ethanol={best.eth:.3e} "
+          f"plant score={best.score:.4e}"
+          + (f" panel violations={best.panel_viol:.2f}" if spec.multitask else "")
+          + f" at iter {best.iteration}")
     if ref_score is not None:
         print(f"[{label}] {spec.warm_start} as it runs, on the same checks: "
               f"plant score={ref_score['score']:.4e} panel violations="
               f"{ref_score['disturbed_violations']:.2f}")
     print(f"[{label}] tail gate (SELECT_MAX_WORST_VIOL={SELECT_MAX_WORST_VIOL}) "
-          f"rejected {tail_rejects} check(s) the mean band would have admitted")
+          f"rejected {best.tail_rejects} check(s) the mean band would have "
+          f"admitted")
     if no_regress:
-        top = sorted(regress_causes.items(), key=lambda kv: -kv[1])[:4]
-        print(f"[{label}] no-regression gate rejected {regress_rejects} "
+        top = sorted(best.regress_causes.items(), key=lambda kv: -kv[1])[:4]
+        print(f"[{label}] no-regression gate rejected {best.regress_rejects} "
               f"check(s) the absolute gate admitted"
               + (": most often " + ", ".join(f"{k} x{n}" for k, n in top)
                  if top else "")
               + f"; final anchor weight {agent.anchor_weight:.3g} pre-fault")
-        if best_feasible and best_iter == 1:
+        if best.feasible and best.iteration == 1:
             print(f"[{label}] WARNING: nothing improved on the loaded "
                   f"{spec.warm_start} policy without regressing somewhere; "
                   f"the selected checkpoint is that policy and ADAPT will "
                   f"read exactly 0.")
-    if not best_feasible:
+    if not best.feasible:
         print(f"[{label}] WARNING: no checkpoint was ever feasible (mean <= "
               f"{SELECT_MAX_VIOL} and worst <= {SELECT_MAX_WORST_VIOL}"
               + (f", and no regression vs {spec.warm_start}" if no_regress else "")
@@ -574,12 +667,11 @@ def _train(arm):
                 "arm's checkpoint as selected on safety alone. If the plant's "
                 "nominal optimum itself violates more than the gate allows, "
                 "calibrate SELECT_MAX_VIOL / SELECT_MAX_WORST_VIOL.")
-    if use_context and np.isfinite(ho.get("z_snr", float("nan"))):
+    if spec.use_context and np.isfinite(ho.get("z_snr", float("nan"))):
         print(f"[{label}] final latent separability SNR = {ho['z_snr']:.4f} "
               f"(gate wants > {Z_INFORM_MIN_SNR})")
-    if agent.adapt_gate and best_iter in log["heldout_iter"]:
-        g = log["heldout_gate_late"][log["heldout_iter"].index(best_iter)]
+    if agent.adapt_gate and best.iteration in log["heldout_iter"]:
+        g = log["heldout_gate_late"][log["heldout_iter"].index(best.iteration)]
         print(f"[{label}] adaptation gate at the selected check (iter "
-              f"{best_iter}), mean opening over the second half: "
+              f"{best.iteration}), mean opening over the second half: "
               + ", ".join(f"{k} {v:.2f}" for k, v in g.items()))
-    return agent

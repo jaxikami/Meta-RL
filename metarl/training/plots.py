@@ -19,6 +19,7 @@ from metarl.training.metrics import (episodes_violated, _paired_delta,
 
 ARM_COLORS = {"saferl": "#1baf7a", "meta": "#2a78d6"}
 PLOT_INK, PLOT_INK2, PLOT_GRID = "#0b0b0b", "#52514e", "#d8d7d2"
+PLOT_SURFACE = "#fcfcfb"
 PLOT_NEUTRAL = "#b4b3ad"
 CONSTRAINT_COLORS = {
     "overflow": "#2a78d6",
@@ -43,30 +44,55 @@ ACTUATORS = (
 )
 
 
-def _style_ax(ax, INK2, GRID):
+def _pyplot(what=""):
+    """matplotlib.pyplot on the Agg backend, or None if unavailable."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        return plt
+    except Exception as exc:                             # pragma: no cover
+        print(f"[plot] {what + ' ' if what else ''}skipped: {exc}")
+        return None
+
+
+def _savefig(fig, stem):
+    """Write ``fig`` to PLOT_DIR/<stem>.png and close it."""
+    import matplotlib.pyplot as plt
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    fig.savefig(os.path.join(PLOT_DIR, f"{stem}.png"), dpi=150)
+    plt.close(fig)
+
+
+def scenario_label(name):
+    """A scenario's tick label."""
+    return name.replace("disturb_", "D ").replace("_", " ")
+
+
+def _style_ax(ax):
     """Shared axis styling."""
-    ax.set_facecolor("#fcfcfb")
-    ax.grid(axis="y", alpha=0.5, color=GRID, lw=0.8)
+    ax.set_facecolor(PLOT_SURFACE)
+    ax.grid(axis="y", alpha=0.5, color=PLOT_GRID, lw=0.8)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     for side in ("left", "bottom"):
-        ax.spines[side].set_color(GRID)
-    ax.tick_params(colors=INK2, labelsize=9)
+        ax.spines[side].set_color(PLOT_GRID)
+    ax.tick_params(colors=PLOT_INK2, labelsize=9)
 
 
-def _plot_distributions(results, names, labels, arms, colors, INK, INK2, GRID,
-                        plt):
+def _plot_distributions(results, names, labels, arms):
     """Per-episode on-spec ethanol per arm and scenario (box plus points)."""
+    import matplotlib.pyplot as plt
     cols = min(len(names), 6)
     rows = -(-len(names) // cols)
     fig, axs = plt.subplots(rows, cols, figsize=(4.1 * cols, 5.0 * rows),
                             squeeze=False, sharey=True)
-    fig.patch.set_facecolor("#fcfcfb")
+    fig.patch.set_facecolor(PLOT_SURFACE)
     for ax in axs.flat[len(names):]:
         ax.set_visible(False)
     for ax, n, lab in zip(axs.flat, names, labels):
-        _style_ax(ax, INK2, GRID)
+        _style_ax(ax)
         data, present = [], []
         for arm in arms:
             v = np.asarray(results[n][arm].get("on_spec_ethanol_per_ep", []),
@@ -77,38 +103,37 @@ def _plot_distributions(results, names, labels, arms, colors, INK, INK2, GRID,
         if not data:
             continue
         bp = ax.boxplot(data, patch_artist=True, widths=0.55,
-                        medianprops={"color": INK, "lw": 1.8},
-                        whiskerprops={"color": INK2, "lw": 1.1},
-                        capprops={"color": INK2, "lw": 1.1},
+                        medianprops={"color": PLOT_INK, "lw": 1.8},
+                        whiskerprops={"color": PLOT_INK2, "lw": 1.1},
+                        capprops={"color": PLOT_INK2, "lw": 1.1},
                         flierprops={"marker": "o", "ms": 3,
-                                    "markerfacecolor": INK2,
+                                    "markerfacecolor": PLOT_INK2,
                                     "markeredgecolor": "none", "alpha": 0.5})
         for patch, arm in zip(bp["boxes"], present):
-            patch.set_facecolor(colors[arm])
+            patch.set_facecolor(ARM_COLORS[arm])
             patch.set_alpha(0.35)
-            patch.set_edgecolor(colors[arm])
+            patch.set_edgecolor(ARM_COLORS[arm])
             patch.set_linewidth(1.8)
         for i, (v, arm) in enumerate(zip(data, present), start=1):
             jitter = (np.arange(v.size) % 5 - 2) * 0.035
             ax.plot(np.full(v.size, i) + jitter, v, "o", ms=3.5,
-                    color=colors[arm], alpha=0.75, markeredgecolor="none")
+                    color=ARM_COLORS[arm], alpha=0.75, markeredgecolor="none")
         ax.set_xticks(range(1, len(present) + 1))
         ax.set_xticklabels(present, rotation=20, ha="right", fontsize=9,
-                           color=INK2)
-        ax.set_title(lab, fontsize=10.5, color=INK, fontweight="bold")
+                           color=PLOT_INK2)
+        ax.set_title(lab, fontsize=10.5, color=PLOT_INK, fontweight="bold")
     for row in axs:
         row[0].set_ylabel("On-spec ethanol per episode  (x10^7)",
-                          fontsize=9.5, color=INK2)
+                          fontsize=9.5, color=PLOT_INK2)
     fig.suptitle("Per-episode production distributions", fontweight="bold",
-                 fontsize=12.5, color=INK)
+                 fontsize=12.5, color=PLOT_INK)
     fig.tight_layout(rect=(0, 0, 1, 0.92))
-    os.makedirs(PLOT_DIR, exist_ok=True)
-    fig.savefig(os.path.join(PLOT_DIR, "distributions.png"), dpi=150)
-    plt.close(fig)
+    _savefig(fig, "distributions")
 
 
-def _plot_adapt(results, names, labels, INK, INK2, GRID, plt):
+def _plot_adapt(results, names, labels):
     """ADAPT (meta vs saferl) as paired deltas per scenario, three panels."""
+    import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
     def _per_ep(r, kind):
@@ -130,9 +155,9 @@ def _plot_adapt(results, names, labels, INK, INK2, GRID, plt):
     fig, axs = plt.subplots(len(panels), 1, sharex=True,
                             figsize=(max(9.0, 0.9 * len(names)),
                                      3.5 * len(panels)))
-    fig.patch.set_facecolor("#fcfcfb")
+    fig.patch.set_facecolor(PLOT_SURFACE)
     for ax, (kind, title, ylab, fmt) in zip(axs, panels):
-        _style_ax(ax, INK2, GRID)
+        _style_ax(ax)
         vals, cis, cols = [], [], []
         for n in names:
             s = _per_ep(results[n]["saferl"], kind)
@@ -160,8 +185,8 @@ def _plot_adapt(results, names, labels, INK, INK2, GRID, plt):
                 cols.append(PLOT_NEUTRAL)
         vals, cis = np.asarray(vals), np.asarray(cis)
         ax.bar(x, np.nan_to_num(vals), 0.6, color=cols, yerr=cis, capsize=3,
-               ecolor=INK2, error_kw={"lw": 1.1})
-        ax.axhline(0.0, color=INK2, lw=1.0, zorder=1)
+               ecolor=PLOT_INK2, error_kw={"lw": 1.1})
+        ax.axhline(0.0, color=PLOT_INK2, lw=1.0, zorder=1)
         for xi, v, ci in zip(x, vals, cis):
             if not np.isfinite(v):
                 txt, y, dy, va = "n/a", 0.0, 3, "bottom"
@@ -172,36 +197,34 @@ def _plot_adapt(results, names, labels, INK, INK2, GRID, plt):
                 dy, va = (3, "bottom") if up else (-3, "top")
             ax.annotate(txt, (xi, y), xytext=(0, dy),
                         textcoords="offset points", ha="center", va=va,
-                        fontsize=7.2, color=INK2)
-        ax.set_title(title, fontsize=10.5, color=INK, fontweight="bold", pad=8)
-        ax.set_ylabel(ylab, fontsize=9.5, color=INK2)
+                        fontsize=7.2, color=PLOT_INK2)
+        ax.set_title(title, fontsize=10.5, color=PLOT_INK, fontweight="bold", pad=8)
+        ax.set_ylabel(ylab, fontsize=9.5, color=PLOT_INK2)
         ax.margins(y=0.22)
     axs[-1].set_xticks(x)
     axs[-1].set_xticklabels(labels, rotation=25, ha="right", fontsize=9,
-                            color=INK2)
+                            color=PLOT_INK2)
     handles = [
         Patch(color=ARM_COLORS["meta"], label="meta better (95% CI excludes 0)"),
         Patch(color=ARM_COLORS["saferl"], label="saferl better (95% CI excludes 0)"),
         Patch(color=PLOT_NEUTRAL, label="no significant or practical difference"),
     ]
     fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False,
-               fontsize=9, labelcolor=INK2, bbox_to_anchor=(0.5, 0.955))
+               fontsize=9, labelcolor=PLOT_INK2, bbox_to_anchor=(0.5, 0.955))
     fig.suptitle("ADAPT -- meta vs saferl, paired over the same episodes "
-                 "(up = meta better)", fontweight="bold", fontsize=12, color=INK)
+                 "(up = meta better)", fontweight="bold", fontsize=12, color=PLOT_INK)
     fig.tight_layout(rect=(0, 0, 1, 0.925))
-    os.makedirs(PLOT_DIR, exist_ok=True)
-    fig.savefig(os.path.join(PLOT_DIR, "compare_adapt.png"), dpi=150)
-    plt.close(fig)
+    _savefig(fig, "compare_adapt")
 
 
-def _ink_on(fill, INK):
+def _ink_on(fill):
     """Ink or white, whichever reads on a bar of colour ``fill``."""
     from matplotlib.colors import to_rgb
     r, g, b = to_rgb(fill)
-    return "#ffffff" if 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.45 else INK
+    return "#ffffff" if 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.45 else PLOT_INK
 
 
-def _plot_burden(results, names, labels, arms, INK, INK2, GRID, plt):
+def _plot_burden(results, names, labels, arms):
     """Violation burden per arm and scenario, and what it is made of.
 
     Left: mean burden per episode (+1 std), labelled with the episodes that
@@ -209,13 +232,14 @@ def _plot_burden(results, names, labels, arms, INK, INK2, GRID, plt):
     by constraint. Replaces the event-count, episodes-violated, mix and
     severity figures.
     """
+    import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
     fig, (ax, ax_mix) = plt.subplots(
         1, 2, figsize=(max(11.0, 0.9 * len(names) + 5.0), 6.6),
         gridspec_kw={"width_ratios": [max(len(names), 4), 3.2]})
-    fig.patch.set_facecolor("#fcfcfb")
-    _style_ax(ax, INK2, GRID)
+    fig.patch.set_facecolor(PLOT_SURFACE)
+    _style_ax(ax)
     x = np.arange(len(names))
     w = 0.8 / max(len(arms), 1)
     seen_vals = []
@@ -225,34 +249,34 @@ def _plot_burden(results, names, labels, arms, INK, INK2, GRID, plt):
         pos = x + (i - (len(arms) - 1) / 2) * w
         ax.bar(pos, vals, w, color=ARM_COLORS[arm], label=arm,
                yerr=np.vstack([np.zeros_like(err), err]), capsize=3,
-               ecolor=INK2, error_kw={"lw": 1.1})
+               ecolor=PLOT_INK2, error_kw={"lw": 1.1})
         for xi, v, e, n in zip(pos, vals, err, names):
             k, eps = episodes_violated(results[n][arm])
             ax.annotate(f"{v:.1f}  ({k}/{eps})", (xi, v + e), xytext=(0, 3),
                         textcoords="offset points", ha="center", va="bottom",
-                        fontsize=6.8, color=INK2, rotation=90)
+                        fontsize=6.8, color=PLOT_INK2, rotation=90)
         seen_vals.extend(vals.tolist())
     pos_vals = [v for v in seen_vals if v > 0]
     if pos_vals and max(pos_vals) > BURDEN_SYMLOG_RATIO * min(pos_vals):
         ax.set_yscale("symlog", linthresh=1.0)
         ax.set_ylabel("Violation burden B per episode  (symlog)", fontsize=9.5,
-                      color=INK2)
+                      color=PLOT_INK2)
     else:
         ax.set_ylabel("Violation burden B per episode", fontsize=9.5,
-                      color=INK2)
+                      color=PLOT_INK2)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9,
-                       color=INK2)
+                       color=PLOT_INK2)
     ax.margins(y=0.25)
     ax.set_title("Burden per scenario (lower is better; label: B  (episodes "
-                 "violated / episodes))", fontsize=10.5, color=INK,
+                 "violated / episodes))", fontsize=10.5, color=PLOT_INK,
                  fontweight="bold", pad=8)
-    ax.legend(frameon=False, fontsize=9, labelcolor=INK2, loc="upper left")
+    ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2, loc="upper left")
 
     # Composition over all scenarios, as a share of each arm's burden.
-    _style_ax(ax_mix, INK2, GRID)
+    _style_ax(ax_mix)
     ax_mix.grid(axis="y", alpha=0.0)
-    ax_mix.grid(axis="x", alpha=0.5, color=GRID, lw=0.8)
+    ax_mix.grid(axis="x", alpha=0.5, color=PLOT_GRID, lw=0.8)
     order = list(CONSTRAINT_NAMES.values())
     parts = {arm: np.asarray([sum(float(results[n][arm]["burden_by_constraint"]
                                         .get(c, 0.0)) for n in names)
@@ -264,7 +288,7 @@ def _plot_burden(results, names, labels, arms, INK, INK2, GRID, plt):
         if total <= 0:
             ax_mix.annotate("no violations", (0.0, yi), xytext=(4, 0),
                             textcoords="offset points", va="center",
-                            fontsize=8.5, color=INK2)
+                            fontsize=8.5, color=PLOT_INK2)
             continue
         left = 0.0
         for c in seen:
@@ -272,37 +296,38 @@ def _plot_burden(results, names, labels, arms, INK, INK2, GRID, plt):
             if pct <= 0:
                 continue
             ax_mix.barh(yi, pct, 0.6, left=left, color=CONSTRAINT_COLORS[c],
-                        edgecolor="#fcfcfb", linewidth=1.5)
+                        edgecolor=PLOT_SURFACE, linewidth=1.5)
             if pct >= BURDEN_MIX_MIN_LABEL_PCT:
                 ax_mix.text(left + pct / 2, yi, f"{pct:.0f}%", ha="center",
                             va="center", fontsize=7.5,
-                            color=_ink_on(CONSTRAINT_COLORS[c], INK))
+                            color=_ink_on(CONSTRAINT_COLORS[c]))
             left += pct
     ax_mix.set_yticks(range(len(arms)))
-    ax_mix.set_yticklabels(arms, fontsize=9.5, color=INK2)
+    ax_mix.set_yticklabels(arms, fontsize=9.5, color=PLOT_INK2)
     ax_mix.invert_yaxis()
     ax_mix.set_xlim(0, 100)
     ax_mix.set_xlabel("Share of burden over all scenarios (%)", fontsize=9.5,
-                      color=INK2)
-    ax_mix.set_title("What the burden is", fontsize=10.5, color=INK,
+                      color=PLOT_INK2)
+    ax_mix.set_title("What the burden is", fontsize=10.5, color=PLOT_INK,
                      fontweight="bold", pad=8)
     if seen:
         ax_mix.legend(handles=[Patch(color=CONSTRAINT_COLORS[c],
                                      label=c.replace("_", " ")) for c in seen],
                       loc="upper center", bbox_to_anchor=(0.5, -0.14),
-                      ncol=2, frameon=False, fontsize=8, labelcolor=INK2)
+                      ncol=2, frameon=False, fontsize=8, labelcolor=PLOT_INK2)
     return fig
 
 
-def _plot_score(results, names, labels, arms, INK, INK2, GRID, plt):
+def _plot_score(results, names, labels, arms):
     """Net production per arm and scenario, and averaged over scenarios.
 
     ``*`` marks the arm whose per-episode net production is significantly
     higher than every other arm's on that scenario (paired).
     """
+    import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(max(9.0, 0.9 * (len(names) + 1)), 6.4))
-    fig.patch.set_facecolor("#fcfcfb")
-    _style_ax(ax, INK2, GRID)
+    fig.patch.set_facecolor(PLOT_SURFACE)
+    _style_ax(ax)
     x = np.append(np.arange(len(names)), len(names) + 0.6)
     w = 0.8 / max(len(arms), 1)
     for i, arm in enumerate(arms):
@@ -311,7 +336,7 @@ def _plot_score(results, names, labels, arms, INK, INK2, GRID, plt):
         vals, err = np.append(vals, vals.mean()), np.append(err, 0.0)
         pos = x + (i - (len(arms) - 1) / 2) * w
         ax.bar(pos, vals, w, color=ARM_COLORS[arm], label=arm, yerr=err,
-               capsize=3, ecolor=INK2, error_kw={"lw": 1.1})
+               capsize=3, ecolor=PLOT_INK2, error_kw={"lw": 1.1})
         for j, (xi, v, e) in enumerate(zip(pos, vals, err)):
             best = j < len(names) and all(
                 _verdict_sign(_paired_delta(
@@ -325,19 +350,19 @@ def _plot_score(results, names, labels, arms, INK, INK2, GRID, plt):
                         xytext=(0, 3 if up else -3),
                         textcoords="offset points", ha="center",
                         va="bottom" if up else "top", fontsize=6.8,
-                        color=INK2, rotation=90)
-    ax.axhline(0.0, color=INK2, lw=1.0, zorder=1)
-    ax.axvline(len(names) - 0.2, color=GRID, lw=1.0, ls="--")
+                        color=PLOT_INK2, rotation=90)
+    ax.axhline(0.0, color=PLOT_INK2, lw=1.0, zorder=1)
+    ax.axvline(len(names) - 0.2, color=PLOT_GRID, lw=1.0, ls="--")
     ax.set_xticks(x)
     ax.set_xticklabels(labels + ["mean over\nscenarios"], rotation=25,
-                       ha="right", fontsize=9, color=INK2)
+                       ha="right", fontsize=9, color=PLOT_INK2)
     ax.set_ylabel("Net production Pi per episode  (x10^7 ethanol)",
-                  fontsize=9.5, color=INK2)
+                  fontsize=9.5, color=PLOT_INK2)
     ax.margins(y=0.2)
     ax.set_title("NET PRODUCTION Pi (higher is better; * = significantly "
                  "best)",
-                 fontsize=10.5, color=INK, fontweight="bold", pad=10)
-    ax.legend(frameon=False, fontsize=9, labelcolor=INK2)
+                 fontsize=10.5, color=PLOT_INK, fontweight="bold", pad=10)
+    ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2)
     return fig
 
 
@@ -359,9 +384,9 @@ def _shared_episode(res, arms):
                    key=lambda i: (ranks[:, i].max(), ranks[:, i].sum())))
 
 
-def _plot_disturbance_response(results, names, arms, colors, INK, INK2, GRID,
-                               plt):
+def _plot_disturbance_response(results, names, arms):
     """The faulted reactor's answering actuator (solid) vs the faulted quantity."""
+    import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
     dist = [n for n in names if scenario_probe(n)
@@ -372,7 +397,7 @@ def _plot_disturbance_response(results, names, arms, colors, INK, INK2, GRID,
     fig, axs = plt.subplots(2, len(dist), figsize=(4.4 * len(dist), 8.6),
                             squeeze=False, sharex="col",
                             gridspec_kw={"height_ratios": [3, 1.3]})
-    fig.patch.set_facecolor("#fcfcfb")
+    fig.patch.set_facecolor(PLOT_SURFACE)
     for c, n in enumerate(dist):
         ax, ax_s = axs[0][c], axs[1][c]
         _, qlabel, a_idx = DISTURB_PROBES[scenario_probe(n)]
@@ -386,10 +411,10 @@ def _plot_disturbance_response(results, names, arms, colors, INK, INK2, GRID,
             act = np.asarray(tr["act"][ep], dtype=float)
             v = results[n][arm]["viol_per_ep"][ep]
             e = results[n][arm]["on_spec_ethanol_per_ep"][ep]
-            ax.plot(fn(act), color=colors[arm], lw=1.6, zorder=3)
-            ax_s.plot(np.asarray(tr["storage"][ep]) / S_MAX, color=colors[arm],
+            ax.plot(fn(act), color=ARM_COLORS[arm], lw=1.6, zorder=3)
+            ax_s.plot(np.asarray(tr["storage"][ep]) / S_MAX, color=ARM_COLORS[arm],
                       lw=1.3)
-            handles.append(Line2D([0], [0], color=colors[arm], lw=1.6,
+            handles.append(Line2D([0], [0], color=ARM_COLORS[arm], lw=1.6,
                                   label=f"{arm}: {v:.0f} viol, "
                                         f"{e / 1e6:.1f}M on-spec"))
         traces = {arm: np.asarray(results[n][arm]["traces"]["quantity"][ep],
@@ -400,48 +425,46 @@ def _plot_disturbance_response(results, names, arms, colors, INK, INK2, GRID,
                      for t in traces.values())
         ax2 = ax.twinx()
         if shared:
-            ax2.plot(ref, color=INK, ls=":", lw=1.9)
-            handles.append(Line2D([0], [0], color=INK, ls=":", lw=1.9,
+            ax2.plot(ref, color=PLOT_INK, ls=":", lw=1.9)
+            handles.append(Line2D([0], [0], color=PLOT_INK, ls=":", lw=1.9,
                                   label=f"{qlabel} (right)"))
         else:
             for arm, t in traces.items():
-                ax2.plot(t, color=colors[arm], ls=":", lw=1.5)
-                handles.append(Line2D([0], [0], color=colors[arm], ls=":",
+                ax2.plot(t, color=ARM_COLORS[arm], ls=":", lw=1.5)
+                handles.append(Line2D([0], [0], color=ARM_COLORS[arm], ls=":",
                                       lw=1.5, label=f"{arm} {qlabel} (right)"))
-        ax2.set_ylabel(qlabel, fontsize=8.5, color=INK2)
-        ax2.tick_params(colors=INK2, labelsize=8)
+        ax2.set_ylabel(qlabel, fontsize=8.5, color=PLOT_INK2)
+        ax2.tick_params(colors=PLOT_INK2, labelsize=8)
         for side in ("top", "left", "bottom"):
             ax2.spines[side].set_visible(False)
-        ax2.spines["right"].set_color(GRID)
+        ax2.spines["right"].set_color(PLOT_GRID)
         onset = results[n][arms[0]].get("onset_outer")
         for a_ in (ax, ax_s):
             if onset is not None:
-                a_.axvline(onset, color=INK2, ls="--", lw=1.0, zorder=1)
-            _style_ax(a_, INK2, GRID)
+                a_.axvline(onset, color=PLOT_INK2, ls="--", lw=1.0, zorder=1)
+            _style_ax(a_)
         if onset is not None:
-            handles.append(Line2D([0], [0], color=INK2, ls="--", lw=1.0,
+            handles.append(Line2D([0], [0], color=PLOT_INK2, ls="--", lw=1.0,
                                   label="fault onset"))
         for lim, lab_ in ((S_MIN / S_MAX, "S_MIN"), (1.0, "S_MAX")):
-            ax_s.axhline(lim, color=INK2, ls=":", lw=0.9)
-        ax_s.set_ylabel("storage / S_MAX", fontsize=8.5, color=INK2)
-        ax_s.set_xlabel("control step", fontsize=9, color=INK2)
+            ax_s.axhline(lim, color=PLOT_INK2, ls=":", lw=0.9)
+        ax_s.set_ylabel("storage / S_MAX", fontsize=8.5, color=PLOT_INK2)
+        ax_s.set_xlabel("control step", fontsize=9, color=PLOT_INK2)
         ax.set_ylabel(alabel + ("" if reactor < 0 else f", reactor {reactor}"),
-                      fontsize=9, color=INK2)
+                      fontsize=9, color=PLOT_INK2)
         title = n.replace("disturb_", "").replace("_", " ")
         where = "plant-wide" if reactor < 0 else f"reactor {reactor}"
         ax.set_title(f"{title} ({where})\nepisode #{ep}", fontsize=10.5,
-                     color=INK, fontweight="bold")
+                     color=PLOT_INK, fontweight="bold")
         ax.legend(handles=handles, loc="upper center",
                   bbox_to_anchor=(0.5, -0.04), frameon=False, fontsize=7.5,
-                  labelcolor=INK2)
+                  labelcolor=PLOT_INK2)
     fig.suptitle("Disturbance response -- the faulted reactor's answering "
                  "actuator (solid), the faulted quantity (dotted) and the "
                  "storage tank (lower), all arms on one shared episode",
-                 fontweight="bold", fontsize=12.5, color=INK)
+                 fontweight="bold", fontsize=12.5, color=PLOT_INK)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    os.makedirs(PLOT_DIR, exist_ok=True)
-    fig.savefig(os.path.join(PLOT_DIR, "disturbance_response.png"), dpi=150)
-    plt.close(fig)
+    _savefig(fig, "disturbance_response")
 
 
 def _plot_comparison(results):
@@ -452,28 +475,21 @@ def _plot_comparison(results):
     (per-reactor on-spec ethanol and violation events), compare_adapt,
     distributions, disturbance_response.
     """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as exc:                             # pragma: no cover
-        print(f"[plot] skipped: {exc}")
+    plt = _pyplot()
+    if plt is None:
         return
-
     names = list(results.keys())
-    labels = [n.replace("disturb_", "D ").replace("_", " ") for n in names]
+    labels = [scenario_label(n) for n in names]
     arms = tuple(a for a in ARM_ORDER if a in results[names[0]])
-    colors = ARM_COLORS
-    INK, INK2, GRID = PLOT_INK, PLOT_INK2, PLOT_GRID
     x = np.arange(len(names))
 
     def _style(ax, title, ylab):
-        ax.set_title(title, fontsize=11, color=INK, fontweight="bold", pad=10)
-        ax.set_ylabel(ylab, fontsize=9.5, color=INK2)
+        ax.set_title(title, fontsize=11, color=PLOT_INK, fontweight="bold", pad=10)
+        ax.set_ylabel(ylab, fontsize=9.5, color=PLOT_INK2)
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9,
-                           color=INK2)
-        _style_ax(ax, INK2, GRID)
+                           color=PLOT_INK2)
+        _style_ax(ax)
         ax.margins(y=0.16)
 
     def _fmt_short(v):
@@ -488,11 +504,10 @@ def _plot_comparison(results):
         for xi, v, t in zip(pos, vals, tops):
             ax.annotate(fmt(v), (xi, t), xytext=(0, 3),
                         textcoords="offset points", ha="center", va="bottom",
-                        fontsize=6.8, color=INK2, rotation=90)
+                        fontsize=6.8, color=PLOT_INK2, rotation=90)
 
     w = 0.8 / max(len(arms), 1)
     off = lambda i: (i - (len(arms) - 1) / 2) * w          # noqa: E731
-    os.makedirs(PLOT_DIR, exist_ok=True)
     arm_titles = {"saferl": "Safe RL", "meta": "Meta-RL"}
     suptitle = " vs ".join(arm_titles.get(a, a) for a in arms)
     if "meta" in arms:
@@ -504,15 +519,14 @@ def _plot_comparison(results):
 
     def _new_fig():
         fig, ax = plt.subplots(figsize=(max(9.0, 0.9 * len(names)), 6.4))
-        fig.patch.set_facecolor("#fcfcfb")
-        ax.set_facecolor("#fcfcfb")
+        fig.patch.set_facecolor(PLOT_SURFACE)
+        ax.set_facecolor(PLOT_SURFACE)
         return fig, ax
 
     def _save(fig, stem):
-        fig.suptitle(suptitle, fontweight="bold", fontsize=12, color=INK)
+        fig.suptitle(suptitle, fontweight="bold", fontsize=12, color=PLOT_INK)
         fig.tight_layout(rect=(0, 0, 1, 0.93))
-        fig.savefig(os.path.join(PLOT_DIR, f"{stem}.png"), dpi=150)
-        plt.close(fig)
+        _savefig(fig, stem)
 
     def _bar_panel(ax, key, errkey, ylab, title, fmt=None):
         fmt = fmt or _fmt_short
@@ -526,22 +540,20 @@ def _plot_comparison(results):
                 tops = vals + err
             else:
                 yerr, tops = None, vals
-            ax.bar(pos, vals, w, label=arm, color=colors[arm], yerr=yerr,
-                   capsize=3, ecolor=INK2, error_kw={"lw": 1.2})
+            ax.bar(pos, vals, w, label=arm, color=ARM_COLORS[arm], yerr=yerr,
+                   capsize=3, ecolor=PLOT_INK2, error_kw={"lw": 1.2})
             _label_bars(ax, pos, vals, tops, fmt)
         _style(ax, title, ylab)
-        ax.legend(frameon=False, fontsize=9, labelcolor=INK2)
+        ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2)
 
     if all("burden" in results[n][a] for n in names for a in arms):
-        _save(_plot_score(results, names, labels, arms, INK, INK2, GRID, plt),
-              "compare_score")
-        _save(_plot_burden(results, names, labels, arms, INK, INK2, GRID,
-                           plt), "compare_burden")
+        _save(_plot_score(results, names, labels, arms), "compare_score")
+        _save(_plot_burden(results, names, labels, arms), "compare_burden")
     else:
         print("[plot] compare_score / compare_burden skipped: eval.json "
               "predates the burden metric (re-run evaluate)")
     if "saferl" in arms and "meta" in arms:
-        _plot_adapt(results, names, labels, INK, INK2, GRID, plt)
+        _plot_adapt(results, names, labels)
 
     fig, ax = _new_fig()
     _bar_panel(ax, "on_spec_ethanol", "on_spec_ethanol_std", "On-spec ethanol",
@@ -556,52 +568,50 @@ def _plot_comparison(results):
         err = np.asarray([results[n][arm]["mean_titer_std"] for n in names],
                          dtype=float)
         pos = x + off(i)
-        ax.errorbar(pos, vals, yerr=err, fmt="o", ms=8, color=colors[arm],
-                    label=arm, capsize=4, ecolor=INK2, elinewidth=1.2,
+        ax.errorbar(pos, vals, yerr=err, fmt="o", ms=8, color=ARM_COLORS[arm],
+                    label=arm, capsize=4, ecolor=PLOT_INK2, elinewidth=1.2,
                     mec="white", mew=1.0, linestyle="none", zorder=3)
         for xi, v in zip(pos, vals):
             ax.annotate(f"{v:.1f}", (xi, v), xytext=(7, 0),
                         textcoords="offset points", ha="left", va="center",
-                        fontsize=7.2, color=INK2)
+                        fontsize=7.2, color=PLOT_INK2)
         lo_seen.append(float(np.min(vals - err)))
         hi_seen.append(float(np.max(vals + err)))
     _style(ax, "QUALITY -- mean product titer (higher is better)",
            "Mean product titer (g/L)")
     spec = MIN_PRODUCT_TITER or 0.0
     if spec:
-        ax.axhline(spec, color=INK2, ls="--", lw=1.2, zorder=0,
+        ax.axhline(spec, color=PLOT_INK2, ls="--", lw=1.2, zorder=0,
                    label=f"purity spec floor ({spec:.0f} g/L)")
     lo, hi = min(lo_seen), max(hi_seen)
     bottom = min(spec - TITER_PANEL_FLOOR_PAD, lo - 1.0) if spec else lo - 1.0
     ax.set_ylim(bottom, max(hi, spec) + 0.10 * max(hi - bottom, 1.0))
-    ax.legend(frameon=False, fontsize=9, labelcolor=INK2)
+    ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2)
     _save(fig, "compare_quality")
 
     # Per reactor: on-spec ethanol and reactor-local violation events, per arm
     # (averaged over scenarios): which vessel carries the plant's numbers.
     fig, (ax_e, ax_v) = plt.subplots(1, 2, figsize=(12.5, 5.2))
-    fig.patch.set_facecolor("#fcfcfb")
+    fig.patch.set_facecolor(PLOT_SURFACE)
     xr = np.arange(N_REACTORS)
     for i, arm in enumerate(arms):
         eth = np.mean([results[n][arm]["reactor_on_spec_ethanol"] for n in names],
                       axis=0)
         vio = np.mean([results[n][arm]["viol_by_reactor"] for n in names], axis=0)
-        ax_e.bar(xr + off(i), eth, w, color=colors[arm], label=arm)
-        ax_v.bar(xr + off(i), vio, w, color=colors[arm], label=arm)
+        ax_e.bar(xr + off(i), eth, w, color=ARM_COLORS[arm], label=arm)
+        ax_v.bar(xr + off(i), vio, w, color=ARM_COLORS[arm], label=arm)
     for a_, t_ in ((ax_e, "On-spec ethanol per reactor (mean over scenarios)"),
                    (ax_v, "Reactor-local violation events per reactor")):
-        _style_ax(a_, INK2, GRID)
+        _style_ax(a_)
         a_.set_xticks(xr)
         a_.set_xticklabels([f"R{i} ({s:g}x pumps)" for i, s in
-                            enumerate(REACTOR_FLOW_SCALE)], color=INK2)
-        a_.set_title(t_, fontsize=10.5, color=INK, fontweight="bold")
-        a_.legend(frameon=False, fontsize=9, labelcolor=INK2)
+                            enumerate(REACTOR_FLOW_SCALE)], color=PLOT_INK2)
+        a_.set_title(t_, fontsize=10.5, color=PLOT_INK, fontweight="bold")
+        a_.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2)
     _save(fig, "compare_reactors")
 
-    _plot_distributions(results, names, labels, arms, colors, INK, INK2, GRID,
-                        plt)
-    _plot_disturbance_response(results, names, arms, colors, INK, INK2, GRID,
-                               plt)
+    _plot_distributions(results, names, labels, arms)
+    _plot_disturbance_response(results, names, arms)
     print(f"wrote figures to {PLOT_DIR}/")
 
 
@@ -615,19 +625,15 @@ def _plot_tiers(tiers):
     """
     if not tiers:
         return
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Patch
-    except Exception as exc:                             # pragma: no cover
-        print(f"[plot] skipped: {exc}")
+    plt = _pyplot()
+    if plt is None:
         return
+    from matplotlib.patches import Patch
     names = list(tiers)
     y = np.arange(len(names))[::-1]
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 1.2 + 0.75 * len(names)),
                              sharey=True)
-    fig.patch.set_facecolor("#fcfcfb")
+    fig.patch.set_facecolor(PLOT_SURFACE)
     panels = (("burden_reduction", "burden_wins",
                "violation burden cut vs saferl (%)"),
               ("score_gain", "score_wins",
@@ -637,7 +643,7 @@ def _plot_tiers(tiers):
         vals = np.nan_to_num(vals)
         cols = [ARM_COLORS["meta"] if v > 0 else ARM_COLORS["saferl"]
                 for v in vals]
-        ax.barh(y, vals, height=0.5, color=cols, edgecolor="#fcfcfb", lw=2)
+        ax.barh(y, vals, height=0.5, color=cols, edgecolor=PLOT_SURFACE, lw=2)
         ax.axvline(0.0, color=PLOT_INK2, lw=1.0)
         span = max(np.max(np.abs(vals)), 1.0)
         ax.set_xlim(-1.9 * span, 1.9 * span)
@@ -649,7 +655,7 @@ def _plot_tiers(tiers):
                         ha="left" if v >= 0 else "right", fontsize=8.5,
                         color=PLOT_INK)
         ax.set_title(title, fontsize=10.5, color=PLOT_INK, fontweight="bold")
-        _style_ax(ax, PLOT_INK2, PLOT_GRID)
+        _style_ax(ax)
         ax.grid(axis="y", visible=False)
         ax.grid(axis="x", alpha=0.5, color=PLOT_GRID, lw=0.8)
         ax.tick_params(axis="y", length=0)
@@ -664,9 +670,7 @@ def _plot_tiers(tiers):
                  "gap, then significant scenario wins meta / saferl / tied",
                  fontweight="bold", fontsize=11, color=PLOT_INK)
     fig.tight_layout(rect=(0, 0.07, 1, 0.92))
-    os.makedirs(PLOT_DIR, exist_ok=True)
-    fig.savefig(os.path.join(PLOT_DIR, "compare_tiers.png"), dpi=150)
-    plt.close(fig)
+    _savefig(fig, "compare_tiers")
 
 
 TRAIN_CURVE_SMOOTH_ITERS = 50
@@ -690,12 +694,8 @@ def _moving_average(y, window):
 
 def plot_training_curves():
     """Plot each trained arm's training reward and violations."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as exc:                             # pragma: no cover
-        print(f"[plot] training curves skipped: {exc}")
+    plt = _pyplot("training curves")
+    if plt is None:
         return
     logs = {}
     for arm in ARM_ORDER:
@@ -705,9 +705,8 @@ def plot_training_curves():
                 logs[arm] = json.load(f)
     if not logs:
         return
-    INK, INK2, GRID = PLOT_INK, PLOT_INK2, PLOT_GRID
     fig, (ax_r, ax_v) = plt.subplots(1, 2, figsize=(17, 6))
-    fig.patch.set_facecolor("#fcfcfb")
+    fig.patch.set_facecolor(PLOT_SURFACE)
     w = TRAIN_CURVE_SMOOTH_ITERS
     for arm, lg in logs.items():
         col = ARM_COLORS[arm]
@@ -720,17 +719,15 @@ def plot_training_curves():
     for ax, title, ylab in ((ax_r, "REWARD (higher is better)", "episode reward"),
                             (ax_v, "VIOLATIONS (lower is better)",
                              "violation events per episode (symlog)")):
-        _style_ax(ax, INK2, GRID)
-        ax.grid(alpha=0.5, color=GRID, lw=0.8)
-        ax.set_title(title, fontsize=11, color=INK, fontweight="bold", pad=10)
-        ax.set_ylabel(ylab, fontsize=9.5, color=INK2)
-        ax.set_xlabel("training iteration", fontsize=9.5, color=INK2)
-        ax.legend(frameon=False, fontsize=9, labelcolor=INK2)
+        _style_ax(ax)
+        ax.grid(alpha=0.5, color=PLOT_GRID, lw=0.8)
+        ax.set_title(title, fontsize=11, color=PLOT_INK, fontweight="bold", pad=10)
+        ax.set_ylabel(ylab, fontsize=9.5, color=PLOT_INK2)
+        ax.set_xlabel("training iteration", fontsize=9.5, color=PLOT_INK2)
+        ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2)
     fig.suptitle(f"Training curves -- reward and violations per arm "
                  f"({w}-iteration centered moving average)",
-                 fontweight="bold", fontsize=12.5, color=INK)
+                 fontweight="bold", fontsize=12.5, color=PLOT_INK)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    os.makedirs(PLOT_DIR, exist_ok=True)
-    fig.savefig(os.path.join(PLOT_DIR, "training_curves.png"), dpi=150)
-    plt.close(fig)
+    _savefig(fig, "training_curves")
     print(f"wrote {os.path.join(PLOT_DIR, 'training_curves.png')}")

@@ -24,6 +24,10 @@ from metarl.agent.common import device, ROLLOUT_DEVICE
 # MultiHeadAPN.safety_loss()'s hinge, per sample so the gate can weight it.
 SAFETY_SHARPNESS = 50.0
 SAFETY_EPS = 1e-3
+# Rows per apn.project call in the update. ROCm's batched solve
+# (hipblasSgetrsBatched) fails with HIPBLAS_STATUS_ALLOC_FAILED at 2048 rows
+# (the meta arm's 4 x 512) on an RX 9070 XT with 17 GB free; 1024 runs.
+PROJECT_CHUNK = 1024
 
 
 class ShieldMixin:
@@ -209,6 +213,31 @@ class ShieldMixin:
 
     # ------------------------------------------------ the actor's APN terms
 
+    def _project_batch(self, s_rows, a_rows, m):
+        """``apn.project`` of a whole update batch, in PROJECT_CHUNK-row calls.
+
+        The rows are corrected independently, except that ``project`` returns
+        early when every row is safe and otherwise trims the drain of every
+        row. A chunk that is all safe while the batch is not is therefore
+        trimmed first, so each row gets what one call on the batch gives it.
+
+        Args:
+            s_rows: States [B, n, 28].
+            a_rows: Actions [B, n, 4], detached.
+            m: ``apn.margins(s_rows, a_rows)`` [B, H].
+
+        Returns:
+            The projected actions [B, n, 4].
+        """
+        if len(a_rows) <= PROJECT_CHUNK:
+            return self.apn.project(s_rows, a_rows)[0]
+        if not bool((m >= 0.0).all()):
+            # Idempotent, so the chunks that project trims again are unchanged.
+            a_rows = self.apn._trim_drain(s_rows, a_rows)
+        return torch.cat([self.apn.project(s, a)[0] for s, a in
+                          zip(s_rows.split(PROJECT_CHUNK),
+                              a_rows.split(PROJECT_CHUNK))])
+
     def _apn_actor_terms(self, actor_loss, o, feat, zd, gate, batch_mean):
         """Add Safe PPO's safety gradient and mapping penalty to the actor's loss.
 
@@ -238,7 +267,7 @@ class ShieldMixin:
             with torch.no_grad():
                 m = self.apn.margins(s_rows, a_rows.detach())
                 w_unsafe = torch.clamp(-m.min(dim=1).values, min=0.0) + 0.1
-                a_safe, _ = self.apn.project(s_rows, a_rows.detach())
+                a_safe = self._project_batch(s_rows, a_rows.detach(), m)
                 a_safe = self._apply_safety(o, a_safe.reshape(a_det.shape))
             map_pen = batch_mean((a_det - a_safe).pow(2).mean(dim=-1)
                                  * w_unsafe)

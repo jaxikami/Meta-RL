@@ -21,10 +21,6 @@ from metarl.env.plant import DISCHARGE_CUTOFF
 from metarl.agent.common import device, LOG_ALPHA_MAX, ENTROPY_TERM_CLIP
 from metarl.agent.replay import WINDOW_CHUNK_LEN, _to_device, _as_long
 
-# MultiHeadAPN.safety_loss()'s hinge, per sample so the gate can weight it.
-SAFETY_SHARPNESS = 50.0
-SAFETY_EPS = 1e-3
-
 # Pre-tanh outlet command whose flow fraction (tanh + 1) / 2 is half the cutoff.
 HOLD_PRE_TANH_TARGET = float(np.arctanh(DISCHARGE_CUTOFF - 1.0))
 
@@ -454,34 +450,8 @@ class LearningMixin:
                                     - torch.min(q1_pi, q2_pi))
 
             # ── 2b. APN safety gradient and mapping penalty ──────────────────
-            # Safe PPO's two terms, on the actor's deterministic action as it
-            # would be sent before projection: the hinge on every head's
-            # margin, backpropagated through the frozen APN, and the pull
-            # toward that action's projection, weighted by its worst margin.
-            # Off-policy, the projection is recomputed here (static buffers:
-            # L3 lives in the episode).
-            if self.apn is not None and (self.apn_penalty_weight > 0.0
-                                         or self.apn_safety_grad_weight > 0.0):
-                a_det, _, _ = self._safe_sample(o, feat_d, zd,
-                                                deterministic=True,
-                                                with_logprob=False,
-                                                gate=gate_act)
-                s_rows, a_rows = self._rows(o), self._rows(a_det)
-                if self.apn_safety_grad_weight > 0.0:
-                    m = self.apn.margins(s_rows, a_rows)
-                    hinge = F.softplus(SAFETY_SHARPNESS * (SAFETY_EPS - m)) / SAFETY_SHARPNESS
-                    safety_pen = batch_mean(hinge.mean(dim=-1))
-                    actor_loss = actor_loss + self.apn_safety_grad_weight * safety_pen
-                if self.apn_penalty_weight > 0.0:
-                    with torch.no_grad():
-                        m = self.apn.margins(s_rows, a_rows.detach())
-                        w_unsafe = torch.clamp(-m.min(dim=1).values, min=0.0) + 0.1
-                        a_safe, _ = self.apn.project(s_rows, a_rows.detach())
-                        a_safe = self._apply_safety(
-                            o, a_safe.reshape(a_det.shape))
-                    map_pen = batch_mean((a_det - a_safe).pow(2).mean(dim=-1)
-                                         * w_unsafe)
-                    actor_loss = actor_loss + self.apn_penalty_weight * map_pen
+            actor_loss, safety_pen, map_pen = self._apn_actor_terms(
+                actor_loss, o, feat_d, zd, gate_act, batch_mean)
 
             # ── 2c. Anchor to the warm-start policy ──────────────────────────
             if self.anchor_actor is not None and self._anchor_on:

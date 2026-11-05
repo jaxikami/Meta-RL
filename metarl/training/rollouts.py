@@ -137,8 +137,11 @@ def ingest_episode_record(agent, replay, rec):
 CONSTRAINT_IDS = tuple(CONSTRAINT_NAMES)
 
 
-def _start_episode(env, agent, task, disturbance, index=0):
-    """Install a task and its faults, reset the plant and the posterior."""
+def _start_episode(env, agent, task, disturbance, index=0, keep_states=False):
+    """Install a task and its faults, reset the plant and the posterior.
+
+    ``keep_states`` also records every observation acted on (``states``).
+    """
     agent.gate_floor = None
     apply_fault_schedule(env, disturbance, index)
     env.set_task(task)
@@ -151,7 +154,8 @@ def _start_episode(env, agent, task, disturbance, index=0):
             "total_v": 0, "smoothing": 0.0,
             "acts": [], "r_traj": [], "v_traj": [],
             "act_traj": [], "probe_traj": [], "storage_traj": [],
-            "gate_traj": [], "stage_traj": [],
+            "gate_traj": [], "stage_traj": [], "t_traj": [],
+            "states": [] if keep_states else None,
             "viol_by_constraint": {cid: 0 for cid in CONSTRAINT_IDS},
             "viol_by_reactor": np.zeros(N_REACTORS, dtype=np.int64),
             "viol_depth_sum": {cid: 0.0 for cid in DEPTH_CONSTRAINTS},
@@ -174,6 +178,9 @@ def _advance(env, agent, ep, stop_at=None):
             return
         state = ep["state"]
         ep["stage_traj"].append(env.current_stage.copy())
+        ep["t_traj"].append(int(env.time_step_count))
+        if ep["states"] is not None:
+            ep["states"].append(state.copy())
         safe_a, _ = agent.select_action(state, deterministic=True)
         ep["gate_traj"].append(agent.last_gate)
         next_state, r, done, info = env.step(safe_a)

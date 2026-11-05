@@ -17,8 +17,9 @@ from metarl.training.config import (SEED, Z_INFORM_MIN_SNR,
                                     Z_INFORM_DISTURBANCES, LOG_DIR)
 from metarl.training.arms import (ARMS, BEST_META_PATH, META_PATH,
                                   _build_agent, _load_preferring_best)
-from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool,
-                                   apply_fault_schedule)
+from metarl.training.tasks import seed_everything, make_arm_env, make_task_pool
+from metarl.training.rollouts import _start_episode, _advance, _episode_metrics
+from metarl.training.evaluate import EVAL_ID_SEED
 from metarl.training.metrics import (latent_separability, gate_opening,
                                      _finite_mean, _paired_delta,
                                      _fmt_delta_sci)
@@ -27,45 +28,29 @@ from metarl.training.logs import _json_default
 
 def _z_rollout(env, agent, task, disturbance=None, z_mode="mean", fixed_z=None,
                keep_states=False, index=0):
-    """Roll out once, optionally deploying a caller-supplied latent."""
+    """Roll out once, optionally deploying a caller-supplied latent.
+
+    Returns:
+        The episode's metrics (``_episode_metrics``) plus ``states`` and
+        ``times`` (each acted-on observation and its inner step; empty
+        without ``keep_states``) and ``gate_times`` (every decision's step).
+    """
     prev = agent.z_mode
     try:
-        apply_fault_schedule(env, disturbance, index)
-        env.set_task(task)
-        state = env.reset()
         agent.z_mode = z_mode
-        agent.clear_z()
+        ep = _start_episode(env, agent, task, disturbance, index,
+                            keep_states=keep_states)
         if z_mode == "fixed" and fixed_z is not None:
             agent.set_fixed_z(fixed_z)
-        states, times, total_r, total_v = [], [], 0.0, 0
-        gates, gate_times = [], []
-        done, info = False, {}
-        while not done:
-            if keep_states:
-                states.append(state.copy())
-                times.append(int(env.time_step_count))
-            gate_times.append(int(env.time_step_count))
-            safe_a, _ = agent.select_action(state, deterministic=True)
-            gates.append(agent.last_gate)
-            next_state, r, done, info = env.step(safe_a)
-            agent.observe_step(next_state, info)
-            agent.update_context(state, safe_a, r, next_state)
-            state = next_state
-            total_r += r
-            total_v += int(info["violation_events"])
-        return {
-            "violations": total_v, "reward": total_r,
-            "ethanol": float(env.product_eth),
-            "on_spec_ethanol": float(info.get("on_spec_ethanol", 0.0)),
-            "mean_titer": float(env.mean_product_titer),
-            "z_mu": agent.z_mu.detach().cpu().numpy().copy(),
-            "z_sigma_sq": agent.z_sigma_sq.detach().cpu().numpy().copy(),
-            "states": states, "times": times,
-            "gates": np.asarray(gates, dtype=float),
-            "gate_times": np.asarray(gate_times, dtype=int),
-        }
+        _advance(env, agent, ep)
+        out = _episode_metrics(env, agent, ep)
     finally:
         agent.z_mode = prev
+    times = np.asarray(ep["t_traj"], dtype=int)
+    out.update(states=ep["states"] or [],
+               times=times.tolist() if keep_states else [],
+               gate_times=times)
+    return out
 
 
 def _probe_states(states, times, split, after, n):
@@ -119,7 +104,7 @@ def z_informativeness(episodes=None):
     env = make_arm_env(ARMS["meta"])
     agent = _build_agent(env, "meta")
     _load_preferring_best(agent, BEST_META_PATH, META_PATH, "meta", strict=True)
-    tasks = make_task_pool(n_ep, seed=12345, ood=False)
+    tasks = make_task_pool(n_ep, seed=EVAL_ID_SEED, ood=False)
     onset = env.max_steps // 2
 
     scenarios = {"undisturbed": None}
@@ -136,10 +121,12 @@ def z_informativeness(episodes=None):
         z_mus = np.stack([m["z_mu"] for m in matched])
         sep = latent_separability(z_mus, [m["z_sigma_sq"] for m in matched])
         snr = sep["snr"]
-        gate_pre = _finite_mean([gate_opening(m["gates"][m["gate_times"] <= onset])
-                                 for m in matched])
-        gate_post = _finite_mean([gate_opening(m["gates"][m["gate_times"] > onset])
-                                  for m in matched])
+        gate_pre = _finite_mean([
+            gate_opening(m["gate_traj"][m["gate_times"] <= onset])
+            for m in matched])
+        gate_post = _finite_mean([
+            gate_opening(m["gate_traj"][m["gate_times"] > onset])
+            for m in matched])
         gated = agent.adapt_gate
 
         def action_probes(after):

@@ -448,31 +448,28 @@ with these plant-specific settings:
   episode once and continues every fault scenario from a snapshot taken just
   before its first onset, so each row is exactly the from-scratch episode
   (the smoke test checks it) at about half the simulation.
-- Evaluation scenarios: in-distribution, OOD, then every
-  `EVAL_DISTURBANCES` kind (Fermentation-PPO's) under every pattern, named
-  `<kind>_<pattern>` (`leak`, `feed_gain`, `dilution`, `kinetics_decay`,
-  `toxin`, `cell_viability`, `contamination`, `downstream_rate`,
-  `turnaround_delay`, `storage_capacity`, `cooling_capacity` × `step`,
-  `spike`, `gradual`, `recurrent`): 46 scenarios. The held-out panel and the
-  latent gate use step faults.
-- **Tiers.** Every scenario is filed in one tier, and `eval_summary.json`
-  (`tiers`), the console and `compare_tiers.png` report ADAPT per tier: the
-  pooled burden cut and net-production gain, and the significant paired wins
-  per side. All tiers run on the same paired in-distribution tasks.
+- **Evaluation runs three tiers, and only them.** The 44-scenario fault grid
+  (every `EVAL_DISTURBANCES` kind under every pattern, `<kind>_<pattern>`)
+  and the undisturbed in-distribution draws are `meta`'s own training
+  distribution. `saferl` never trains on a fault, so a grid comparison would
+  test `meta` on its homework and is not run. The component ablation still
+  runs the grid (`evaluate.ablation_scenarios`), where every variant trained
+  on it. The held-out panel and the latent gate use step faults.
+- **Tiers.** `eval_summary.json` (`tiers`), the console and
+  `compare_tiers.png` report ADAPT per tier: the pooled burden cut and
+  net-production gain, and the significant paired wins per side. Every tier
+  runs on the same paired in-distribution tasks (T1's widened prior and T3's
+  mismatch copies aside). 19 scenarios in all: 12, 4 and 3.
 
   | tier | what is new to `meta` at test | scenarios |
   |---|---|---|
-  | T1 | only the draw: instance, timing, reactor | the 44-scenario grid, `in_distribution` |
-  | T2 | parameters past training | `out_of_distribution` (prior 1.8× wider); `<kind>_extreme`: a step at a magnitude past the training range, by one rule for every kind (`EVAL_EXTRAPOLATION`: the training edge pushed 1.5× as far from nominal in log space; additive kinds 1.5× the upper edge) |
-  | T3 | the fault kind | any scenario with a kind in `PLANT_HOLDOUT_KINDS`, which `meta` then trains without (out of its training faults, compound pairs, held-out selection panel and gate) |
-  | T4 | the combination | `combo_*` (`EVAL_COMBINATIONS`): three kinds at once, staggered onsets, a ramp with a recurrent fault. Training compounds only two kinds stepping at one onset |
+  | T1 | parameters past training | `out_of_distribution` (prior 1.8× wider); `<kind>_extreme`: a step at a magnitude past the training range, by one rule for every kind (`EVAL_EXTRAPOLATION`: the training edge pushed 1.5× as far from nominal in log space; additive kinds 1.5× the upper edge) |
+  | T2 | the combination | `combo_*` (`EVAL_COMBINATIONS`): three kinds at once, staggered onsets, a ramp with a recurrent fault. Training compounds only two kinds stepping at one onset |
+  | T3 | the plant model itself | `mismatch_*` (`EVAL_MISMATCH`): from t = 0, no fault, every reactor's rate law has a constant multiplier on one term (`metarl/env/mismatch.py`): cellulose→glucose hydrolysis r2 × 0.6, xylose uptake qX × 1.5, the yeast's death constants × 3. Training only moves the lumped modifiers (all hydrolysis together, each uptake), KineticNet learned the unmodified law, and the term is not in the task descriptor |
 
-  T3 needs its own `meta` run (`PLANT_HOLDOUT_KINDS=leak,contamination,storage_capacity`,
-  one kind per family, each with a trained sibling that acts on the same
-  constraint) against the same `saferl`; report T1, T2 and T4 from the run
-  that trains on every kind. Training writes the holdout to
-  `policy/[tag]/meta_holdout.json`, and `evaluate` refuses a different one.
-  `saferl` never trains on a fault, so every tier is new to it.
+  No tier holds a fault kind out of `meta`'s training: T1's extrapolated
+  magnitudes and T2's combinations already put it outside what it trained
+  on. The disturbance-response figure traces each kind's `_extreme` step.
 
 ### Why `meta` tied `saferl`, and the training fixes
 
@@ -650,7 +647,6 @@ $env:PLANT_SEED=1; $env:PLANT_RUN_TAG="seed1"; python -m metarl all
 | `PLANT_EVAL_EPISODES` | evaluation tasks per scenario (default 100) |
 | `PLANT_EVAL_WORKERS` | evaluation worker processes (default: every logical CPU); `0` or `1` runs in-process |
 | `PLANT_EARLY_STOP_PATIENCE` | early-stop patience in held-out checks (default 50) |
-| `PLANT_HOLDOUT_KINDS` | comma-separated fault kinds `meta` trains without (tier 3; default none) |
 | `PLANT_DEVICE` | force the training device, e.g. `cpu` |
 | `PLANT_VERBOSE_PBAR` | `1` adds losses and latent diagnostics to the progress bar |
 

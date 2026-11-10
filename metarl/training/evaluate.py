@@ -20,11 +20,12 @@ from metarl.training.config import (SEED, EVAL_EPISODES, EVAL_Z_MODE,
                                     CONSTRAINT_NAMES, DEPTH_CONSTRAINTS,
                                     Z_INFORM_MIN_SNR, LOG_DIR, PLOT_DIR,
                                     DISTURB_PROBES, META_DISTURB_MAG_RANGES,
-                                    META_HOLDOUT_KINDS, EVAL_EXTRAPOLATION,
-                                    EVAL_COMBINATIONS, EVAL_TIERS)
+                                    EVAL_EXTRAPOLATION,
+                                    EVAL_COMBINATIONS, EVAL_TIERS,
+                                    EVAL_MISMATCH)
 from metarl.training.arms import (ARMS, ARM_ORDER, CONTRASTS, arm_paths,
                                   _build_agent,
-                                  _load_preferring_best, check_holdout)
+                                  _load_preferring_best)
 from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool,
                                    as_fault_schedule, pattern_schedule)
 from metarl.training.rollouts import scenario_rollouts
@@ -280,7 +281,7 @@ def eval_fault_scenarios(onset, horizon=None):
 
 
 def extreme_magnitude(label):
-    """Tier 2's magnitude for EVAL_DISTURBANCES ``label``, past training.
+    """Tier 1's magnitude for EVAL_DISTURBANCES ``label``, past training.
 
     The training range's edge on the evaluation magnitude's side of nominal
     (1.0), EVAL_EXTRAPOLATION times as far from nominal in log space; an
@@ -295,15 +296,15 @@ def extreme_magnitude(label):
 
 
 def eval_tier_scenarios(onset, horizon):
-    """Tier 2's extrapolated magnitudes and tier 4's combinations.
+    """Tier 1's extrapolated magnitudes and tier 2's combinations.
 
     Returns:
-        Dict scenario name -> (base tier, fault schedule): "<label>_extreme"
-        (T2, a step at ``onset``) and "combo_<name>" (T4, EVAL_COMBINATIONS).
+        Dict scenario name -> (tier, fault schedule): "<label>_extreme" (T1,
+        a step at ``onset``) and "combo_<name>" (T2, EVAL_COMBINATIONS).
     """
     out = {}
     for label, d in EVAL_DISTURBANCES.items():
-        out[f"{label}_extreme"] = ("T2", pattern_schedule(
+        out[f"{label}_extreme"] = ("T1", pattern_schedule(
             d["kind"], extreme_magnitude(label), "step", onset, d["reactor"],
             horizon))
     for name, parts in EVAL_COMBINATIONS.items():
@@ -317,14 +318,25 @@ def eval_tier_scenarios(onset, horizon):
                 onset if t0 is None else t0, reactor, horizon,
                 spike_h=EVAL_SPIKE_H, gradual_h=EVAL_GRADUAL_H,
                 treads=META_DRIFT_TREADS, windows=EVAL_RECURRENT_WINDOWS)
-        out[f"combo_{name}"] = ("T4", sched)
+        out[f"combo_{name}"] = ("T2", sched)
     return out
 
 
-def scenario_tier(base, dist, holdout=META_HOLDOUT_KINDS):
-    """A scenario's tier: T3 when it contains a held-out kind, else ``base``."""
-    kinds = {d["kind"] for d in as_fault_schedule(dist)}
-    return "T3" if kinds & set(holdout) else base
+def with_mismatch(tasks, spec):
+    """Copies of ``tasks`` whose plant runs the mismatch ``spec``."""
+    return [{**t, "mismatch": dict(spec)} for t in tasks]
+
+
+def eval_mismatch_scenarios(tasks):
+    """Tier 3: each EVAL_MISMATCH case on copies of ``tasks``, undisturbed.
+
+    Returns:
+        Dict "mismatch_<name>" -> {"tasks", "dist" (None), "tier" ("T3")}.
+        Each case is its own task pool, so it runs its own episodes from t = 0.
+    """
+    return {f"mismatch_{name}": {"tasks": with_mismatch(tasks, spec),
+                                 "dist": None, "tier": "T3"}
+            for name, spec in EVAL_MISMATCH.items()}
 
 
 def eval_task_pools(n):
@@ -333,31 +345,41 @@ def eval_task_pools(n):
             make_task_pool(n, seed=EVAL_OOD_SEED, ood=True))
 
 
-def eval_scenarios(id_tasks, ood_tasks, onset, horizon, tiers=True):
-    """Every scenario ``evaluate`` runs, in report order.
+def eval_scenarios(id_tasks, ood_tasks, onset, horizon):
+    """Every scenario ``evaluate`` runs, in report order: the three tiers.
+
+    The fault grid (``eval_fault_scenarios``) is meta's training
+    distribution, so it is no fair test against saferl and is not run here.
 
     Args:
         id_tasks, ood_tasks: The task pools (``eval_task_pools``).
-        onset: First inner step of the step / spike / gradual faults.
+        onset: First inner step of the stepped faults.
         horizon: Episode length in inner steps.
-        tiers: Include tier 2's extrapolations and tier 4's combinations;
-            without them, the undisturbed pools and the fault grid.
 
     Returns:
         Dict name -> {"tasks", "dist" (fault schedule or None), "tier"}.
     """
+    scenarios = {"out_of_distribution": {"tasks": ood_tasks, "dist": None,
+                                         "tier": "T1"}}
+    for name, (tier, dist) in eval_tier_scenarios(onset, horizon).items():
+        scenarios[name] = {"tasks": id_tasks, "dist": dist, "tier": tier}
+    scenarios.update(eval_mismatch_scenarios(id_tasks))
+    return scenarios
+
+
+def ablation_scenarios(id_tasks, ood_tasks, onset, horizon):
+    """The component ablation's scenarios: both undisturbed pools and the grid.
+
+    Every ablation variant trains on the grid's distribution, so it compares
+    them fairly. Untiered.
+    """
     scenarios = {
-        "in_distribution": {"tasks": id_tasks, "dist": None, "tier": "T1"},
+        "in_distribution": {"tasks": id_tasks, "dist": None, "tier": None},
         "out_of_distribution": {"tasks": ood_tasks, "dist": None,
-                                "tier": "T2"},
+                                "tier": None},
     }
     for name, dist in eval_fault_scenarios(onset, horizon).items():
-        scenarios[name] = {"tasks": id_tasks, "dist": dist,
-                           "tier": scenario_tier("T1", dist)}
-    if tiers:
-        for name, (base, dist) in eval_tier_scenarios(onset, horizon).items():
-            scenarios[name] = {"tasks": id_tasks, "dist": dist,
-                               "tier": scenario_tier(base, dist)}
+        scenarios[name] = {"tasks": id_tasks, "dist": dist, "tier": None}
     return scenarios
 
 
@@ -403,7 +425,6 @@ def evaluate():
         The full results dict, also written to ``eval.json``.
     """
     seed_everything(SEED)
-    check_holdout()
     arms = ARM_ORDER
     envs, agents = {}, {}
     for name in arms:
@@ -433,7 +454,6 @@ def evaluate():
     summary = _eval_summary(results, arms)
     summary["tiers"] = _tier_summary(
         results, summary, {n: sc["tier"] for n, sc in scenarios.items()})
-    summary["holdout_kinds"] = list(META_HOLDOUT_KINDS)
     _print_eval(results, summary)
     os.makedirs(LOG_DIR, exist_ok=True)
     with open(os.path.join(LOG_DIR, "eval.json"), "w") as f:
@@ -616,7 +636,7 @@ def _tier_summary(results, summary, tiers, arm_a="meta", arm_b="saferl"):
     return out
 
 
-def _print_tiers(tiers, holdout):
+def _print_tiers(tiers):
     """One line per tier: meta's pooled gaps and its significant wins."""
     if not tiers:
         return
@@ -631,9 +651,6 @@ def _print_tiers(tiers, holdout):
               f"{bw['meta']:>5}/{bw['saferl']}/{bw['tied']:<4}"
               f"{t['score_gain'] * 100:>+9.1f}%"
               f"{sw['meta']:>5}/{sw['saferl']}/{sw['tied']:<4}")
-    if "T3" not in tiers:
-        print("  T3   none: set PLANT_HOLDOUT_KINDS and retrain meta"
-              + (f" (held out: {', '.join(holdout)})" if holdout else ""))
 
 
 def _print_eval(results, summary):
@@ -672,6 +689,6 @@ def _print_eval(results, summary):
                   f"B {_fmt_delta(v['d_burden']):<22}"
                   f"eth {_fmt_delta_sci(v['d_eth']):<26}"
                   f"Pi {_fmt_delta_sci(v['d_score'])}")
-    _print_tiers(summary.get("tiers", {}), summary.get("holdout_kinds", ()))
+    _print_tiers(summary.get("tiers", {}))
     print(f"\nfull per-scenario tables: eval.json  |  figures: {PLOT_DIR}  |  "
           f"redraw figures only: python -m metarl plot_eval")

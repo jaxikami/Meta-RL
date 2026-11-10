@@ -324,7 +324,7 @@ def evaluate_run(spec, n_episodes):
         Dict scenario name -> compact results.
     """
     from metarl.training.tasks import seed_everything, make_arm_env
-    from metarl.training.evaluate import (eval_task_pools, eval_scenarios,
+    from metarl.training.evaluate import (eval_task_pools, ablation_scenarios,
                                           scenario_groups,
                                           scenario_rows_in_process,
                                           _aggregate_rows, _z_label)
@@ -333,8 +333,8 @@ def evaluate_run(spec, n_episodes):
     agent = _build_agent(env, spec)
     final_path, best_path = arm_paths(spec)
     _load_preferring_best(agent, best_path, final_path, spec.name, strict=True)
-    scenarios = eval_scenarios(*eval_task_pools(n_episodes),
-                               env.max_steps // 2, env.max_steps, tiers=False)
+    scenarios = ablation_scenarios(*eval_task_pools(n_episodes),
+                                   env.max_steps // 2, env.max_steps)
     print(f"[eval] {spec.name}: {len(scenarios)} scenarios ...", flush=True)
     rows = scenario_rows_in_process(env, agent, scenario_groups(scenarios),
                                     scenarios)

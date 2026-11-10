@@ -20,7 +20,6 @@ from metarl.agent.common import LATENT_DIM, device
 from metarl.agent.replay import MultiTaskReplayBuffer
 from metarl.training.config import (APN_REFINE_EVERY, APN_REFINE_EPISODES,
                                     SEED, N_TRAIN_TASKS, META_ITERATIONS,
-                                    META_HOLDOUT_KINDS,
                                     COLLECT_EPISODES_PER_ITER,
                                     META_COLLECT_EPISODES_PER_ITER,
                                     UPDATES_PER_ITER, META_BATCH, BATCH_SIZE,
@@ -52,8 +51,7 @@ from metarl.training.config import (APN_REFINE_EVERY, APN_REFINE_EPISODES,
                                     GATE_SHARPNESS, HOLD_PENALTY_WEIGHT,
                                     HOLD_MARGIN, HOLD_GATE_TARGET,
                                     FINETUNE_FROM, COLLECT_IN_WORKERS)
-from metarl.training.arms import (arm_paths, get_arm, _build_agent,
-                                  write_holdout)
+from metarl.training.arms import arm_paths, get_arm, _build_agent
 from metarl.training.early_stopping import EarlyStopper
 from metarl.training.tasks import (seed_everything, make_arm_env, make_task_pool,
                                    corner_risk, make_corner_tasks,
@@ -464,11 +462,6 @@ def _train(arm):
     replay = MultiTaskReplayBuffer(env.stateDim, env.actionDim,
                                    priv_dim=agent.critic_privileged_dim)
     rng = np.random.default_rng(SEED + 1)
-    if spec.multitask:
-        write_holdout()
-        if META_HOLDOUT_KINDS:
-            print(f"  held out of training (tier 3): "
-                  f"{', '.join(META_HOLDOUT_KINDS)}")
 
     pool = (make_task_pool(N_TRAIN_TASKS, seed=0) if spec.multitask
             else [nominal_task()])

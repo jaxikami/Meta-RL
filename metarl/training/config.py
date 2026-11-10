@@ -14,7 +14,6 @@ from metarl.env.disturbances import EVAL_ONSET
 from metarl.env.disturbances import (  # noqa: F401
     EVAL_DISTURBANCES, EVAL_SPIKE_H, EVAL_GRADUAL_H, EVAL_RECURRENT_WINDOWS,
     FAULT_PATTERNS)
-from metarl.env.faults import DISTURBANCE_ALIASES, VALID_DISTURBANCES
 
 MODE = "all"
 SEED = int(os.environ.get("PLANT_SEED", 0))
@@ -213,28 +212,6 @@ META_COMPOUND_PAIRS = (("leak", "feed_conc"), ("feed_gain", "feed_conc"),
 META_COMPOUND_PAIR_FRAC = 0.5
 
 
-def _holdout_kinds(raw):
-    """Parse PLANT_HOLDOUT_KINDS ("leak,contamination") into canonical kinds."""
-    out = []
-    for k in (s.strip() for s in raw.split(",")):
-        if not k:
-            continue
-        k = DISTURBANCE_ALIASES.get(k, k)
-        if k not in VALID_DISTURBANCES:
-            raise ValueError(f"PLANT_HOLDOUT_KINDS: unknown kind {k!r}; "
-                             f"expected some of {VALID_DISTURBANCES}")
-        out.append(k)
-    return tuple(dict.fromkeys(out))
-
-
-# Tier 3 (kind OOD): kinds meta never trains on. They leave the training
-# distribution, the compound pairs (tasks filters by candidate kind) and the
-# held-out selection panel, so no checkpoint is chosen on them; evaluation
-# reports every scenario that contains one under tier 3. Empty by default.
-META_HOLDOUT_KINDS = _holdout_kinds(os.environ.get("PLANT_HOLDOUT_KINDS", ""))
-META_DISTURB_KINDS = tuple(k for k in META_DISTURB_KINDS
-                           if k not in META_HOLDOUT_KINDS)
-
 # ─── Evaluation disturbance scenarios ────────────────────────────────────────
 # Fermentation-PPO's (metarl.env.disturbances): every evaluated kind under
 # every FAULT_PATTERNS entry, scenario "<label>_<pattern>" (e.g.
@@ -245,18 +222,20 @@ META_DISTURB_KINDS = tuple(k for k in META_DISTURB_KINDS
 # (paired) tasks. Imported above: EVAL_DISTURBANCES, EVAL_ONSET, EVAL_SPIKE_H,
 # EVAL_GRADUAL_H, EVAL_RECURRENT_WINDOWS.
 #
-# Tiers beyond those (evaluate.eval_tier_scenarios), every one on the same
-# paired in-distribution tasks:
-#   T1  the grid above and the undisturbed prior: inside meta's training
-#       distribution, fresh draws.
-#   T2  parameter OOD: the 1.8x-wide task prior ("out_of_distribution"), and
+# The grid is meta's own training distribution (fresh draws of the kinds,
+# magnitudes and patterns it trains on), so it is no fair test of meta
+# against saferl: ``evaluate`` does not run it. The component ablation does
+# (``evaluate.ablation_scenarios``), where every variant trained on it.
+#
+# ``evaluate`` runs three tiers (evaluate.eval_tier_scenarios,
+# eval_mismatch_scenarios), every one on the same paired in-distribution tasks:
+#   T1  parameter OOD: the 1.8x-wide task prior ("out_of_distribution"), and
 #       each kind stepped at EVAL_ONSET with a magnitude past its training
 #       range ("<label>_extreme"): the training edge on the evaluation
 #       magnitude's side of nominal, pushed EVAL_EXTRAPOLATION times as far
 #       in log space (additive kinds: EVAL_EXTRAPOLATION x the upper edge).
 #       One rule for every kind, so no magnitude is picked by its outcome.
-#   T3  kind OOD: any scenario containing a META_HOLDOUT_KINDS kind.
-#   T4  combinations training never draws (it compounds two kinds stepping at
+#   T2  combinations training never draws (it compounds two kinds stepping at
 #       ONE onset): three kinds at once, staggered onsets, mixed patterns.
 #       Each part is (EVAL_DISTURBANCES label, pattern, onset, reactor
 #       shift): a rotating fault acts on reactor (k + shift) % 3 in episode k,
@@ -274,17 +253,33 @@ EVAL_COMBINATIONS = {
     "ramp_and_recurrent": (("feed_gain", "gradual", EVAL_ONSET, 0),
                            ("cooling_capacity", "recurrent", None, 0)),
 }
+# T3  plant-model mismatch: the plant's rate law gains a constant multiplier
+#     on one rate term (metarl.env.mismatch), on every reactor from t = 0,
+#     with no fault. Training only ever moves the lumped modifiers (all
+#     hydrolysis together, each uptake), the APN's KineticNet learned the
+#     unmodified law, and the term is not in the task descriptor. Scenario
+#     "mismatch_<name>", on copies of the in-distribution tasks. Magnitudes
+#     from the scripted policies (tests/smoke_test.py recipes, nominal task):
+#       r2 x0.6     fixed-rate recipe: 2 of 5 lots rejected, on-spec -40%;
+#                   the closed-loop scheduler compensates
+#       qX x1.5     closed-loop scheduler: 10 h over the cooling cap (id 9)
+#       death x3    fixed-rate recipe: 2 of 5 lots rejected, on-spec -40%
+#     r1, r4, qF, qHMF and qACT at x0.3-0.5 cost either recipe under 1%.
+EVAL_MISMATCH = {
+    "hydrolysis": {"r2": 0.6},
+    "xylose_uptake": {"qX": 1.5},
+    "cell_death": {"death": 3.0},
+}
 EVAL_TIERS = {
-    "T1": "in-distribution (fresh draws)",
-    "T2": "parameter OOD (prior 1.8x, magnitudes past training)",
-    "T3": "kind OOD (kinds held out of meta-training)",
-    "T4": "unseen combinations (3 kinds, staggered, mixed patterns)",
+    "T1": "parameter OOD (prior 1.8x, magnitudes past training)",
+    "T2": "unseen combinations (3 kinds, staggered, mixed patterns)",
+    "T3": "plant-model mismatch (a rate term off the modelled kinetics)",
 }
 # Kind label -> (disturbance_probe key, label, actuator index within a
 # reactor): the quantity the fault acts on and the actuator that answers it,
-# traced on the label's "step" scenario. For a per-reactor fault both are the
-# faulted reactor's; for a plant-wide fault the actuator is the mean over the
-# reactors.
+# traced on the label's stepped scenario ("<label>_extreme"; "<label>_step" in
+# the ablation). For a per-reactor fault both are the faulted reactor's; for a
+# plant-wide fault the actuator is the mean over the reactors.
 DISTURB_PROBES = {
     "leak": ("mass", "faulted reactor's mass (kg)", 1),
     "feed_gain": ("feed_gain", "faulted pump's gain", 1),
@@ -364,8 +359,7 @@ SELECT_VIOL_WEIGHT = 1.0
 # Panel branches that must pass the absolute gate on their own: the faults
 # that move an ONLINE measurement (reactor masses, the storage mass), so an
 # adaptive arm can avoid them.
-GATE_FAULT_KINDS = tuple(k for k in ("leak", "feed_gain", "downstream_rate")
-                         if k not in META_HOLDOUT_KINDS)
+GATE_FAULT_KINDS = ("leak", "feed_gain", "downstream_rate")
 
 # ─── Disturbed held-out panel (selection + early stop) ───────────────────────
 # Magnitudes bracket the evaluation's without equalling them. Per-reactor
@@ -383,8 +377,6 @@ HELDOUT_DISTURBANCES = (
     ("storage_capacity", 0.88, None),
     ("cooling_capacity", 0.82, None),
 )
-HELDOUT_DISTURBANCES = tuple(d for d in HELDOUT_DISTURBANCES
-                             if d[0] not in META_HOLDOUT_KINDS)
 HELDOUT_DISTURB_WEIGHT = 0.5
 EARLY_STOP_DIVERGE_FACTOR = 5.0
 EARLY_STOP_DIVERGE_VIOL_FLOOR = 15.0

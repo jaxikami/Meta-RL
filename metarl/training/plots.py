@@ -367,9 +367,14 @@ def _plot_score(results, names, labels, arms):
 
 
 def scenario_probe(name):
-    """The DISTURB_PROBES key traced on scenario ``name`` (its step pattern), or None."""
+    """The DISTURB_PROBES key traced on scenario ``name``, or None.
+
+    A kind's stepped scenario is traced: "<label>_extreme" in ``evaluate``
+    (a step at EVAL_ONSET), "<label>_step" in the ablation's grid.
+    """
     label, _, pattern = name.rpartition("_")
-    return label if pattern == "step" and label in DISTURB_PROBES else None
+    return (label if pattern in ("step", "extreme") and label in DISTURB_PROBES
+            else None)
 
 
 def _shared_episode(res, arms):

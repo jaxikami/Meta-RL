@@ -11,6 +11,9 @@ meta-RL side reads:
     installed as the plant's nominal values before every reset, so a fault
     acts relative to them. The nominal task is the Fermentation-PPO plant
     exactly;
+  * plant-model mismatch (``task["mismatch"]``, evaluation only): rate-term
+    multipliers the training plants never had (``metarl.env.mismatch``),
+    constant over the episode and absent from the task descriptor;
   * privileged views for training (``get_effective_context``,
     ``fault_kind``, ``privileged_state``) and the probes and per-reactor
     ledger the evaluation reports.
@@ -34,7 +37,9 @@ from metarl.env.layout import STATE_DIM, ACTION_DIM
 from metarl.env.faults import (ADDITIVE_DISTURBANCES, DISTURBANCE_ALIASES,
                                DISTURBANCE_KIND_INDEX,
                                parse_active_disturbances)
-from metarl.env.plant import FermentationPlant
+from metarl.env.mismatch import (calculate_rates_mismatch,
+                                 integrate_rk4_mismatch, mismatch_matrix)
+from metarl.env.plant import HEAT_LOAD_SCALE, FermentationPlant
 from metarl.env.safe import FermentationEnv
 
 # Constraint ids attributed to a reactor in ``reactor_violation_events``.
@@ -63,6 +68,8 @@ class MetaPlantMixin:
         self._task_leak = np.zeros(n)
         self._feed_conc_mag = 1.0
         self._kinetic_activity = np.ones(n)
+        # Rate-term multipliers of a mismatched plant; None runs kinetics.py.
+        self._mismatch = None
         self._fault_seen = False
         self._fault_kind = 0
         self._step_events = np.zeros(n, dtype=np.int64)
@@ -96,6 +103,7 @@ class MetaPlantMixin:
             flow.get("feed_gain", 1.0), dtype=np.float64), (n,)).copy()
         self._task_leak = np.broadcast_to(np.asarray(
             flow.get("leak_frac", 0.0), dtype=np.float64), (n,)).copy()
+        self._mismatch = mismatch_matrix(task.get("mismatch"), n)
 
     def _restore_nominal(self):
         """The environment's nominal values, then the task's pump gains."""
@@ -174,6 +182,25 @@ class MetaPlantMixin:
     def _apply_leak(self, leak_frac_per_hour):
         """The faults' leak plus the task's own."""
         return super()._apply_leak(leak_frac_per_hour + self._task_leak)
+
+    # ------------------------------------------------- plant-model mismatch
+
+    def _integrate(self, fl):
+        """The plant's RK4 step, over the mismatched rates when a task sets them."""
+        if self._mismatch is None:
+            return super()._integrate(fl)
+        self.C, self.M, instability = integrate_rk4_mismatch(
+            self.C.astype(np.float64), self.M.astype(np.float64), fl.F_in,
+            fl.F_out, fl.C_in, self.params, self._mismatch,
+            self.time_step_duration / self.n_inner_steps, self.n_inner_steps)
+        return instability
+
+    def heat_load(self):
+        """The plant's CO2 evolution (id 9's load), from the mismatched rates if set."""
+        if self._mismatch is None:
+            return super().heat_load()
+        rates = calculate_rates_mismatch(self.C, self.params, self._mismatch)
+        return rates[:, self.idx['CO2']] * self.M * HEAT_LOAD_SCALE
 
     def _mark_fault(self, kind):
         """Record that a fault of ``kind`` acted on the plant this step."""

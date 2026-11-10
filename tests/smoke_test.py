@@ -24,6 +24,10 @@ properties that must not silently regress:
     kinds refuse a reactor; the training-only fault flag latches;
   * the per-reactor violation events add up to the environment's counts;
   * every fault kind hurts a scripted policy on at least one axis;
+  * the mismatched rate law equals kinetics.py at theta = 1, a term's
+    multiplier moves only the species that term feeds, a mismatched task
+    leaves no trace on the next one, and every tier-3 case hurts a scripted
+    policy on at least one axis;
   * the longest episode fits the recurrent encoder's training window;
   * evaluation and held-out magnitudes lie strictly inside the meta-training
     ranges;
@@ -66,7 +70,7 @@ from metarl.env.config import (N_REACTORS, nominal_task, sample_task,
                                CTX_KIN, CTX_DOWNSTREAM, CTX_TURNAROUND,
                                CTX_STORAGE_CAP, CTX_COOLING_CAP,
                                REACTOR_FLOW_SCALE, REACTOR_OBS_DIM,
-                               PRODUCT_MASS_SCALE, TITER_SCALE)
+                               PRODUCT_MASS_SCALE, TITER_SCALE, SPECIES_IDX)
 from metarl.env.kinetics import integrate_rk4
 from metarl.env.layout import (STATE_DIM, ACTION_DIM,
                                STORAGE_CHANNEL, PRIVILEGED_STATE_DIM,
@@ -95,7 +99,7 @@ from metarl.training.tasks import (make_env, make_task_pool, resolve_reactor,
                                    pattern_schedule, apply_fault_schedule)
 from metarl.training.evaluate import (eval_fault_scenarios,
                                       eval_tier_scenarios, extreme_magnitude,
-                                      scenario_tier, _eval_summary,
+                                      _eval_summary,
                                       _tier_summary)
 from metarl.training.rollouts import (collect_rollout, rollout_deterministic,
                                       _start_episode, _advance,
@@ -674,6 +678,76 @@ def check_fault_coverage(ref_info):
     print("  fault coverage OK (every kind hurts on at least one axis)")
 
 
+def check_plant_model_mismatch(ref_info):
+    """Tier 3's mismatched plant: kinetics.py at theta = 1, one term otherwise."""
+    from metarl.env.kinetics import calculate_rates_numba
+    from metarl.env.mismatch import (MISMATCH_INDEX, N_MISMATCH_TERMS,
+                                     calculate_rates_mismatch,
+                                     integrate_rk4_mismatch, mismatch_matrix)
+    from metarl.training.config import EVAL_MISMATCH
+    from metarl.training.evaluate import (eval_mismatch_scenarios,
+                                          scenario_groups)
+    env = PlantFermentationEnv()
+    prm = np.ascontiguousarray(env.params)
+    c = np.random.default_rng(0).uniform(0.01, 60.0, (N_REACTORS, 15))
+    m = np.full(N_REACTORS, 1e5)
+    z3 = np.zeros(N_REACTORS)
+    ones = np.ones((N_REACTORS, N_MISMATCH_TERMS))
+    nominal = calculate_rates_numba(c, prm)
+    assert np.allclose(calculate_rates_mismatch(c, prm, ones), nominal,
+                       rtol=1e-12, atol=0.0)
+    rk_args = (z3, z3, np.zeros((N_REACTORS, 15)), prm)
+    assert np.allclose(integrate_rk4_mismatch(c, m, *rk_args, ones, 120.0, 30)[0],
+                       integrate_rk4(c, m, *rk_args, 120.0, 30)[0],
+                       rtol=1e-12, atol=0.0)
+    # r2 (cellulose -> glucose) feeds only cellulose and glucose.
+    th = mismatch_matrix({"r2": 0.6}, N_REACTORS)
+    moved = np.flatnonzero(np.any(
+        calculate_rates_mismatch(c, prm, th) != nominal, axis=0))
+    assert set(moved) == {SPECIES_IDX["CS"], SPECIES_IDX["G"]}, moved
+    assert mismatch_matrix(None, N_REACTORS) is None
+    assert mismatch_matrix({"qG": 1.0}, N_REACTORS) is None
+    per = mismatch_matrix({"qX": [1.0, 1.5, 1.0]}, N_REACTORS)
+    assert per[1, MISMATCH_INDEX["qX"]] == 1.5 and per[0].tolist() == [1.0] * N_MISMATCH_TERMS
+    with _raises(ValueError, "an unknown mismatch term was accepted"):
+        mismatch_matrix({"r9": 0.5}, N_REACTORS)
+    with _raises(ValueError, "a non-positive multiplier was accepted"):
+        mismatch_matrix({"r2": 0.0}, N_REACTORS)
+
+    # The mismatch reaches the plant's heat load, stays out of the task
+    # descriptor, and the next nominal task runs kinetics.py again.
+    env.set_task({**nominal_task(), "mismatch": {"qX": 1.5}})
+    env.reset()
+    assert env._mismatch is not None and not env._off_task()
+    env.set_task(nominal_task())
+    env.reset()
+    assert env._mismatch is None
+
+    pools = eval_mismatch_scenarios(make_task_pool(2, seed=0))
+    assert set(pools) == {f"mismatch_{k}" for k in EVAL_MISMATCH}
+    assert all(sc["tier"] == "T3" and sc["dist"] is None for sc in pools.values())
+    assert len(scenario_groups(pools)) == len(EVAL_MISMATCH)
+
+    base_eth = float(ref_info["on_spec_ethanol"])
+    _, base_c, info_c, _ = _run(PlantFermentationEnv(), _pol_deliberate)
+    base_eth_c = float(info_c["on_spec_ethanol"])
+    print("    mismatch                 open-loop viol    closed-loop viol  "
+          "on-spec (open / closed)")
+    for name, spec in EVAL_MISMATCH.items():
+        task = {**nominal_task(), "mismatch": spec}
+        _, c_o, info_o, _ = _run(PlantFermentationEnv(), _pol_open_loop, task=task)
+        _, c_c, info, _ = _run(PlantFermentationEnv(), _pol_deliberate, task=task)
+        loss_o = 1.0 - float(info_o["on_spec_ethanol"]) / base_eth
+        loss_c = 1.0 - float(info["on_spec_ethanol"]) / base_eth_c
+        print(f"    {name:<24} {str(c_o):<17} {str(c_c):<17} "
+              f"{-loss_o:+.0%} / {-loss_c:+.0%}")
+        worse_c = any(v > base_c.get(k, 0) for k, v in c_c.items())
+        assert c_o or worse_c or max(loss_o, loss_c) > 0.10, (
+            f"mismatch {name} neither violated anything nor cost >10%")
+    print("  plant-model mismatch OK (theta = 1 is kinetics.py; every tier-3 "
+          "case hurts on at least one axis)")
+
+
 def check_magnitudes_in_support():
     """Evaluation, held-out and latent-gate magnitudes lie inside training ranges."""
     for d in EVAL_DISTURBANCES.values():
@@ -686,11 +760,12 @@ def check_magnitudes_in_support():
 
 
 def check_eval_tiers():
-    """Tier 2 magnitudes lie past training; tier 4 is outside it; tier 3
-    filters training, the panel and the gate; the tier summary counts."""
-    import subprocess
+    """``evaluate`` runs the three tiers only (no training-grid scenario);
+    tier 1 magnitudes lie past training, tier 2 is outside it; the tier
+    summary counts."""
     from metarl.env.faults import ADDITIVE_DISTURBANCES
-    from metarl.training.config import EVAL_COMBINATIONS, _holdout_kinds
+    from metarl.training.config import EVAL_COMBINATIONS, EVAL_MISMATCH, EVAL_TIERS
+    from metarl.training.evaluate import ablation_scenarios, eval_scenarios
     env = PlantFermentationEnv()
     env.set_task(nominal_task())
     tiers = eval_tier_scenarios(env.max_steps // 2, env.max_steps)
@@ -703,11 +778,11 @@ def check_eval_tiers():
             assert m > hi, (label, m)
         else:   # past the edge, on the evaluation magnitude's side of 1.0
             assert (m < lo) if d["magnitude"] < 1.0 else (m > hi), (label, m)
-        assert tiers[f"{label}_extreme"][0] == "T2"
+        assert tiers[f"{label}_extreme"][0] == "T1"
     for name, (tier, sched) in tiers.items():
         for index in range(N_REACTORS):
             apply_fault_schedule(env, sched, index=index)
-        if tier != "T4":
+        if tier != "T2":
             continue
         # Training compounds two kinds stepping at one onset: every
         # combination has three kinds, two onsets, or a non-step pattern.
@@ -721,22 +796,17 @@ def check_eval_tiers():
     for index in range(N_REACTORS):
         assert (resolve_reactor("leak", leak["reactor"], index)
                 != resolve_reactor("feed_gain", gain["reactor"], index))
-    # Tier 3: any scenario containing a held-out kind.
-    bio = tiers["combo_staggered_bio"][1]
-    assert scenario_tier("T4", bio, ("contamination",)) == "T3"
-    assert scenario_tier("T4", bio, ("leak",)) == "T4"
-    assert scenario_tier("T1", None, ("leak",)) == "T1"
-    assert _holdout_kinds(" kinetics_decay, leak,leak") == (
-        "disturb_kinetics_decay", "leak")
-    with _raises(ValueError, "an unknown held-out kind was accepted"):
-        _holdout_kinds("leek")
-    code = ("from metarl.training import config as c; "
-            "assert 'leak' not in c.META_DISTURB_KINDS; "
-            "assert all(d[0] != 'leak' for d in c.HELDOUT_DISTURBANCES); "
-            "assert 'leak' not in c.GATE_FAULT_KINDS; "
-            "assert c.META_HOLDOUT_KINDS == ('leak',)")
-    subprocess.run([sys.executable, "-c", code], check=True, cwd=_ROOT,
-                   env={**os.environ, "PLANT_HOLDOUT_KINDS": "leak"})
+    # evaluate: every scenario in a tier, none from meta's training grid;
+    # the ablation keeps the grid.
+    pool = make_task_pool(2, seed=0)
+    full = eval_scenarios(pool, pool, env.max_steps // 2, env.max_steps)
+    assert set(EVAL_TIERS) == {"T1", "T2", "T3"}
+    assert {sc["tier"] for sc in full.values()} == set(EVAL_TIERS)
+    assert len(full) == 1 + len(tiers) + len(EVAL_MISMATCH), sorted(full)
+    grid = set(eval_fault_scenarios(env.max_steps // 2, env.max_steps))
+    assert not grid & set(full) and "in_distribution" not in full
+    assert grid <= set(ablation_scenarios(pool, pool, env.max_steps // 2,
+                                          env.max_steps))
     # The tier summary: meta cuts burden significantly on "a", ties on "b".
     rng = np.random.default_rng(0)
 
@@ -751,13 +821,13 @@ def check_eval_tiers():
     res = {"a": {"meta": arm(1.0, 1e7), "saferl": arm(4.0, 1e7)},
            "b": {"meta": arm(2.0, 1e7), "saferl": arm(2.0, 1e7)}}
     summ = _eval_summary(res, ("saferl", "meta"))
-    t = _tier_summary(res, summ, {"a": "T2", "b": "T2"})["T2"]
+    t = _tier_summary(res, summ, {"a": "T1", "b": "T1"})["T1"]
     assert t["n"] == 2 and t["burden_wins"] == {"meta": 1, "saferl": 0,
                                                 "tied": 1}, t
     assert np.isclose(t["burden_reduction"], 1 - 3.0 / 6.0, atol=0.05), t
-    print(f"  evaluation tiers OK ({len(tiers)} tier-2/4 scenarios; "
-          f"magnitudes past training, combinations outside it, tier-3 "
-          f"filtering)")
+    print(f"  evaluation tiers OK ({len(full)} scenarios in 3 tiers, none from "
+          f"the training grid; magnitudes past training, combinations "
+          f"outside it)")
 
 
 def _apply_until(env, t_end):
@@ -1475,6 +1545,7 @@ def main():
     check_episode_length_bound()
     check_privileged_state_and_heat_load()
     check_fault_coverage(ref_info)
+    check_plant_model_mismatch(ref_info)
     check_magnitudes_in_support()
     check_fault_patterns()
     check_eval_tiers()

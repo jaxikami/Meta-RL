@@ -22,3 +22,6 @@ extend-exclude = [
 [lint.per-file-ignores]
 # The smoke test puts the repo root on sys.path before importing metarl.
 "tests/smoke_test.py" = ["E402"]
+# Its rate law is kinetics.py's lines with the mismatch multipliers inserted,
+# kept line for line so a diff against kinetics.py shows only theta.
+"metarl/env/mismatch.py" = ["E501", "E741"]

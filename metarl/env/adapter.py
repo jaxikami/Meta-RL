@@ -33,7 +33,7 @@ import numpy as np
 from metarl.env.config import (N_REACTORS, I_ETH, SPECIES_IDX,
                                REACTOR_OBS_DIM, PRODUCT_MASS_SCALE,
                                TITER_SCALE, TASK_CONTEXT_DIM,
-                               get_main_reactor_config, nominal_task)
+                               get_reactor_config, nominal_task)
 from metarl.env.layout import STATE_DIM, ACTION_DIM
 from metarl.env.faults import (ADDITIVE_DISTURBANCES, DISTURBANCE_ALIASES,
                                DISTURBANCE_KIND_INDEX,
@@ -407,7 +407,7 @@ class PlantFermentationEnv(MetaPlantMixin, FermentationEnv):
     def __init__(self, control_action_interval=5, active_disturbances=None,
                  max_steps=None):
         self._init_meta(active_disturbances)
-        hw = get_main_reactor_config()
+        hw = get_reactor_config()
         super().__init__(n_reactors=N_REACTORS, Mmax=hw['Mmax'],
                          max_flow_LF=hw['max_flow_LF'],
                          max_flow_C5=hw['max_flow_C5'],

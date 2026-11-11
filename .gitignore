@@ -17,3 +17,7 @@ manuscript/
 
 # metarl.apn.validate's figure (Fermentation-PPO's output folder).
 am_plot/
+
+# The five-reactor sub-study's outputs.
+five_reactor/policy/
+five_reactor/results/

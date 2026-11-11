@@ -2,6 +2,7 @@
 
 - Python: `C:/Users/jaxi0/miniconda3/envs/work/python.exe` (the base env's torch is broken). Ruff: `<that python> -m ruff`.
 - Check every change with `python tests/smoke_test.py` (~1 min, prints `ALL SMOKE CHECKS PASSED`).
+- `five_reactor/` is a sub-study on `metarl` (five vessels, `PLANT_LAYOUT=five`, one from-scratch meta arm, a known mid-episode change; see its README). After changing `metarl`, also run `python five_reactor/smoke_test.py` (~40 s, prints `FIVE-REACTOR SMOKE PASSED`).
 
 ## Do not refactor
 

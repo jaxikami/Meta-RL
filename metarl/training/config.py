@@ -343,11 +343,11 @@ Z_INFORM_DISTURBANCES = (
 
 # ─── Output paths ─────────────────────────────────────────────────────────────
 RUN_TAG = os.environ.get("PLANT_RUN_TAG", "")
-POLICY_DIR = os.path.join("policy", RUN_TAG) if RUN_TAG else "policy"
-LOG_DIR = (os.path.join("results", "log", RUN_TAG) if RUN_TAG
-           else os.path.join("results", "log"))
-PLOT_DIR = (os.path.join("results", "plot", RUN_TAG) if RUN_TAG
-            else os.path.join("results", "plot"))
+# A sub-study (five_reactor/) keeps its outputs under its own folder.
+OUTPUT_ROOT = os.environ.get("PLANT_OUTPUT_ROOT", "")
+POLICY_DIR = os.path.normpath(os.path.join(OUTPUT_ROOT, "policy", RUN_TAG))
+LOG_DIR = os.path.normpath(os.path.join(OUTPUT_ROOT, "results", "log", RUN_TAG))
+PLOT_DIR = os.path.normpath(os.path.join(OUTPUT_ROOT, "results", "plot", RUN_TAG))
 
 
 # ─── Early stopping (units are HELD-OUT CHECKS) ──────────────────────────────

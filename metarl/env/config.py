@@ -15,6 +15,9 @@ vessel leak); the chemistry is pinned at the nominal values on every task and
 in every reactor. The nominal task is the Fermentation-PPO plant exactly.
 """
 
+# ─── Standard Library ─────────────────────────────────────────────────────────
+import os
+
 # ─── Third-Party ──────────────────────────────────────────────────────────────
 import numpy as np
 
@@ -150,19 +153,46 @@ MAX_HEAT_LOAD = 540.0       # kg CO2/h, plant-wide
 # =============================================================================
 # META-RL: OBSERVATION LAYOUT AND TASK DISTRIBUTION (not in Fermentation-PPO)
 # =============================================================================
-N_REACTORS = 3
+# The plant layout, read at import because every module sizes itself from
+# N_REACTORS. "three" is Fermentation-PPO's plant; "five" is the
+# five_reactor sub-study's (five_reactor/ sets it before importing metarl,
+# and worker processes inherit it).
+PLANT_LAYOUT = os.environ.get("PLANT_LAYOUT", "three")
 N_SPECIES = len(SPECIES_NAMES)
 I_ETH = SPECIES_IDX['Eth']
 
+# Five of the three-reactor plant's vessels (220 t; pumps of its 1x, 4x and
+# 0.5x types) on its one tank, downstream draw, cooling loop and feedstock
+# pools, so the APN's plant-wide constants (S_MAX, MAX_HEAT_LOAD, S_OUT_RATE)
+# stay true and every vessel is hardware KineticNet trained on. The shared
+# utilities, not the vessels, then bound production. Five 132 t vessels with
+# the same total volume were tried first: the fixed 10 t charge diluted their
+# lots to ~74 g/L, under the 75 g/L purity spec, for every scripted recipe.
+FIVE_REACTOR_MMAX = 220000.0
+FIVE_REACTOR_FLOW_SCALE = (1.0, 4.0, 0.5, 1.0, 0.5)
+
+if PLANT_LAYOUT == "three":
+    N_REACTORS = 3
+    # Each reactor's feed pumps as a multiple of the 1x reactor's (2487 kg/h
+    # LF, 628 kg/h C5), as in get_main_reactor_config.
+    REACTOR_FLOW_SCALE = (1.0, 4.0, 0.5)
+elif PLANT_LAYOUT == "five":
+    N_REACTORS = 5
+    REACTOR_FLOW_SCALE = FIVE_REACTOR_FLOW_SCALE
+else:
+    raise ValueError(f"PLANT_LAYOUT={PLANT_LAYOUT!r}: expected 'three' or 'five'")
+
 
 def get_reactor_config():
-    """The plant's reactor capacities (``get_main_reactor_config``)."""
-    return get_main_reactor_config()
-
-
-# Each reactor's feed pumps as a multiple of the 1x reactor's (2487 kg/h LF,
-# 628 kg/h C5), as in get_main_reactor_config.
-REACTOR_FLOW_SCALE = (1.0, 4.0, 0.5)
+    """The plant's reactor capacities (``get_main_reactor_config`` for "three")."""
+    if PLANT_LAYOUT == "three":
+        return get_main_reactor_config()
+    scale = np.asarray(REACTOR_FLOW_SCALE, dtype=np.float64)
+    return {
+        'Mmax': np.full(N_REACTORS, FIVE_REACTOR_MMAX, dtype=np.float64),
+        'max_flow_LF': (2487 / 3600) * scale,
+        'max_flow_C5': (628 / 3600) * scale,
+    }
 
 
 # One observation row per reactor, the environment's get_state_norm() row

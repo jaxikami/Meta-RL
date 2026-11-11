@@ -25,7 +25,9 @@ properties that must not silently regress:
   * the per-reactor violation events add up to the environment's counts;
   * every fault kind hurts a scripted policy on at least one axis;
   * the mismatched rate law equals kinetics.py at theta = 1, a term's
-    multiplier moves only the species that term feeds, a mismatched task
+    multiplier moves only the species that term feeds, nominal flow terms
+    leave the plant's flows alone and a mismatched actuator delivers its
+    characteristic, a mismatched task
     leaves no trace on the next one, and every tier-3 case hurts a scripted
     policy on at least one axis;
   * the longest episode fits the recurrent encoder's training window;
@@ -681,11 +683,13 @@ def check_fault_coverage(ref_info):
 
 
 def check_plant_model_mismatch(ref_info):
-    """Tier 3's mismatched plant: kinetics.py at theta = 1, one term otherwise."""
+    """Tier 3's mismatched plant: kinetics.py at theta = 1, one term otherwise;
+    the plant's own flows at nominal flow terms, the characteristic otherwise."""
     from metarl.env.kinetics import calculate_rates_numba
-    from metarl.env.mismatch import (MISMATCH_INDEX, N_MISMATCH_TERMS,
-                                     calculate_rates_mismatch,
-                                     integrate_rk4_mismatch, mismatch_matrix)
+    from metarl.env.mismatch import (FLOW_TERMS, MISMATCH_INDEX,
+                                     N_MISMATCH_TERMS, calculate_rates_mismatch,
+                                     flow_mismatch, integrate_rk4_mismatch,
+                                     mismatch_matrix)
     from metarl.training.config import EVAL_MISMATCH
     from metarl.training.evaluate import (eval_mismatch_scenarios,
                                           scenario_groups)
@@ -715,6 +719,33 @@ def check_plant_model_mismatch(ref_info):
         mismatch_matrix({"r9": 0.5}, N_REACTORS)
     with _raises(ValueError, "a non-positive multiplier was accepted"):
         mismatch_matrix({"r2": 0.0}, N_REACTORS)
+
+    # Flow terms: out of the rate matrix, None at their nominal values.
+    assert mismatch_matrix({"feed_curve": 0.6}, N_REACTORS) is None
+    assert flow_mismatch({"r2": 0.6}) is None and flow_mismatch(FLOW_TERMS) is None
+    assert flow_mismatch({"drain_head": 1.0}) == {"feed_curve": 1.0, "drain_head": 1.0}
+    with _raises(ValueError, "a non-positive feed_curve was accepted"):
+        flow_mismatch({"feed_curve": 0.0})
+    with _raises(ValueError, "a negative drain_head was accepted"):
+        flow_mismatch({"drain_head": -0.5})
+    # Reactors half full (the second full), a quarter-open feed and drain:
+    # nominal terms give the plant's flows, the characteristics their own.
+    def flows(spec):
+        e = PlantFermentationEnv()
+        e.set_task({**nominal_task(), "mismatch": spec})
+        e.reset()
+        e.M = 0.5 * e.Mmax * np.array([1.0, 2.0, 1.0])[:N_REACTORS]
+        cmd = np.tile([0.5, 0.25, 0.25, 0.25], (N_REACTORS, 1))
+        fl = e._execute_flows(cmd)
+        assert np.all(cmd == np.tile([0.5, 0.25, 0.25, 0.25], (N_REACTORS, 1)))
+        return fl
+    f0, f1 = flows(None), flows(dict(FLOW_TERMS))
+    assert np.array_equal(f0.F_in, f1.F_in) and np.array_equal(f0.F_out, f1.F_out)
+    fc = flows({"feed_curve": 0.6})
+    assert np.allclose(fc.F_in, f0.F_in * 0.25 ** -0.4) and np.array_equal(fc.F_out, f0.F_out)
+    dh = flows({"drain_head": 1.0})
+    assert np.allclose(dh.F_out, f0.F_out * np.array([1.0, 2.0, 1.0])[:N_REACTORS])
+    assert np.array_equal(dh.F_in, f0.F_in)
 
     # The mismatch reaches the plant's heat load, stays out of the task
     # descriptor, and the next nominal task runs kinetics.py again.
@@ -1339,6 +1370,7 @@ def check_warm_start_and_gate():
 def check_shield():
     """Safe PPO's APN: exact heads, projection, L3 and the actor's terms."""
     from metarl.apn.apn import HEADS, MultiHeadAPN, stage_mask
+    from metarl.env.config import MAX_HEAT_LOAD
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
     # Plant states from a random-action episode, with random actions.
@@ -1405,6 +1437,22 @@ def check_shield():
                            "storage_overflow_violation": 0.1})
     assert agent._shield_backoff.offsets()[3] > 0.0
     assert agent._shield_backoff.floor[3] > 0.0
+    # A tank cut to 65% (T1's storage_capacity_extreme), alarming at 80%: L3
+    # locates the cap past AdaptiveBackoff's own 0.15 ceiling (0.80 S_MAX).
+    agent._shield_backoff.calibrate({"violation_counts": {3: 1},
+                                     "storage_overflow_violation": 0.80 / 0.65 - 1.0},
+                                    0.80, 0.79)
+    assert np.isclose(agent._shield_backoff.offsets()[3], 0.95 * 0.35)
+    # Likewise a cooling loop cut to 52% (T1's cooling_capacity_extreme), past
+    # the 0.25 ceiling (0.70 MAX_HEAT_LOAD); a storage alarm at the located
+    # cap keeps the buffer at the floor.
+    agent._shield_backoff.calibrate({"violation_counts": {9: 1},
+                                     "heat_load_violation": 0.70 / 0.52 - 1.0,
+                                     "heat_load_peak": 0.70 * MAX_HEAT_LOAD},
+                                    0.5, 0.5)
+    assert np.isclose(agent._shield_backoff.offsets()[9], 0.95 * 0.48)
+    agent._shield_backoff.update({3: 1})
+    assert np.isclose(agent._shield_backoff.offsets()[3], 0.95 * 0.35)
     agent.clear_z()
     assert agent._shield_backoff.offsets()[3] == 0.0 and agent._shield_last is None
     stats = agent.update(rep, batch_size=8, context_size=CTX, min_buffer=1)

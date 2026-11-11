@@ -253,27 +253,40 @@ EVAL_COMBINATIONS = {
     "ramp_and_recurrent": (("feed_gain", "gradual", EVAL_ONSET, 0),
                            ("cooling_capacity", "recurrent", None, 0)),
 }
-# T3  plant-model mismatch: the plant's rate law gains a constant multiplier
-#     on one rate term (metarl.env.mismatch), on every reactor from t = 0,
-#     with no fault. Training only ever moves the lumped modifiers (all
-#     hydrolysis together, each uptake), the APN's KineticNet learned the
-#     unmodified law, and the term is not in the task descriptor. Scenario
-#     "mismatch_<name>", on copies of the in-distribution tasks. Magnitudes
-#     from the scripted policies (tests/smoke_test.py recipes, nominal task):
-#       r2 x0.6     fixed-rate recipe: 2 of 5 lots rejected, on-spec -40%;
-#                   the closed-loop scheduler compensates
-#       qX x1.5     closed-loop scheduler: 10 h over the cooling cap (id 9)
-#       death x3    fixed-rate recipe: 2 of 5 lots rejected, on-spec -40%
-#     r1, r4, qF, qHMF and qACT at x0.3-0.5 cost either recipe under 1%.
+# T3  plant-model mismatch (metarl.env.mismatch), on every reactor from
+#     t = 0, with no fault: either the rate law gains a constant multiplier
+#     on one rate term, or an actuator departs from the linear flow every
+#     training plant has. Training only ever moves the lumped modifiers (all
+#     hydrolysis together, each uptake) and linear pump gains, the APN's
+#     KineticNet learned the unmodified law, its exact heads and residual
+#     fit assume linear flows, and nothing of it is in the task descriptor.
+#     Scenario "mismatch_<name>", on copies of the in-distribution tasks.
+#     Magnitudes from the scripted policies (tests/smoke_test.py recipes,
+#     nominal task):
+#       r2 x0.6          fixed-rate recipe: 2 of 5 lots rejected, on-spec
+#                        -40%; the closed-loop scheduler compensates
+#       qX x1.5          closed-loop scheduler: 10 h over the cooling cap (id 9)
+#       death x3         fixed-rate recipe: 2 of 5 lots rejected, on-spec -40%
+#       feed_curve 0.6   fixed-rate recipe: 217 reactor-hours of overflow
+#                        (id 1, area 112); the closed-loop scheduler holds the
+#                        level but feeds faster, 39 h over the cooling cap
+#       drain_head 1.0   both recipes: unloads slow near empty, the tank runs
+#                        dry (id 4, 13-24 h), on-spec -40%
+#     r1, r4, qF, qHMF and qACT at x0.3-0.5 cost either recipe under 1%; a
+#     feed_curve of 0.7 overflows the recipe too (area 79) and a drain_head of
+#     0.5 or 0.75 only costs production. A tank drawn in 12-48 h pulses (same
+#     mean draw) violated nothing for either recipe.
 EVAL_MISMATCH = {
     "hydrolysis": {"r2": 0.6},
     "xylose_uptake": {"qX": 1.5},
     "cell_death": {"death": 3.0},
+    "feed_curve": {"feed_curve": 0.6},
+    "drain_head": {"drain_head": 1.0},
 }
 EVAL_TIERS = {
     "T1": "parameter OOD (prior 1.8x, magnitudes past training)",
     "T2": "unseen combinations (3 kinds, staggered, mixed patterns)",
-    "T3": "plant-model mismatch (a rate term off the modelled kinetics)",
+    "T3": "plant-model mismatch (a rate term or an actuator off the model)",
 }
 # Kind label -> (disturbance_probe key, label, actuator index within a
 # reactor): the quantity the fault acts on and the actuator that answers it,

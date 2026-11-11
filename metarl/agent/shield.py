@@ -28,6 +28,39 @@ SAFETY_EPS = 1e-3
 # (hipblasSgetrsBatched) fails with HIPBLAS_STATUS_ALLOC_FAILED at 2048 rows
 # (the meta arm's 4 x 512) on an RX 9070 XT with 17 GB free; 1024 runs.
 PROJECT_CHUNK = 1024
+# Ceiling of L3's located capacity limits (their floors), per constraint
+# group: storage overflow (3) and heat load (9). AdaptiveBackoff's own (0.15
+# and 0.25) put the lowest caps the shield can enforce at 0.80 S_MAX and 0.70
+# MAX_HEAT_LOAD, enough for Safe PPO's evaluation faults (0.90 tank, 0.80
+# cooling) but not for meta's training ranges (down to 0.75 and 0.65) or T1's
+# extremes (0.65 and 0.52): with a 0.65 tank the shield kept draining into a
+# 0.80 wall 23% past the real cap once calibrate() had located it.
+# 0.475 = (1 - buffer) x 0.5 follows either cap down to half its rating.
+CAP_OFFSET_MAX = {3: 0.475, 9: 0.475}
+
+
+class ShieldBackoff(AdaptiveBackoff):
+    """AdaptiveBackoff whose located capacity limits may reach CAP_OFFSET_MAX.
+
+    Only the floor goes deeper. The alarm-rate rule keeps Safe PPO's ceiling
+    (or the floor, if higher): after a cap drops below the operating point,
+    the plant alarms every step until the level or load has come down, and
+    those alarms say nothing new. Letting them raise the storage buffer to
+    0.475 overshot the 0.33 a 0.65 tank needs, and the fixed-rate recipe lost
+    10% on-spec.
+    """
+
+    def update(self, violation_counts):
+        """AdaptiveBackoff.update, each capacity ceiling at max(its own, floor)."""
+        self.DELTA_MAX = {**AdaptiveBackoff.DELTA_MAX,
+                          **{g: max(AdaptiveBackoff.DELTA_MAX[g], self.floor[g])
+                             for g in CAP_OFFSET_MAX}}
+        super().update(violation_counts)
+
+    def _raise_floor(self, g, value):
+        """AdaptiveBackoff._raise_floor, a capacity floor up to CAP_OFFSET_MAX."""
+        self.DELTA_MAX = {**AdaptiveBackoff.DELTA_MAX, **CAP_OFFSET_MAX}
+        super()._raise_floor(g, value)
 
 
 class ShieldMixin:
@@ -48,7 +81,7 @@ class ShieldMixin:
         self.apn_adaptation = bool(adaptation)
         self.refiner = None
         self._refine_episodes = 0
-        self._shield_backoff = AdaptiveBackoff()
+        self._shield_backoff = ShieldBackoff()
         self._shield_residual = AdaptiveResidual(N_REACTORS)
         self._shield_last = None
         self._proj_calls = self._proj_noop = self._proj_steps = 0

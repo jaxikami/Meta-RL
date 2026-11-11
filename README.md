@@ -459,7 +459,7 @@ with these plant-specific settings:
   `compare_tiers.png` report ADAPT per tier: the pooled burden cut and
   net-production gain, and the significant paired wins per side. Every tier
   runs on the same paired in-distribution tasks (T1's widened prior and T3's
-  mismatch copies aside). 19 scenarios in all: 12, 4 and 3.
+  mismatch copies aside). 21 scenarios in all: 12, 4 and 5.
   `compare_tier_burden_pie.png` shows which constraints make up the burden
   in each tier: a pie per arm and tier, each slice a constraint's share of
   the burden summed over the tier's scenarios, titled with the tier's mean
@@ -469,7 +469,7 @@ with these plant-specific settings:
   |---|---|---|
   | T1 | parameters past training | `out_of_distribution` (prior 1.8× wider); `<kind>_extreme`: a step at a magnitude past the training range, by one rule for every kind (`EVAL_EXTRAPOLATION`: the training edge pushed 1.5× as far from nominal in log space; additive kinds 1.5× the upper edge) |
   | T2 | the combination | `combo_*` (`EVAL_COMBINATIONS`): three kinds at once, staggered onsets, a ramp with a recurrent fault. Training compounds only two kinds stepping at one onset |
-  | T3 | the plant model itself | `mismatch_*` (`EVAL_MISMATCH`): from t = 0, no fault, every reactor's rate law has a constant multiplier on one term (`metarl/env/mismatch.py`): cellulose→glucose hydrolysis r2 × 0.6, xylose uptake qX × 1.5, the yeast's death constants × 3. Training only moves the lumped modifiers (all hydrolysis together, each uptake), KineticNet learned the unmodified law, and the term is not in the task descriptor |
+  | T3 | the plant model itself | `mismatch_*` (`EVAL_MISMATCH`): from t = 0, no fault, every reactor has one structural error (`metarl/env/mismatch.py`). Kinetic: a constant multiplier on one rate term, cellulose→glucose hydrolysis r2 × 0.6, xylose uptake qX × 1.5, the yeast's death constants × 3. Flow: the feed valves deliver rated × u^0.6 (over-delivering at part throttle), or the discharge is proportional to the reactor's level (rated at half full). Training only moves the lumped modifiers (all hydrolysis together, each uptake) and linear pump gains, KineticNet learned the unmodified law, the exact heads assume linear flows, and none of it is in the task descriptor |
 
   No tier holds a fault kind out of `meta`'s training: T1's extrapolated
   magnitudes and T2's combinations already put it outside what it trained

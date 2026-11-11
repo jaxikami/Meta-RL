@@ -50,6 +50,7 @@ import os
 import sys
 import tempfile
 import time
+from unittest import mock
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -110,6 +111,7 @@ from metarl.training.rollouts import (collect_rollout, rollout_deterministic,
 from metarl.training.heldout import (_regressions,
                                      blended_heldout_score, violation_price)
 from metarl.training.workers import RolloutPool
+from metarl.training import plots
 from metarl.env.config import PROD_REWARD_PER_ETH, VIOLATION_SPIKE
 
 CTX = CONTEXT_SIZE
@@ -810,21 +812,33 @@ def check_eval_tiers():
     # The tier summary: meta cuts burden significantly on "a", ties on "b".
     rng = np.random.default_rng(0)
 
-    def arm(burden, eth):
+    def arm(burden, eth, wear):
         n = 20
         b = burden + rng.normal(0, 0.1, n)
         e = eth + rng.normal(0, 1e4, n)
         return {"burden_per_ep": b.tolist(), "viol_per_ep": b.tolist(),
                 "on_spec_ethanol_per_ep": e.tolist(), "score_per_ep": e.tolist(),
                 "burden": float(b.mean()), "on_spec_ethanol": float(e.mean()),
-                "score": float(e.mean()), "mean_titer": 80.0, "z_snr": 2.0}
-    res = {"a": {"meta": arm(1.0, 1e7), "saferl": arm(4.0, 1e7)},
-           "b": {"meta": arm(2.0, 1e7), "saferl": arm(2.0, 1e7)}}
+                "burden_by_constraint": {"overflow": 0.25 * float(b.mean()),
+                                         "heat_load": 0.75 * float(b.mean())},
+                "score": float(e.mean()), "smoothing": wear,
+                "mean_titer": 80.0, "z_snr": 2.0}
+    res = {"a": {"meta": arm(1.0, 1e7, 1.0), "saferl": arm(4.0, 1e7, 2.0)},
+           "b": {"meta": arm(2.0, 1e7, 1.0), "saferl": arm(2.0, 1e7, 2.0)}}
     summ = _eval_summary(res, ("saferl", "meta"))
-    t = _tier_summary(res, summ, {"a": "T1", "b": "T1"})["T1"]
+    tiers_out = _tier_summary(res, summ, {"a": "T1", "b": "T1"})
+    t = tiers_out["T1"]
     assert t["n"] == 2 and t["burden_wins"] == {"meta": 1, "saferl": 0,
                                                 "tied": 1}, t
     assert np.isclose(t["burden_reduction"], 1 - 3.0 / 6.0, atol=0.05), t
+    assert np.isclose(t["wear_reduction"], 0.5), t
+    # The evaluation figures render from these numbers.
+    with tempfile.TemporaryDirectory() as d:
+        with mock.patch.object(plots, "PLOT_DIR", d):
+            plots.plot_eval(res, tiers_out)
+        drawn = sorted(os.listdir(d))
+    assert drawn == ["compare_adapt.png", "compare_tier_burden_pie.png",
+                     "compare_tiers.png"], drawn
     print(f"  evaluation tiers OK ({len(full)} scenarios in 3 tiers, none from "
           f"the training grid; magnitudes past training, combinations "
           f"outside it)")

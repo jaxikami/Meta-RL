@@ -336,7 +336,6 @@ LOG_DIR = (os.path.join("results", "log", RUN_TAG) if RUN_TAG
 PLOT_DIR = (os.path.join("results", "plot", RUN_TAG) if RUN_TAG
             else os.path.join("results", "plot"))
 
-TITER_PANEL_FLOOR_PAD = 3.0
 
 # ─── Early stopping (units are HELD-OUT CHECKS) ──────────────────────────────
 EARLY_STOP_ENABLED = True

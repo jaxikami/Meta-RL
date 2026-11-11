@@ -56,9 +56,7 @@ from metarl.training.config import (MODE, SEED, USE_FILM, AUX_MODE,
 from metarl.training.arms import ARMS, ARM_ORDER
 from metarl.training.train import _train
 from metarl.training.evaluate import evaluate
-from metarl.training.plots import (_plot_comparison, _plot_tiers,
-                                   _plot_tier_burden_pie,
-                                   plot_training_curves)
+from metarl.training.plots import plot_eval, plot_training_curves
 from metarl.training.z_informativeness import z_informativeness
 
 
@@ -91,13 +89,12 @@ def main(argv):
     elif mode == "plot_eval":
         with open(os.path.join(LOG_DIR, "eval.json")) as f:
             results = json.load(f)
-        _plot_comparison(results)
+        tiers = {}
         summary_path = os.path.join(LOG_DIR, "eval_summary.json")
         if os.path.exists(summary_path):
             with open(summary_path) as f:
                 tiers = json.load(f).get("tiers", {})
-            _plot_tiers(tiers)
-            _plot_tier_burden_pie(results, tiers)
+        plot_eval(results, tiers)
     elif mode == "all":
         for a in ARM_ORDER:
             _train(a)

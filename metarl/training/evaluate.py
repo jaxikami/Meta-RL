@@ -35,9 +35,8 @@ from metarl.training.metrics import (latent_separability, gate_opening,
                                      _paired_delta, _verdict_sign, _fmt_delta,
                                      _fmt_delta_sci)
 from metarl.training.logs import _json_default
-from metarl.training.plots import (_plot_comparison, _plot_tiers,
-                                   _plot_tier_burden_pie,
-                                   plot_training_curves, scenario_probe)
+from metarl.training.plots import (plot_eval, plot_training_curves,
+                                   scenario_probe)
 
 # The evaluation's task pools (``eval_task_pools``).
 EVAL_ID_SEED = 12345
@@ -462,9 +461,7 @@ def evaluate():
     with open(os.path.join(LOG_DIR, "eval_summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=_json_default)
     print(f"\nwrote {os.path.join(LOG_DIR, 'eval.json')} and eval_summary.json")
-    _plot_comparison(results)
-    _plot_tiers(summary["tiers"])
-    _plot_tier_burden_pie(results, summary["tiers"])
+    plot_eval(results, summary["tiers"])
     plot_training_curves()
     return results
 
@@ -601,7 +598,8 @@ def _tier_summary(results, summary, tiers, arm_a="meta", arm_b="saferl"):
     """ADAPT per tier: significant wins per side, and the pooled gaps.
 
     ``burden_reduction`` is 1 - (meta's summed burden / saferl's) over the
-    tier's scenarios; ``score_gain`` the summed net-production gap over
+    tier's scenarios, ``wear_reduction`` the same for the flow-change
+    penalty; ``score_gain`` the summed net-production gap over
     saferl's summed on-spec ethanol (``_score_delta``'s scale). Wins are the
     per-scenario paired verdicts (``_verdict_sign``).
 
@@ -627,11 +625,14 @@ def _tier_summary(results, summary, tiers, arm_a="meta", arm_b="saferl"):
             return {arm_a: s.count(1), arm_b: s.count(-1), "tied": s.count(0)}
 
         b_ref, e_ref = total(arm_b, "burden"), total(arm_b, "on_spec_ethanol")
+        w_ref = total(arm_b, "smoothing")
         out[tier] = {
             "label": label, "n": len(names), "scenarios": names,
             "burden_wins": wins("d_burden"), "score_wins": wins("d_score"),
             "burden_reduction": (1.0 - total(arm_a, "burden") / b_ref
                                  if b_ref > 0 else float("nan")),
+            "wear_reduction": (1.0 - total(arm_a, "smoothing") / w_ref
+                               if w_ref > 0 else float("nan")),
             "score_gain": ((total(arm_a, "score") - total(arm_b, "score"))
                            / e_ref if e_ref > 0 else float("nan")),
         }
@@ -645,14 +646,15 @@ def _print_tiers(tiers):
     print("\nADAPT BY TIER (meta vs saferl, paired; wins = significant "
           "scenarios, meta / saferl / tied)")
     print(f"  {'tier':<5}{'':<60}{'n':>4}{'burden cut':>12}{'B wins':>12}"
-          f"{'Pi gain':>10}{'Pi wins':>12}")
+          f"{'Pi gain':>10}{'Pi wins':>12}{'wear cut':>10}")
     for tier, t in tiers.items():
         bw, sw = t["burden_wins"], t["score_wins"]
         print(f"  {tier:<5}{t['label']:<60}{t['n']:>4}"
               f"{t['burden_reduction'] * 100:>+11.1f}%"
               f"{bw['meta']:>5}/{bw['saferl']}/{bw['tied']:<4}"
               f"{t['score_gain'] * 100:>+9.1f}%"
-              f"{sw['meta']:>5}/{sw['saferl']}/{sw['tied']:<4}")
+              f"{sw['meta']:>5}/{sw['saferl']}/{sw['tied']:<4}"
+              f"{t.get('wear_reduction', float('nan')) * 100:>+9.1f}%")
 
 
 def _print_eval(results, summary):

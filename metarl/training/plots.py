@@ -1,4 +1,4 @@
-"""Figures: arm comparisons, disturbance responses and training curves."""
+"""Figures: meta vs saferl by evaluation tier, and training curves."""
 
 # ─── Standard Library ─────────────────────────────────────────────────────────
 import json
@@ -8,14 +8,10 @@ import os
 import numpy as np
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.config import (MIN_PRODUCT_TITER, N_REACTORS, S_MAX, S_MIN,
-                               REACTOR_FLOW_SCALE)
-from metarl.training.config import (CONSTRAINT_NAMES,
-                                    Z_INFORM_MIN_SNR, LOG_DIR, PLOT_DIR,
-                                    TITER_PANEL_FLOOR_PAD, DISTURB_PROBES)
+from metarl.training.config import (CONSTRAINT_NAMES, LOG_DIR, PLOT_DIR,
+                                    DISTURB_PROBES)
 from metarl.training.arms import ARMS, ARM_ORDER
-from metarl.training.metrics import (episodes_violated, _paired_delta,
-                                     _verdict_sign)
+from metarl.training.metrics import _paired_delta
 
 ARM_COLORS = {"saferl": "#1baf7a", "meta": "#2a78d6"}
 PLOT_INK, PLOT_INK2, PLOT_GRID = "#0b0b0b", "#52514e", "#d8d7d2"
@@ -33,15 +29,6 @@ CONSTRAINT_COLORS = {
     "heat_load": "#0f8b8d",
 }
 BURDEN_MIX_MIN_LABEL_PCT = 6.0
-# Burden axis turns symlog when the largest bar is this many times the
-# smallest non-zero one, so a quiet scenario stays readable next to a bad one.
-BURDEN_SYMLOG_RATIO = 30.0
-ACTUATORS = (
-    ("stage-time multiplier (x)", lambda a: a * 1.5 + 0.5),
-    ("LF feed (frac. of max)", lambda a: a),
-    ("C5 feed (frac. of max)", lambda a: a),
-    ("discharge (frac. of max)", lambda a: a),
-)
 
 
 def _pyplot(what=""):
@@ -81,289 +68,11 @@ def _style_ax(ax):
     ax.tick_params(colors=PLOT_INK2, labelsize=9)
 
 
-def _plot_distributions(results, names, labels, arms):
-    """Per-episode on-spec ethanol per arm and scenario (box plus points)."""
-    import matplotlib.pyplot as plt
-    cols = min(len(names), 6)
-    rows = -(-len(names) // cols)
-    fig, axs = plt.subplots(rows, cols, figsize=(4.1 * cols, 5.0 * rows),
-                            squeeze=False, sharey=True)
-    fig.patch.set_facecolor(PLOT_SURFACE)
-    for ax in axs.flat[len(names):]:
-        ax.set_visible(False)
-    for ax, n, lab in zip(axs.flat, names, labels):
-        _style_ax(ax)
-        data, present = [], []
-        for arm in arms:
-            v = np.asarray(results[n][arm].get("on_spec_ethanol_per_ep", []),
-                           dtype=float)
-            if v.size:
-                data.append(v / 1e7)
-                present.append(arm)
-        if not data:
-            continue
-        bp = ax.boxplot(data, patch_artist=True, widths=0.55,
-                        medianprops={"color": PLOT_INK, "lw": 1.8},
-                        whiskerprops={"color": PLOT_INK2, "lw": 1.1},
-                        capprops={"color": PLOT_INK2, "lw": 1.1},
-                        flierprops={"marker": "o", "ms": 3,
-                                    "markerfacecolor": PLOT_INK2,
-                                    "markeredgecolor": "none", "alpha": 0.5})
-        for patch, arm in zip(bp["boxes"], present):
-            patch.set_facecolor(ARM_COLORS[arm])
-            patch.set_alpha(0.35)
-            patch.set_edgecolor(ARM_COLORS[arm])
-            patch.set_linewidth(1.8)
-        for i, (v, arm) in enumerate(zip(data, present), start=1):
-            jitter = (np.arange(v.size) % 5 - 2) * 0.035
-            ax.plot(np.full(v.size, i) + jitter, v, "o", ms=3.5,
-                    color=ARM_COLORS[arm], alpha=0.75, markeredgecolor="none")
-        ax.set_xticks(range(1, len(present) + 1))
-        ax.set_xticklabels(present, rotation=20, ha="right", fontsize=9,
-                           color=PLOT_INK2)
-        ax.set_title(lab, fontsize=10.5, color=PLOT_INK, fontweight="bold")
-    for row in axs:
-        row[0].set_ylabel("On-spec ethanol per episode  (x10^7)",
-                          fontsize=9.5, color=PLOT_INK2)
-    fig.suptitle("Per-episode production distributions", fontweight="bold",
-                 fontsize=12.5, color=PLOT_INK)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
-    _savefig(fig, "distributions")
-
-
-def _plot_adapt(results, names, labels):
-    """ADAPT (meta vs saferl) as paired deltas per scenario, three panels."""
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-
-    def _per_ep(r, kind):
-        key = {"burden": "burden_per_ep", "eth": "on_spec_ethanol_per_ep",
-               "score": "score_per_ep"}[kind]
-        return np.asarray(r.get(key, []), dtype=float)
-
-    panels = (
-        ("burden", "Violation burden avoided per episode (exceedance area "
-                   "past the limits, limit-hours)", "saferl - meta  (B)",
-         lambda v: f"{v:+.1f}"),
-        ("eth", "On-spec ethanol gained", "meta - saferl  (% of saferl)",
-         lambda v: f"{v:+.1f}%"),
-        ("score", "Net production gained (on-spec ethanol less violations "
-                  "and wear)", "meta - saferl  (% of saferl on-spec)",
-         lambda v: f"{v:+.1f}%"),
-    )
-    x = np.arange(len(names))
-    fig, axs = plt.subplots(len(panels), 1, sharex=True,
-                            figsize=(max(9.0, 0.9 * len(names)),
-                                     3.5 * len(panels)))
-    fig.patch.set_facecolor(PLOT_SURFACE)
-    for ax, (kind, title, ylab, fmt) in zip(axs, panels):
-        _style_ax(ax)
-        vals, cis, cols = [], [], []
-        for n in names:
-            s = _per_ep(results[n]["saferl"], kind)
-            m = _per_ep(results[n]["meta"], kind)
-            if s.size == 0 or s.size != m.size:
-                vals.append(np.nan)
-                cis.append(0.0)
-                cols.append(PLOT_NEUTRAL)
-                continue
-            if kind in ("eth", "score"):
-                # Net production can sit near zero: both read as a share
-                # of saferl's gross on-spec output.
-                scale = abs(float(results[n]["saferl"]["on_spec_ethanol"]))
-                d = _paired_delta(m, s, ref=scale)
-                k = 100.0 / scale if scale > 0 else np.nan
-            else:
-                d = _paired_delta(s, m, ref=float(np.mean(s)))
-                k = 1.0
-            v, ci = d["mean"] * k, d["ci95"] * k
-            vals.append(v)
-            cis.append(ci if np.isfinite(ci) else 0.0)
-            if d["significant"] and not d["negligible"] and v != 0:
-                cols.append(ARM_COLORS["meta" if v > 0 else "saferl"])
-            else:
-                cols.append(PLOT_NEUTRAL)
-        vals, cis = np.asarray(vals), np.asarray(cis)
-        ax.bar(x, np.nan_to_num(vals), 0.6, color=cols, yerr=cis, capsize=3,
-               ecolor=PLOT_INK2, error_kw={"lw": 1.1})
-        ax.axhline(0.0, color=PLOT_INK2, lw=1.0, zorder=1)
-        for xi, v, ci in zip(x, vals, cis):
-            if not np.isfinite(v):
-                txt, y, dy, va = "n/a", 0.0, 3, "bottom"
-            else:
-                txt = "0" if v == 0 else fmt(v)
-                up = v >= 0
-                y = v + ci if up else v - ci
-                dy, va = (3, "bottom") if up else (-3, "top")
-            ax.annotate(txt, (xi, y), xytext=(0, dy),
-                        textcoords="offset points", ha="center", va=va,
-                        fontsize=7.2, color=PLOT_INK2)
-        ax.set_title(title, fontsize=10.5, color=PLOT_INK, fontweight="bold", pad=8)
-        ax.set_ylabel(ylab, fontsize=9.5, color=PLOT_INK2)
-        ax.margins(y=0.22)
-    axs[-1].set_xticks(x)
-    axs[-1].set_xticklabels(labels, rotation=25, ha="right", fontsize=9,
-                            color=PLOT_INK2)
-    handles = [
-        Patch(color=ARM_COLORS["meta"], label="meta better (95% CI excludes 0)"),
-        Patch(color=ARM_COLORS["saferl"], label="saferl better (95% CI excludes 0)"),
-        Patch(color=PLOT_NEUTRAL, label="no significant or practical difference"),
-    ]
-    fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False,
-               fontsize=9, labelcolor=PLOT_INK2, bbox_to_anchor=(0.5, 0.955))
-    fig.suptitle("ADAPT -- meta vs saferl, paired over the same episodes "
-                 "(up = meta better)", fontweight="bold", fontsize=12, color=PLOT_INK)
-    fig.tight_layout(rect=(0, 0, 1, 0.925))
-    _savefig(fig, "compare_adapt")
-
-
 def _ink_on(fill):
     """Ink or white, whichever reads on a bar of colour ``fill``."""
     from matplotlib.colors import to_rgb
     r, g, b = to_rgb(fill)
     return "#ffffff" if 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.45 else PLOT_INK
-
-
-def _plot_burden(results, names, labels, arms):
-    """Violation burden per arm and scenario, and what it is made of.
-
-    Left: mean burden per episode (+1 std), labelled with the episodes that
-    violated anything. Right: each arm's burden over every scenario, split
-    by constraint. Replaces the event-count, episodes-violated, mix and
-    severity figures.
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-
-    fig, (ax, ax_mix) = plt.subplots(
-        1, 2, figsize=(max(11.0, 0.9 * len(names) + 5.0), 6.6),
-        gridspec_kw={"width_ratios": [max(len(names), 4), 3.2]})
-    fig.patch.set_facecolor(PLOT_SURFACE)
-    _style_ax(ax)
-    x = np.arange(len(names))
-    w = 0.8 / max(len(arms), 1)
-    seen_vals = []
-    for i, arm in enumerate(arms):
-        vals = np.asarray([results[n][arm]["burden"] for n in names])
-        err = np.asarray([results[n][arm]["burden_std"] for n in names])
-        pos = x + (i - (len(arms) - 1) / 2) * w
-        ax.bar(pos, vals, w, color=ARM_COLORS[arm], label=arm,
-               yerr=np.vstack([np.zeros_like(err), err]), capsize=3,
-               ecolor=PLOT_INK2, error_kw={"lw": 1.1})
-        for xi, v, e, n in zip(pos, vals, err, names):
-            k, eps = episodes_violated(results[n][arm])
-            ax.annotate(f"{v:.1f}  ({k}/{eps})", (xi, v + e), xytext=(0, 3),
-                        textcoords="offset points", ha="center", va="bottom",
-                        fontsize=6.8, color=PLOT_INK2, rotation=90)
-        seen_vals.extend(vals.tolist())
-    pos_vals = [v for v in seen_vals if v > 0]
-    if pos_vals and max(pos_vals) > BURDEN_SYMLOG_RATIO * min(pos_vals):
-        ax.set_yscale("symlog", linthresh=1.0)
-        ax.set_ylabel("Violation burden B per episode  (symlog)", fontsize=9.5,
-                      color=PLOT_INK2)
-    else:
-        ax.set_ylabel("Violation burden B per episode", fontsize=9.5,
-                      color=PLOT_INK2)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9,
-                       color=PLOT_INK2)
-    ax.margins(y=0.25)
-    ax.set_title("Burden per scenario (lower is better; label: B  (episodes "
-                 "violated / episodes))", fontsize=10.5, color=PLOT_INK,
-                 fontweight="bold", pad=8)
-    ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2, loc="upper left")
-
-    # Composition over all scenarios, as a share of each arm's burden.
-    _style_ax(ax_mix)
-    ax_mix.grid(axis="y", alpha=0.0)
-    ax_mix.grid(axis="x", alpha=0.5, color=PLOT_GRID, lw=0.8)
-    order = list(CONSTRAINT_NAMES.values())
-    parts = {arm: np.asarray([sum(float(results[n][arm]["burden_by_constraint"]
-                                        .get(c, 0.0)) for n in names)
-                              for c in order]) for arm in arms}
-    seen = [c for j, c in enumerate(order)
-            if any(parts[a][j] > 0 for a in arms)]
-    for yi, arm in enumerate(arms):
-        total = parts[arm].sum()
-        if total <= 0:
-            ax_mix.annotate("no violations", (0.0, yi), xytext=(4, 0),
-                            textcoords="offset points", va="center",
-                            fontsize=8.5, color=PLOT_INK2)
-            continue
-        left = 0.0
-        for c in seen:
-            pct = 100.0 * parts[arm][order.index(c)] / total
-            if pct <= 0:
-                continue
-            ax_mix.barh(yi, pct, 0.6, left=left, color=CONSTRAINT_COLORS[c],
-                        edgecolor=PLOT_SURFACE, linewidth=1.5)
-            if pct >= BURDEN_MIX_MIN_LABEL_PCT:
-                ax_mix.text(left + pct / 2, yi, f"{pct:.0f}%", ha="center",
-                            va="center", fontsize=7.5,
-                            color=_ink_on(CONSTRAINT_COLORS[c]))
-            left += pct
-    ax_mix.set_yticks(range(len(arms)))
-    ax_mix.set_yticklabels(arms, fontsize=9.5, color=PLOT_INK2)
-    ax_mix.invert_yaxis()
-    ax_mix.set_xlim(0, 100)
-    ax_mix.set_xlabel("Share of burden over all scenarios (%)", fontsize=9.5,
-                      color=PLOT_INK2)
-    ax_mix.set_title("What the burden is", fontsize=10.5, color=PLOT_INK,
-                     fontweight="bold", pad=8)
-    if seen:
-        ax_mix.legend(handles=[Patch(color=CONSTRAINT_COLORS[c],
-                                     label=c.replace("_", " ")) for c in seen],
-                      loc="upper center", bbox_to_anchor=(0.5, -0.14),
-                      ncol=2, frameon=False, fontsize=8, labelcolor=PLOT_INK2)
-    return fig
-
-
-def _plot_score(results, names, labels, arms):
-    """Net production per arm and scenario, and averaged over scenarios.
-
-    ``*`` marks the arm whose per-episode net production is significantly
-    higher than every other arm's on that scenario (paired).
-    """
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(max(9.0, 0.9 * (len(names) + 1)), 6.4))
-    fig.patch.set_facecolor(PLOT_SURFACE)
-    _style_ax(ax)
-    x = np.append(np.arange(len(names)), len(names) + 0.6)
-    w = 0.8 / max(len(arms), 1)
-    for i, arm in enumerate(arms):
-        vals = np.asarray([results[n][arm]["score"] for n in names]) / 1e7
-        err = np.asarray([results[n][arm]["score_std"] for n in names]) / 1e7
-        vals, err = np.append(vals, vals.mean()), np.append(err, 0.0)
-        pos = x + (i - (len(arms) - 1) / 2) * w
-        ax.bar(pos, vals, w, color=ARM_COLORS[arm], label=arm, yerr=err,
-               capsize=3, ecolor=PLOT_INK2, error_kw={"lw": 1.1})
-        for j, (xi, v, e) in enumerate(zip(pos, vals, err)):
-            best = j < len(names) and all(
-                _verdict_sign(_paired_delta(
-                    results[names[j]][arm]["score_per_ep"],
-                    results[names[j]][o]["score_per_ep"],
-                    ref=results[names[j]][o]["on_spec_ethanol"])) > 0
-                for o in arms if o != arm)
-            up = v >= 0
-            ax.annotate(f"{v:.2f}" + ("*" if best else ""),
-                        (xi, v + e if up else v - e),
-                        xytext=(0, 3 if up else -3),
-                        textcoords="offset points", ha="center",
-                        va="bottom" if up else "top", fontsize=6.8,
-                        color=PLOT_INK2, rotation=90)
-    ax.axhline(0.0, color=PLOT_INK2, lw=1.0, zorder=1)
-    ax.axvline(len(names) - 0.2, color=PLOT_GRID, lw=1.0, ls="--")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels + ["mean over\nscenarios"], rotation=25,
-                       ha="right", fontsize=9, color=PLOT_INK2)
-    ax.set_ylabel("Net production Pi per episode  (x10^7 ethanol)",
-                  fontsize=9.5, color=PLOT_INK2)
-    ax.margins(y=0.2)
-    ax.set_title("NET PRODUCTION Pi (higher is better; * = significantly "
-                 "best)",
-                 fontsize=10.5, color=PLOT_INK, fontweight="bold", pad=10)
-    ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2)
-    return fig
 
 
 def scenario_probe(name):
@@ -377,304 +86,112 @@ def scenario_probe(name):
             else None)
 
 
-def _shared_episode(res, arms):
-    """The one episode on which every arm does comparatively well."""
-    ranks = []
-    for arm in arms:
-        keys = list(zip(res[arm]["viol_per_ep"],
-                        [-e for e in res[arm]["on_spec_ethanol_per_ep"]]))
-        ranks.append([sum(k2 < k for k2 in keys) for k in keys])
-    ranks = np.asarray(ranks)
-    return int(min(range(ranks.shape[1]),
-                   key=lambda i: (ranks[:, i].max(), ranks[:, i].sum())))
+def _tier_title(tiers, t):
+    """A tier's short name, e.g. "T1  parameter OOD"."""
+    return f"{t}  {tiers[t]['label'].split(' (')[0]}"
 
 
-def _plot_disturbance_response(results, names, arms):
-    """The faulted reactor's answering actuator (solid) vs the faulted quantity."""
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-
-    dist = [n for n in names if scenario_probe(n)
-            and all("traces" in results[n][a] for a in arms)]
-    if not dist:
-        print("[plot] disturbance response skipped: no per-episode traces")
-        return
-    fig, axs = plt.subplots(2, len(dist), figsize=(4.4 * len(dist), 8.6),
-                            squeeze=False, sharex="col",
-                            gridspec_kw={"height_ratios": [3, 1.3]})
-    fig.patch.set_facecolor(PLOT_SURFACE)
-    for c, n in enumerate(dist):
-        ax, ax_s = axs[0][c], axs[1][c]
-        _, qlabel, a_idx = DISTURB_PROBES[scenario_probe(n)]
-        alabel, fn = ACTUATORS[a_idx]
-        ep = _shared_episode(results[n], arms)
-        tr0 = results[n][arms[0]]["traces"]
-        reactor = tr0["reactor"][ep]
-        handles = []
-        for arm in arms:
-            tr = results[n][arm]["traces"]
-            act = np.asarray(tr["act"][ep], dtype=float)
-            v = results[n][arm]["viol_per_ep"][ep]
-            e = results[n][arm]["on_spec_ethanol_per_ep"][ep]
-            ax.plot(fn(act), color=ARM_COLORS[arm], lw=1.6, zorder=3)
-            ax_s.plot(np.asarray(tr["storage"][ep]) / S_MAX, color=ARM_COLORS[arm],
-                      lw=1.3)
-            handles.append(Line2D([0], [0], color=ARM_COLORS[arm], lw=1.6,
-                                  label=f"{arm}: {v:.0f} viol, "
-                                        f"{e / 1e6:.1f}M on-spec"))
-        traces = {arm: np.asarray(results[n][arm]["traces"]["quantity"][ep],
-                                  dtype=float) for arm in arms}
-        ref = traces[arms[0]]
-        shared = all(t.shape == ref.shape and np.allclose(t, ref, rtol=1e-4,
-                                                          equal_nan=True)
-                     for t in traces.values())
-        ax2 = ax.twinx()
-        if shared:
-            ax2.plot(ref, color=PLOT_INK, ls=":", lw=1.9)
-            handles.append(Line2D([0], [0], color=PLOT_INK, ls=":", lw=1.9,
-                                  label=f"{qlabel} (right)"))
-        else:
-            for arm, t in traces.items():
-                ax2.plot(t, color=ARM_COLORS[arm], ls=":", lw=1.5)
-                handles.append(Line2D([0], [0], color=ARM_COLORS[arm], ls=":",
-                                      lw=1.5, label=f"{arm} {qlabel} (right)"))
-        ax2.set_ylabel(qlabel, fontsize=8.5, color=PLOT_INK2)
-        ax2.tick_params(colors=PLOT_INK2, labelsize=8)
-        for side in ("top", "left", "bottom"):
-            ax2.spines[side].set_visible(False)
-        ax2.spines["right"].set_color(PLOT_GRID)
-        onset = results[n][arms[0]].get("onset_outer")
-        for a_ in (ax, ax_s):
-            if onset is not None:
-                a_.axvline(onset, color=PLOT_INK2, ls="--", lw=1.0, zorder=1)
-            _style_ax(a_)
-        if onset is not None:
-            handles.append(Line2D([0], [0], color=PLOT_INK2, ls="--", lw=1.0,
-                                  label="fault onset"))
-        for lim, lab_ in ((S_MIN / S_MAX, "S_MIN"), (1.0, "S_MAX")):
-            ax_s.axhline(lim, color=PLOT_INK2, ls=":", lw=0.9)
-        ax_s.set_ylabel("storage / S_MAX", fontsize=8.5, color=PLOT_INK2)
-        ax_s.set_xlabel("control step", fontsize=9, color=PLOT_INK2)
-        ax.set_ylabel(alabel + ("" if reactor < 0 else f", reactor {reactor}"),
-                      fontsize=9, color=PLOT_INK2)
-        title = n.replace("disturb_", "").replace("_", " ")
-        where = "plant-wide" if reactor < 0 else f"reactor {reactor}"
-        ax.set_title(f"{title} ({where})\nepisode #{ep}", fontsize=10.5,
-                     color=PLOT_INK, fontweight="bold")
-        ax.legend(handles=handles, loc="upper center",
-                  bbox_to_anchor=(0.5, -0.04), frameon=False, fontsize=7.5,
-                  labelcolor=PLOT_INK2)
-    fig.suptitle("Disturbance response -- the faulted reactor's answering "
-                 "actuator (solid), the faulted quantity (dotted) and the "
-                 "storage tank (lower), all arms on one shared episode",
-                 fontweight="bold", fontsize=12.5, color=PLOT_INK)
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
-    _savefig(fig, "disturbance_response")
+def _tier_order(results, tiers):
+    """Scenario names grouped by tier, and each group's (tier, first, last)."""
+    order, spans = [], []
+    for t, info in tiers.items():
+        names = [n for n in info["scenarios"] if n in results]
+        if names:
+            spans.append((t, len(order), len(order) + len(names) - 1))
+            order += names
+    rest = [n for n in results if n not in order]
+    if rest:
+        spans.append(("other", len(order), len(order) + len(rest) - 1))
+        order += rest
+    return order, spans
 
 
-def _plot_comparison(results):
-    """Render the evaluation figures into PLOT_DIR.
-
-    compare_score (net production), compare_burden (violation burden and
-    its make-up), compare_production / compare_quality / compare_reactors
-    (per-reactor on-spec ethanol and violation events), compare_adapt,
-    distributions, disturbance_response.
-    """
-    plt = _pyplot()
-    if plt is None:
-        return
-    names = list(results.keys())
-    labels = [scenario_label(n) for n in names]
-    arms = tuple(a for a in ARM_ORDER if a in results[names[0]])
-    x = np.arange(len(names))
-
-    def _style(ax, title, ylab):
-        ax.set_title(title, fontsize=11, color=PLOT_INK, fontweight="bold", pad=10)
-        ax.set_ylabel(ylab, fontsize=9.5, color=PLOT_INK2)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9,
-                           color=PLOT_INK2)
-        _style_ax(ax)
-        ax.margins(y=0.16)
-
-    def _fmt_short(v):
-        av = abs(v)
-        if av >= 1e6:
-            return f"{v / 1e6:.1f}M"
-        if av >= 1e3:
-            return f"{v / 1e3:.1f}k"
-        return f"{v:.1f}"
-
-    def _label_bars(ax, pos, vals, tops, fmt):
-        for xi, v, t in zip(pos, vals, tops):
-            ax.annotate(fmt(v), (xi, t), xytext=(0, 3),
-                        textcoords="offset points", ha="center", va="bottom",
-                        fontsize=6.8, color=PLOT_INK2, rotation=90)
-
-    w = 0.8 / max(len(arms), 1)
-    off = lambda i: (i - (len(arms) - 1) / 2) * w          # noqa: E731
-    arm_titles = {"saferl": "Safe RL", "meta": "Meta-RL"}
-    suptitle = " vs ".join(arm_titles.get(a, a) for a in arms)
-    if "meta" in arms:
-        snr = float(np.mean([results[n]["meta"]["z_snr"] for n in names]))
-        suptitle += (f"   |   latent separability SNR {snr:.2f} "
-                     f"({'above' if snr >= Z_INFORM_MIN_SNR else 'BELOW'} the "
-                     f"{Z_INFORM_MIN_SNR:g} gate)")
-    suptitle += f"   |   {N_REACTORS} reactors + central storage"
-
-    def _new_fig():
-        fig, ax = plt.subplots(figsize=(max(9.0, 0.9 * len(names)), 6.4))
-        fig.patch.set_facecolor(PLOT_SURFACE)
-        ax.set_facecolor(PLOT_SURFACE)
-        return fig, ax
-
-    def _save(fig, stem):
-        fig.suptitle(suptitle, fontweight="bold", fontsize=12, color=PLOT_INK)
-        fig.tight_layout(rect=(0, 0, 1, 0.93))
-        _savefig(fig, stem)
-
-    def _bar_panel(ax, key, errkey, ylab, title, fmt=None):
-        fmt = fmt or _fmt_short
-        for i, arm in enumerate(arms):
-            vals = np.asarray([results[n][arm][key] for n in names], dtype=float)
-            pos = x + off(i)
-            if errkey:
-                err = np.asarray([results[n][arm][errkey] for n in names],
-                                 dtype=float)
-                yerr = np.vstack([np.minimum(err, np.clip(vals, 0, None)), err])
-                tops = vals + err
-            else:
-                yerr, tops = None, vals
-            ax.bar(pos, vals, w, label=arm, color=ARM_COLORS[arm], yerr=yerr,
-                   capsize=3, ecolor=PLOT_INK2, error_kw={"lw": 1.2})
-            _label_bars(ax, pos, vals, tops, fmt)
-        _style(ax, title, ylab)
-        ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2)
-
-    if all("burden" in results[n][a] for n in names for a in arms):
-        _save(_plot_score(results, names, labels, arms), "compare_score")
-        _save(_plot_burden(results, names, labels, arms), "compare_burden")
-    else:
-        print("[plot] compare_score / compare_burden skipped: eval.json "
-              "predates the burden metric (re-run evaluate)")
-    if "saferl" in arms and "meta" in arms:
-        _plot_adapt(results, names, labels)
-
-    fig, ax = _new_fig()
-    _bar_panel(ax, "on_spec_ethanol", "on_spec_ethanol_std", "On-spec ethanol",
-               "PRODUCTION -- on-spec ethanol (higher is better)")
-    _save(fig, "compare_production")
-
-    fig, ax = _new_fig()
-    lo_seen, hi_seen = [], []
-    for i, arm in enumerate(arms):
-        vals = np.asarray([results[n][arm]["mean_titer"] for n in names],
-                          dtype=float)
-        err = np.asarray([results[n][arm]["mean_titer_std"] for n in names],
-                         dtype=float)
-        pos = x + off(i)
-        ax.errorbar(pos, vals, yerr=err, fmt="o", ms=8, color=ARM_COLORS[arm],
-                    label=arm, capsize=4, ecolor=PLOT_INK2, elinewidth=1.2,
-                    mec="white", mew=1.0, linestyle="none", zorder=3)
-        for xi, v in zip(pos, vals):
-            ax.annotate(f"{v:.1f}", (xi, v), xytext=(7, 0),
-                        textcoords="offset points", ha="left", va="center",
-                        fontsize=7.2, color=PLOT_INK2)
-        lo_seen.append(float(np.min(vals - err)))
-        hi_seen.append(float(np.max(vals + err)))
-    _style(ax, "QUALITY -- mean product titer (higher is better)",
-           "Mean product titer (g/L)")
-    spec = MIN_PRODUCT_TITER or 0.0
-    if spec:
-        ax.axhline(spec, color=PLOT_INK2, ls="--", lw=1.2, zorder=0,
-                   label=f"purity spec floor ({spec:.0f} g/L)")
-    lo, hi = min(lo_seen), max(hi_seen)
-    bottom = min(spec - TITER_PANEL_FLOOR_PAD, lo - 1.0) if spec else lo - 1.0
-    ax.set_ylim(bottom, max(hi, spec) + 0.10 * max(hi - bottom, 1.0))
-    ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2)
-    _save(fig, "compare_quality")
-
-    # Per reactor: on-spec ethanol and reactor-local violation events, per arm
-    # (averaged over scenarios): which vessel carries the plant's numbers.
-    fig, (ax_e, ax_v) = plt.subplots(1, 2, figsize=(12.5, 5.2))
-    fig.patch.set_facecolor(PLOT_SURFACE)
-    xr = np.arange(N_REACTORS)
-    for i, arm in enumerate(arms):
-        eth = np.mean([results[n][arm]["reactor_on_spec_ethanol"] for n in names],
-                      axis=0)
-        vio = np.mean([results[n][arm]["viol_by_reactor"] for n in names], axis=0)
-        ax_e.bar(xr + off(i), eth, w, color=ARM_COLORS[arm], label=arm)
-        ax_v.bar(xr + off(i), vio, w, color=ARM_COLORS[arm], label=arm)
-    for a_, t_ in ((ax_e, "On-spec ethanol per reactor (mean over scenarios)"),
-                   (ax_v, "Reactor-local violation events per reactor")):
-        _style_ax(a_)
-        a_.set_xticks(xr)
-        a_.set_xticklabels([f"R{i} ({s:g}x pumps)" for i, s in
-                            enumerate(REACTOR_FLOW_SCALE)], color=PLOT_INK2)
-        a_.set_title(t_, fontsize=10.5, color=PLOT_INK, fontweight="bold")
-        a_.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK2)
-    _save(fig, "compare_reactors")
-
-    _plot_distributions(results, names, labels, arms)
-    _plot_disturbance_response(results, names, arms)
-    print(f"wrote figures to {PLOT_DIR}/")
+def _pooled(results, names, key, arm):
+    """``key`` summed over scenarios ``names`` for ``arm``."""
+    return float(sum(results[n][arm][key] for n in names))
 
 
-def _plot_tiers(tiers):
+def _plot_tiers(results, tiers):
     """compare_tiers.png: meta's pooled gap on saferl in each tier.
 
-    Two panels, one quantity each: the violation-burden cut and the
-    net-production gain (``evaluate._tier_summary``). A bar takes the colour
-    of the arm it favours; the label beside it gives the significant
-    per-scenario wins, meta / saferl / tied.
+    One panel per quantity: net production (``evaluate._tier_summary``'s
+    ``score_gain``), violation burden (``burden_reduction``, with each arm's
+    mean B per scenario, since a large cut of a small burden is little) and
+    the flow-change penalty (actuator wear, pooled here from ``results``).
+    A bar takes the colour of the arm it favours; "wins" are the tier's
+    significant per-scenario verdicts, meta / saferl / tied.
     """
-    if not tiers:
-        return
-    plt = _pyplot()
-    if plt is None:
-        return
+    import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
     names = list(tiers)
     y = np.arange(len(names))[::-1]
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 1.2 + 0.75 * len(names)),
+
+    def burden_note(t):
+        n = tiers[t]["scenarios"]
+        s, m = (_pooled(results, n, "burden", a) / len(n)
+                for a in ("saferl", "meta"))
+        w = tiers[t]["burden_wins"]
+        return f"B {s:.2f} -> {m:.2f}   wins {w['meta']}/{w['saferl']}/{w['tied']}"
+
+    def score_note(t):
+        w = tiers[t]["score_wins"]
+        return f"wins {w['meta']}/{w['saferl']}/{w['tied']}"
+
+    def wear_cut(t):
+        n = tiers[t]["scenarios"]
+        ref = _pooled(results, n, "smoothing", "saferl")
+        return (1.0 - _pooled(results, n, "smoothing", "meta") / ref
+                if ref > 0 else float("nan"))
+
+    panels = [
+        ("net production gain vs saferl\n(% of saferl's on-spec ethanol)",
+         [tiers[t]["score_gain"] for t in names], score_note),
+        ("violation burden cut vs saferl (%)",
+         [tiers[t]["burden_reduction"] for t in names], burden_note),
+    ]
+    if all("smoothing" in results[n][a] for t in names
+           for n in tiers[t]["scenarios"] for a in ("saferl", "meta")):
+        panels.append(("flow-change wear cut vs saferl (%)",
+                       [wear_cut(t) for t in names], lambda t: ""))
+    fig, axes = plt.subplots(1, len(panels),
+                             figsize=(5.4 * len(panels), 1.5 + 0.8 * len(names)),
                              sharey=True)
     fig.patch.set_facecolor(PLOT_SURFACE)
-    panels = (("burden_reduction", "burden_wins",
-               "violation burden cut vs saferl (%)"),
-              ("score_gain", "score_wins",
-               "net production gain vs saferl\n(% of saferl's on-spec ethanol)"))
-    for ax, (key, wkey, title) in zip(axes, panels):
-        vals = np.array([100.0 * tiers[n][key] for n in names], dtype=float)
-        vals = np.nan_to_num(vals)
+    for ax, (title, raw, note) in zip(axes, panels):
+        vals = np.nan_to_num(100.0 * np.asarray(raw, dtype=float))
         cols = [ARM_COLORS["meta"] if v > 0 else ARM_COLORS["saferl"]
                 for v in vals]
         ax.barh(y, vals, height=0.5, color=cols, edgecolor=PLOT_SURFACE, lw=2)
         ax.axvline(0.0, color=PLOT_INK2, lw=1.0)
         span = max(np.max(np.abs(vals)), 1.0)
-        ax.set_xlim(-1.9 * span, 1.9 * span)
-        for yi, v, n in zip(y, vals, names):
-            w = tiers[n][wkey]
-            ax.annotate(f"{v:+.1f}%   {w['meta']}/{w['saferl']}/{w['tied']}",
-                        (v, yi), xytext=(6 if v >= 0 else -6, 0),
+        ax.set_xlim(-2.6 * span, 2.6 * span)
+        for yi, v, t in zip(y, vals, names):
+            up = v >= 0
+            ax.annotate(f"{v:+.1f}%", (v, yi), xytext=(6 if up else -6, 5),
                         textcoords="offset points", va="center",
-                        ha="left" if v >= 0 else "right", fontsize=8.5,
-                        color=PLOT_INK)
+                        ha="left" if up else "right", fontsize=9.5,
+                        color=PLOT_INK, fontweight="bold")
+            ax.annotate(note(t), (v, yi), xytext=(6 if up else -6, -7),
+                        textcoords="offset points", va="center",
+                        ha="left" if up else "right", fontsize=7.8,
+                        color=PLOT_INK2)
         ax.set_title(title, fontsize=10.5, color=PLOT_INK, fontweight="bold")
         _style_ax(ax)
         ax.grid(axis="y", visible=False)
         ax.grid(axis="x", alpha=0.5, color=PLOT_GRID, lw=0.8)
         ax.tick_params(axis="y", length=0)
     axes[0].set_yticks(y)
-    axes[0].set_yticklabels([f"{n}  {tiers[n]['label'].split(' (')[0]}\n"
-                             f"{tiers[n]['n']} scenarios" for n in names],
-                            fontsize=9, color=PLOT_INK2)
+    axes[0].set_yticklabels([f"{_tier_title(tiers, t)}\n"
+                             f"{tiers[t]['n']} scenarios" for t in names],
+                            fontsize=9.5, color=PLOT_INK2)
     fig.legend(handles=[Patch(color=ARM_COLORS["meta"], label="meta ahead"),
                         Patch(color=ARM_COLORS["saferl"], label="saferl ahead")],
                loc="lower center", ncol=2, frameon=False, fontsize=9)
-    fig.suptitle("Meta-RL vs Safe RL by evaluation tier   |   labels: pooled "
-                 "gap, then significant scenario wins meta / saferl / tied",
-                 fontweight="bold", fontsize=11, color=PLOT_INK)
-    fig.tight_layout(rect=(0, 0.07, 1, 0.92))
+    fig.suptitle("Meta-RL vs Safe RL by evaluation tier   |   pooled over the "
+                 "tier's scenarios; wins = significant scenarios meta / saferl "
+                 "/ tied; B = saferl -> meta burden per scenario",
+                 fontweight="bold", fontsize=10.5, color=PLOT_INK)
+    fig.tight_layout(rect=(0, 0.08, 1, 0.93))
     _savefig(fig, "compare_tiers")
 
 
@@ -687,11 +204,7 @@ def _plot_tier_burden_pie(results, tiers):
     ``evaluate._tier_summary`` uses). Shares are within one pie; its title
     gives the tier's mean burden per scenario and the largest constraint.
     """
-    if not tiers or not results:
-        return
-    plt = _pyplot("tier burden pie")
-    if plt is None:
-        return
+    import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
     arms = [a for a in ARM_ORDER if a in next(iter(results.values()))]
     names = list(tiers)
@@ -713,7 +226,7 @@ def _plot_tier_burden_pie(results, tiers):
             ax.set_facecolor(PLOT_SURFACE)
             vals = parts[(arm, t)]
             total = float(vals.sum())
-            head = (f"{arm}   {t}  {tiers[t]['label'].split(' (')[0]}\n"
+            head = (f"{arm}   {_tier_title(tiers, t)}\n"
                     f"mean B {total / tiers[t]['n']:.2f} per scenario "
                     f"({tiers[t]['n']} scenarios)")
             if total <= 0:
@@ -752,6 +265,124 @@ def _plot_tier_burden_pie(results, tiers):
                  fontweight="bold", fontsize=11.5, color=PLOT_INK)
     fig.tight_layout(rect=(0, 0.07, 1, 0.95))
     _savefig(fig, "compare_tier_burden_pie")
+
+
+def _plot_adapt(results, tiers):
+    """compare_adapt.png: the per-scenario paired gaps behind the tiers.
+
+    Two panels, violation burden and net production, meta vs saferl over
+    the same episodes, scenarios grouped by tier. A bar is coloured by the
+    arm it favours when the 95% CI excludes 0 and the gap is not negligible.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    names, spans = _tier_order(results, tiers)
+    labels = [scenario_label(n) for n in names]
+    panels = (
+        ("burden_per_ep", "Violation burden avoided per episode "
+         "(limit-hours)", "saferl - meta  (B)", lambda v: f"{v:+.1f}"),
+        ("score_per_ep", "Net production gained (on-spec ethanol less "
+         "violations and wear)", "meta - saferl\n(% of saferl on-spec)",
+         lambda v: f"{v:+.1f}%"),
+    )
+    x = np.arange(len(names))
+    fig, axs = plt.subplots(len(panels), 1, sharex=True,
+                            figsize=(max(9.0, 0.62 * len(names) + 2.0), 7.6))
+    fig.patch.set_facecolor(PLOT_SURFACE)
+    for ax, (key, title, ylab, fmt) in zip(axs, panels):
+        _style_ax(ax)
+        vals, cis, cols = [], [], []
+        for n in names:
+            s = np.asarray(results[n]["saferl"].get(key, []), dtype=float)
+            m = np.asarray(results[n]["meta"].get(key, []), dtype=float)
+            if s.size == 0 or s.size != m.size:
+                vals.append(np.nan)
+                cis.append(0.0)
+                cols.append(PLOT_NEUTRAL)
+                continue
+            if key == "score_per_ep":
+                # Net production can sit near zero: read it as a share of
+                # saferl's gross on-spec output.
+                scale = abs(float(results[n]["saferl"]["on_spec_ethanol"]))
+                d = _paired_delta(m, s, ref=scale)
+                k = 100.0 / scale if scale > 0 else np.nan
+            else:
+                d = _paired_delta(s, m, ref=float(np.mean(s)))
+                k = 1.0
+            v, ci = d["mean"] * k, d["ci95"] * k
+            vals.append(v)
+            cis.append(ci if np.isfinite(ci) else 0.0)
+            if d["significant"] and not d["negligible"] and v != 0:
+                cols.append(ARM_COLORS["meta" if v > 0 else "saferl"])
+            else:
+                cols.append(PLOT_NEUTRAL)
+        vals, cis = np.asarray(vals), np.asarray(cis)
+        ax.bar(x, np.nan_to_num(vals), 0.6, color=cols, yerr=cis, capsize=3,
+               ecolor=PLOT_INK2, error_kw={"lw": 1.1})
+        ax.axhline(0.0, color=PLOT_INK2, lw=1.0, zorder=1)
+        for xi, v, ci in zip(x, vals, cis):
+            if not np.isfinite(v):
+                txt, yv, dy, va = "n/a", 0.0, 3, "bottom"
+            else:
+                txt = "0" if v == 0 else fmt(v)
+                up = v >= 0
+                yv = v + ci if up else v - ci
+                dy, va = (3, "bottom") if up else (-3, "top")
+            ax.annotate(txt, (xi, yv), xytext=(0, dy),
+                        textcoords="offset points", ha="center", va=va,
+                        fontsize=7.2, color=PLOT_INK2)
+        for i, (_, lo, hi) in enumerate(spans):
+            if i % 2:
+                ax.axvspan(lo - 0.5, hi + 0.5, color=PLOT_GRID, alpha=0.25,
+                           lw=0, zorder=0)
+        ax.set_title(title, fontsize=10.5, color=PLOT_INK, fontweight="bold",
+                     pad=18 if ax is axs[0] else 8)
+        ax.set_ylabel(ylab, fontsize=9.5, color=PLOT_INK2)
+        ax.margins(y=0.22)
+    for t, lo, hi in spans:
+        axs[0].text(0.5 * (lo + hi), 1.01, t if t == "other"
+                    else _tier_title(tiers, t), ha="center", va="bottom",
+                    transform=axs[0].get_xaxis_transform(), fontsize=9,
+                    color=PLOT_INK2, fontweight="bold")
+    axs[-1].set_xlim(-0.6, len(names) - 0.4)
+    axs[-1].set_xticks(x)
+    axs[-1].set_xticklabels(labels, rotation=30, ha="right", fontsize=9,
+                            color=PLOT_INK2)
+    fig.legend(handles=[
+        Patch(color=ARM_COLORS["meta"], label="meta better (95% CI excludes 0)"),
+        Patch(color=ARM_COLORS["saferl"], label="saferl better (95% CI excludes 0)"),
+        Patch(color=PLOT_NEUTRAL, label="no significant or practical difference"),
+    ], loc="upper center", ncol=3, frameon=False, fontsize=9,
+        labelcolor=PLOT_INK2, bbox_to_anchor=(0.5, 0.95))
+    fig.suptitle("Meta-RL vs Safe RL per scenario, paired over the same "
+                 "episodes (up = meta better)", fontweight="bold", fontsize=12,
+                 color=PLOT_INK)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    _savefig(fig, "compare_adapt")
+
+
+def plot_eval(results, tiers):
+    """Render the evaluation figures into PLOT_DIR.
+
+    compare_tiers (meta's gap on saferl per tier), compare_tier_burden_pie
+    (what each tier's burden is) and compare_adapt (the per-scenario gaps
+    behind the tiers). All three contrast meta with saferl.
+    """
+    arms = next(iter(results.values())) if results else {}
+    if not ("meta" in arms and "saferl" in arms):
+        print("[plot] evaluation figures skipped: they need both arms")
+        return
+    if not all("burden" in r[a] for r in results.values() for a in arms):
+        print("[plot] evaluation figures skipped: eval.json predates the "
+              "burden metric (re-run evaluate)")
+        return
+    if _pyplot("evaluation figures") is None:
+        return
+    if tiers:
+        _plot_tiers(results, tiers)
+        _plot_tier_burden_pie(results, tiers)
+    _plot_adapt(results, tiers or {})
+    print(f"wrote figures to {PLOT_DIR}/")
 
 
 TRAIN_CURVE_SMOOTH_ITERS = 50

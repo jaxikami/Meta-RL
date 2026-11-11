@@ -522,17 +522,17 @@ picked iteration 590 on one high 10-task undisturbed ethanol reading, which
 also stopped training early; the final checkpoint (≈1090) is better on the
 faults (5 wins at 590).
 
-Figures (`results/plot/[tag]/`): **`compare_score`** (net production Π)
-and **`compare_burden`** (violation burden B per scenario and its make-up by
-constraint), which replace the event-count, episodes-violated, violation-mix
-and severity figures; then `compare_production`, `compare_quality`,
-`compare_adapt` (paired B, on-spec ethanol and Π), `distributions`,
-`disturbance_response`, `training_curves` and `compare_reactors.png`
-(on-spec ethanol and violation events per reactor). B and Π are defined in
-[docs/evaluation_metrics.md](docs/evaluation_metrics.md). The disturbance-response
-panels show the faulted reactor's actuator and add the storage trajectory.
-`eval.json` records per-reactor on-spec ethanol, batches, actuator means and
-violation events, the storage range and each episode's faulted reactor.
+Figures (`results/plot/[tag]/`), all meta vs saferl: **`compare_tiers`**
+(per tier T1–T3, pooled over its scenarios: the net-production Π gain, the
+violation-burden B cut with each arm's B per scenario, and the flow-change
+wear cut, with the significant per-scenario wins),
+**`compare_tier_burden_pie`** (each arm's B per tier split by constraint)
+and `compare_adapt` (the paired per-scenario B and Π gaps behind the tiers,
+grouped by tier). `training_curves` comes from the training logs. B and Π
+are defined in [docs/evaluation_metrics.md](docs/evaluation_metrics.md).
+`eval.json` still records per-reactor on-spec ethanol, titer, batches,
+actuator means, violation events, the storage range, each episode's faulted
+reactor and the disturbance-response traces.
 
 The lean `optional/headroom.py` and `optional/calibrate_faults.py` are not
 ported yet; `compare_headroom.png` is not drawn.

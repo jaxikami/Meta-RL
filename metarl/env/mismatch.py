@@ -1,4 +1,4 @@
-"""Plant-model mismatch: kinetics with rate terms the modelled plant lacks.
+"""Plant-model mismatch: kinetics and flows the modelled plant lacks.
 
 The plant the agents train on runs ``metarl.env.kinetics`` (Fermentation-PPO's,
 verbatim). A mismatched plant runs the same rate law with a constant
@@ -24,6 +24,19 @@ Terms (``MISMATCH_TERMS``), each a multiplier on:
     qHMF   HMF detoxification
     qACT   acetate consumption
     death  the yeast's death constants on both sugars
+
+Flow terms (``FLOW_TERMS``, the adapter's ``_execute_flows``) change how the
+actuators deliver, not the rate law. Every training plant, the APN's exact
+mass-balance heads and its residual fit assume a flow linear in the command
+(realized = gain x rated x u):
+
+    feed_curve  both feed valves deliver rated x u^feed_curve (nominal 1): below
+                1 a quick-opening characteristic, over-delivering at part
+                throttle (0.6: 1.9x at u = 0.2, 1.3x at u = 0.5)
+    drain_head  the discharge is rated x u x (M / (0.5 Mmax))^drain_head
+                (nominal 0): a level-driven drain rated at a half-full vessel,
+                faster than modelled when full and slower near empty (1: flow
+                proportional to the level, as through a laminar line)
 """
 
 # ─── Third-Party ──────────────────────────────────────────────────────────────
@@ -34,6 +47,32 @@ MISMATCH_TERMS = ("r1", "r2", "r3", "r4", "qG", "qX", "qF", "qHMF", "qACT",
                   "death")
 MISMATCH_INDEX = {k: i for i, k in enumerate(MISMATCH_TERMS)}
 N_MISMATCH_TERMS = len(MISMATCH_TERMS)
+# Flow term -> its nominal (modelled) value.
+FLOW_TERMS = {"feed_curve": 1.0, "drain_head": 0.0}
+
+
+def flow_mismatch(spec):
+    """The flow terms of a mismatch spec, or None when they are nominal.
+
+    Args:
+        spec: None, or dict term -> value (rate terms are ignored here).
+
+    Returns:
+        Dict with every FLOW_TERMS key (float), or None when all are nominal.
+
+    Raises:
+        ValueError: On a feed_curve that is not positive and finite, or a
+            drain_head that is negative or not finite.
+    """
+    out = dict(FLOW_TERMS)
+    for term in FLOW_TERMS:
+        if spec and term in spec:
+            v = float(spec[term])
+            low_ok = v > 0.0 if term == "feed_curve" else v >= 0.0
+            if not (np.isfinite(v) and low_ok):
+                raise ValueError(f"mismatch {term}={spec[term]!r} is out of range")
+            out[term] = v
+    return None if out == FLOW_TERMS else out
 
 
 def mismatch_matrix(spec, n_reactors):
@@ -41,7 +80,8 @@ def mismatch_matrix(spec, n_reactors):
 
     Args:
         spec: None, or dict term -> multiplier (a scalar for every reactor,
-            or one value per reactor).
+            or one value per reactor). FLOW_TERMS are skipped
+            (``flow_mismatch``).
         n_reactors: Number of reactors.
 
     Returns:
@@ -57,9 +97,11 @@ def mismatch_matrix(spec, n_reactors):
         return None
     theta = np.ones((n_reactors, N_MISMATCH_TERMS))
     for term, value in spec.items():
+        if term in FLOW_TERMS:
+            continue
         if term not in MISMATCH_INDEX:
             raise ValueError(f"unknown mismatch term {term!r}; expected one "
-                             f"of {MISMATCH_TERMS}")
+                             f"of {MISMATCH_TERMS + tuple(FLOW_TERMS)}")
         v = np.broadcast_to(np.asarray(value, dtype=np.float64), (n_reactors,))
         if not np.all(np.isfinite(v) & (v > 0.0)):
             raise ValueError(f"mismatch {term}={value!r} must be positive")

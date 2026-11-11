@@ -12,8 +12,9 @@ meta-RL side reads:
     acts relative to them. The nominal task is the Fermentation-PPO plant
     exactly;
   * plant-model mismatch (``task["mismatch"]``, evaluation only): rate-term
-    multipliers the training plants never had (``metarl.env.mismatch``),
-    constant over the episode and absent from the task descriptor;
+    multipliers and actuator characteristics the training plants never had
+    (``metarl.env.mismatch``), constant over the episode and absent from the
+    task descriptor;
   * privileged views for training (``get_effective_context``,
     ``fault_kind``, ``privileged_state``) and the probes and per-reactor
     ledger the evaluation reports.
@@ -37,7 +38,7 @@ from metarl.env.layout import STATE_DIM, ACTION_DIM
 from metarl.env.faults import (ADDITIVE_DISTURBANCES, DISTURBANCE_ALIASES,
                                DISTURBANCE_KIND_INDEX,
                                parse_active_disturbances)
-from metarl.env.mismatch import (calculate_rates_mismatch,
+from metarl.env.mismatch import (calculate_rates_mismatch, flow_mismatch,
                                  integrate_rk4_mismatch, mismatch_matrix)
 from metarl.env.plant import HEAT_LOAD_SCALE, FermentationPlant
 from metarl.env.safe import FermentationEnv
@@ -70,6 +71,8 @@ class MetaPlantMixin:
         self._kinetic_activity = np.ones(n)
         # Rate-term multipliers of a mismatched plant; None runs kinetics.py.
         self._mismatch = None
+        # Flow terms of a mismatched plant; None runs the plant's own flows.
+        self._flow_mismatch = None
         self._fault_seen = False
         self._fault_kind = 0
         self._step_events = np.zeros(n, dtype=np.int64)
@@ -104,6 +107,7 @@ class MetaPlantMixin:
         self._task_leak = np.broadcast_to(np.asarray(
             flow.get("leak_frac", 0.0), dtype=np.float64), (n,)).copy()
         self._mismatch = mismatch_matrix(task.get("mismatch"), n)
+        self._flow_mismatch = flow_mismatch(task.get("mismatch"))
 
     def _restore_nominal(self):
         """The environment's nominal values, then the task's pump gains."""
@@ -184,6 +188,21 @@ class MetaPlantMixin:
         return super()._apply_leak(leak_frac_per_hour + self._task_leak)
 
     # ------------------------------------------------- plant-model mismatch
+
+    def _execute_flows(self, a_reshaped):
+        """The plant's flows, through the mismatched actuators when a task sets them.
+
+        The commands are reshaped on a copy, so the step's reported action
+        stays what was commanded. The plant still caps the drain at its
+        discharge floor.
+        """
+        fm = self._flow_mismatch
+        if fm is None:
+            return super()._execute_flows(a_reshaped)
+        a = a_reshaped.copy()
+        a[:, 1:3] = a[:, 1:3] ** fm["feed_curve"]
+        a[:, 3] *= (np.maximum(self.M, 0.0) / (0.5 * self.Mmax)) ** fm["drain_head"]
+        return super()._execute_flows(a)
 
     def _integrate(self, fl):
         """The plant's RK4 step, over the mismatched rates when a task sets them."""

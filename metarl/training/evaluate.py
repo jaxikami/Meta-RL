@@ -36,6 +36,7 @@ from metarl.training.metrics import (latent_separability, gate_opening,
                                      _fmt_delta_sci)
 from metarl.training.logs import _json_default
 from metarl.training.plots import (_plot_comparison, _plot_tiers,
+                                   _plot_tier_burden_pie,
                                    plot_training_curves, scenario_probe)
 
 # The evaluation's task pools (``eval_task_pools``).
@@ -463,6 +464,7 @@ def evaluate():
     print(f"\nwrote {os.path.join(LOG_DIR, 'eval.json')} and eval_summary.json")
     _plot_comparison(results)
     _plot_tiers(summary["tiers"])
+    _plot_tier_burden_pie(results, summary["tiers"])
     plot_training_curves()
     return results
 

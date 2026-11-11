@@ -678,6 +678,82 @@ def _plot_tiers(tiers):
     _savefig(fig, "compare_tiers")
 
 
+def _plot_tier_burden_pie(results, tiers):
+    """compare_tier_burden_pie.png: what each tier's violation burden is.
+
+    A pie per (arm, tier): rows are the arms, columns the tiers. A slice is a
+    constraint's share of the arm's burden summed over the tier's scenarios
+    (each scenario's mean per episode, the pooling
+    ``evaluate._tier_summary`` uses). Shares are within one pie; its title
+    gives the tier's mean burden per scenario and the largest constraint.
+    """
+    if not tiers or not results:
+        return
+    plt = _pyplot("tier burden pie")
+    if plt is None:
+        return
+    from matplotlib.patches import Patch
+    arms = [a for a in ARM_ORDER if a in next(iter(results.values()))]
+    names = list(tiers)
+    order = list(CONSTRAINT_NAMES.values())
+    parts = {(arm, t): np.array([sum(float(results[s][arm]
+                                           ["burden_by_constraint"].get(c, 0.0))
+                                     for s in tiers[t]["scenarios"])
+                                 for c in order])
+             for arm in arms for t in names}
+    seen = [c for j, c in enumerate(order) if any(p[j] > 0 for p in
+                                                  parts.values())]
+    fig, axes = plt.subplots(len(arms), len(names),
+                             figsize=(4.6 * len(names), 5.2 * len(arms) + 1.2),
+                             squeeze=False)
+    fig.patch.set_facecolor(PLOT_SURFACE)
+    for r, arm in enumerate(arms):
+        for k, t in enumerate(names):
+            ax = axes[r][k]
+            ax.set_facecolor(PLOT_SURFACE)
+            vals = parts[(arm, t)]
+            total = float(vals.sum())
+            head = (f"{arm}   {t}  {tiers[t]['label'].split(' (')[0]}\n"
+                    f"mean B {total / tiers[t]['n']:.2f} per scenario "
+                    f"({tiers[t]['n']} scenarios)")
+            if total <= 0:
+                ax.pie([1.0], colors=[PLOT_GRID],
+                       wedgeprops={"edgecolor": PLOT_SURFACE, "lw": 2})
+                ax.text(0, 0, "no burden", ha="center", va="center",
+                        fontsize=10, color=PLOT_INK2)
+                ax.set_title(head, fontsize=9.5, color=ARM_COLORS[arm],
+                             fontweight="bold")
+                continue
+            keep = [j for j, v in enumerate(vals) if v > 0]
+            cols = [CONSTRAINT_COLORS[order[j]] for j in keep]
+            wedges, _ = ax.pie(vals[keep], colors=cols, startangle=90,
+                               counterclock=False,
+                               wedgeprops={"edgecolor": PLOT_SURFACE, "lw": 2})
+            for w, j, c in zip(wedges, keep, cols):
+                pct = 100.0 * vals[j] / total
+                if pct < BURDEN_MIX_MIN_LABEL_PCT:
+                    continue
+                ang = np.deg2rad(0.5 * (w.theta1 + w.theta2))
+                ax.text(0.65 * np.cos(ang), 0.65 * np.sin(ang), f"{pct:.0f}%",
+                        ha="center", va="center", fontsize=9,
+                        color=_ink_on(c), fontweight="bold")
+            top = int(np.argmax(vals))
+            ax.set_title(f"{head}\nlargest: {order[top].replace('_', ' ')} "
+                         f"{100.0 * vals[top] / total:.0f}%", fontsize=9.5,
+                         color=ARM_COLORS[arm], fontweight="bold")
+            ax.set_aspect("equal")
+    if seen:
+        fig.legend(handles=[Patch(color=CONSTRAINT_COLORS[c],
+                                  label=c.replace("_", " ")) for c in seen],
+                   loc="lower center", ncol=min(len(seen), 5), frameon=False,
+                   fontsize=9, labelcolor=PLOT_INK2)
+    fig.suptitle("What the violation burden is, per evaluation tier "
+                 "(share of the tier's summed burden by constraint)",
+                 fontweight="bold", fontsize=11.5, color=PLOT_INK)
+    fig.tight_layout(rect=(0, 0.07, 1, 0.95))
+    _savefig(fig, "compare_tier_burden_pie")
+
+
 TRAIN_CURVE_SMOOTH_ITERS = 50
 
 

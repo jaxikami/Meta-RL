@@ -460,6 +460,10 @@ with these plant-specific settings:
   net-production gain, and the significant paired wins per side. Every tier
   runs on the same paired in-distribution tasks (T1's widened prior and T3's
   mismatch copies aside). 19 scenarios in all: 12, 4 and 3.
+  `compare_tier_burden_pie.png` shows which constraints make up the burden
+  in each tier: a pie per arm and tier, each slice a constraint's share of
+  the burden summed over the tier's scenarios, titled with the tier's mean
+  burden per scenario and its largest constraint.
 
   | tier | what is new to `meta` at test | scenarios |
   |---|---|---|

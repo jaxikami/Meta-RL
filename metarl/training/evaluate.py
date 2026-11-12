@@ -18,7 +18,8 @@ from metarl.training.config import (SEED, EVAL_EPISODES, EVAL_Z_MODE,
                                     EVAL_SPIKE_H, EVAL_GRADUAL_H,
                                     EVAL_RECURRENT_WINDOWS, META_DRIFT_TREADS,
                                     CONSTRAINT_NAMES, DEPTH_CONSTRAINTS,
-                                    Z_INFORM_MIN_SNR, LOG_DIR, PLOT_DIR,
+                                    Z_INFORM_MIN_SNR, Z_INFORM_MIN_PRIOR_SENS,
+                                    EVAL_SHARED_SHIELD, LOG_DIR, PLOT_DIR,
                                     DISTURB_PROBES, META_DISTURB_MAG_RANGES,
                                     EVAL_EXTRAPOLATION,
                                     EVAL_COMBINATIONS, EVAL_TIERS,
@@ -433,6 +434,7 @@ def evaluate():
         agents[name] = _build_agent(envs[name], spec)
         final_path, best_path = arm_paths(spec)
         _load_preferring_best(agents[name], best_path, final_path, name)
+    _share_shield(agents)
     env = envs[arms[-1]]
 
     id_tasks, ood_tasks = eval_task_pools(EVAL_EPISODES)
@@ -451,7 +453,13 @@ def evaluate():
             for arm in arms
         }
 
-    summary = _eval_summary(results, arms)
+    z_sens = None
+    if "meta" in agents and agents["meta"].use_context:
+        # Lazy: z_informativeness imports this module.
+        from metarl.training.z_informativeness import actor_z_sensitivity
+        z_sens = actor_z_sensitivity(agents["meta"], id_tasks[0])
+    summary = _eval_summary(results, arms, z_actor_sens=z_sens)
+    summary["shared_shield"] = EVAL_SHARED_SHIELD
     summary["tiers"] = _tier_summary(
         results, summary, {n: sc["tier"] for n, sc in scenarios.items()})
     _print_eval(results, summary)
@@ -560,8 +568,28 @@ def _eval_verdict(res, arm_a, arm_b):
             "d_score": d_score, "d_titer": d_titer, "verdict": verdict}
 
 
-def _eval_summary(results, arms):
-    """Derived, per-scenario verdicts for every reportable contrast."""
+def _share_shield(agents):
+    """Give every arm ``EVAL_SHARED_SHIELD``'s refined KineticNet (None: own)."""
+    src = EVAL_SHARED_SHIELD
+    if src is None:
+        return
+    if src not in agents or agents[src].kinetic is None:
+        raise SystemExit(f"EVAL_SHARED_SHIELD={src!r}: that arm is not "
+                         f"evaluated or has no KineticNet")
+    state = {k: v.detach().clone()
+             for k, v in agents[src].kinetic.state_dict().items()}
+    for name, agent in agents.items():
+        if name != src and agent.kinetic is not None:
+            agent.install_kinetic(state)
+    print(f"[shield] every arm runs {src}'s KineticNet (EVAL_SHARED_SHIELD)")
+
+
+def _eval_summary(results, arms, z_actor_sens=None):
+    """Derived, per-scenario verdicts for every reportable contrast.
+
+    ``z_actor_sens`` is the meta actor's d|a|/d|z| (``actor_z_sensitivity``);
+    ``z_pass`` needs it and the encoder's separability both.
+    """
     usable = [c for c in CONTRASTS if c[1] in arms and c[2] in arms]
     contrasts = {
         label: {name: _eval_verdict(res, arm_a, arm_b)
@@ -572,6 +600,11 @@ def _eval_summary(results, arms):
     if "meta" in arms:
         snr = float(np.mean([res["meta"]["z_snr"] for res in results.values()]))
         out.update(z_snr_mean=snr, z_snr_pass=bool(snr >= Z_INFORM_MIN_SNR))
+        sens = float("nan") if z_actor_sens is None else float(z_actor_sens)
+        out.update(z_actor_sens=sens,
+                   z_actor_pass=bool(sens > Z_INFORM_MIN_PRIOR_SENS),
+                   z_pass=bool(out["z_snr_pass"]
+                               and sens > Z_INFORM_MIN_PRIOR_SENS))
     return out
 
 
@@ -668,8 +701,16 @@ def _print_eval(results, summary):
         print(f"  {a:<10}{ARMS[a].summary():<58}{ARMS[a].blurb}")
     if "z_snr_mean" in summary:
         snr, ok = summary["z_snr_mean"], summary["z_snr_pass"]
-        print(f"\nlatent separability: mean SNR {snr:.2f} "
-              f"({'>= ' if ok else '< '}{Z_INFORM_MIN_SNR})")
+        sens = summary.get("z_actor_sens", float("nan"))
+        act_ok = summary.get("z_actor_pass", False)
+        print(f"\nlatent: encoder SNR {snr:.2f} "
+              f"({'>= ' if ok else '< '}{Z_INFORM_MIN_SNR}), actor "
+              f"d|a|/d|z| {sens:.1e} ({'> ' if act_ok else '<= '}"
+              f"{Z_INFORM_MIN_PRIOR_SENS}) -> "
+              f"{'PASS' if summary.get('z_pass') else 'FAIL'}"
+              + ("" if act_ok else " (the actor does not read z)"))
+    if summary.get("shared_shield"):
+        print(f"shield: every arm runs {summary['shared_shield']}'s KineticNet")
     print("\nB: violation burden, exceedance area past the limits in "
           "limit-hours (lower is better).  Pi: net production, on-spec ethanol less "
           "violations and wear at the reward's rates (higher is better).")

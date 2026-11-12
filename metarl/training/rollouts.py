@@ -49,8 +49,8 @@ def collect_rollout(env, agent, replay, task_id, task, add_to_replay=True,
         while not done:
             acted_on.append(state)
             # Privileged: whether (and which) fault had acted before this
-            # action.
-            fault = env.fault_kind()
+            # action, counting a consequence-only fault from its first alarm.
+            fault = env.fault_label()
             safe_a, _ = agent.select_action(state, deterministic=False)
             next_state, r, done, info = env.step(safe_a)
             agent.observe_step(next_state, info)
@@ -63,9 +63,9 @@ def collect_rollout(env, agent, replay, task_id, task, add_to_replay=True,
                 next_priv = env.privileged_state() if store_priv else None
                 replay.add(task_id, state, safe_a, r, next_state, done,
                            ctx_true, fault=fault, priv=priv,
-                           next_priv=next_priv)
+                           next_priv=next_priv, alarms=info["alarms"])
                 priv = next_priv
-            agent.update_context(state, safe_a, r, next_state)
+            agent.update_context(state, safe_a, r, next_state, info["alarms"])
             led_to.append(next_state)
             state = next_state
             total_r += r
@@ -155,6 +155,8 @@ def _start_episode(env, agent, task, disturbance, index=0, keep_states=False):
             "acts": [], "r_traj": [], "v_traj": [],
             "act_traj": [], "probe_traj": [], "storage_traj": [],
             "gate_traj": [], "stage_traj": [], "t_traj": [],
+            # Per decision: whether the fault could be seen (fault_label).
+            "label_traj": [],
             "states": [] if keep_states else None,
             "viol_by_constraint": {cid: 0 for cid in CONSTRAINT_IDS},
             "viol_by_reactor": np.zeros(N_REACTORS, dtype=np.int64),
@@ -183,9 +185,10 @@ def _advance(env, agent, ep, stop_at=None):
             ep["states"].append(state.copy())
         safe_a, _ = agent.select_action(state, deterministic=True)
         ep["gate_traj"].append(agent.last_gate)
+        ep["label_traj"].append(env.fault_label() > 0)
         next_state, r, done, info = env.step(safe_a)
         agent.observe_step(next_state, info)
-        agent.update_context(state, safe_a, r, next_state)
+        agent.update_context(state, safe_a, r, next_state, info["alarms"])
         ep["state"], ep["done"], ep["info"] = next_state, done, info
         ep["total_r"] += r
         ep["total_v"] += int(info["violation_events"])

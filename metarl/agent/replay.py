@@ -6,6 +6,7 @@ import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
 from metarl.env.config import TASK_CONTEXT_DIM
+from metarl.env.adapter import N_ALARMS
 from metarl.agent.common import device
 
 # Transitions per contiguous chunk in ``sample_windows``.
@@ -29,7 +30,7 @@ class _TaskRing:
     ``ep_step`` (its index within its episode), the privileged fault code
     (0 until a fault has acted, then the first acting kind's code) and,
     when built with ``priv_dim``, the plant's privileged state before and
-    after it.
+    after it, and the step's alarm vector (``env.alarms()``).
     """
 
     def __init__(self, obs_dim, action_dim, capacity, initial=4096,
@@ -52,13 +53,18 @@ class _TaskRing:
         self.priv = np.empty((rows, self.priv_dim), dtype=np.float32)
         self.next_priv = np.empty((rows, self.priv_dim), dtype=np.float32)
         self.ep_step = np.empty(rows, dtype=np.int64)
+        self.alarms = np.empty((rows, N_ALARMS), dtype=np.float32)
 
     def _fields(self):
         return (self.obs, self.act, self.rew, self.next_obs, self.done,
-                self.ctx, self.fault, self.priv, self.next_priv)
+                self.ctx, self.fault, self.priv, self.next_priv, self.alarms)
+
+    def _context_fields(self):
+        """What the encoder reads per transition: obs, act, rew, next_obs, alarms."""
+        return (self.obs, self.act, self.rew, self.next_obs, self.alarms)
 
     def append(self, obs, act, rew, next_obs, done, ctx, fault=0.0,
-               priv=None, next_priv=None):
+               priv=None, next_priv=None, alarms=None):
         """Write one transition, overwriting the oldest when full."""
         if self.priv_dim and (priv is None or next_priv is None):
             raise ValueError(f"this replay stores a {self.priv_dim}-wide "
@@ -79,6 +85,7 @@ class _TaskRing:
         self.done[i] = done
         self.ctx[i] = ctx
         self.fault[i] = fault
+        self.alarms[i] = 0.0 if alarms is None else alarms
         if self.priv_dim:
             self.priv[i] = priv
             self.next_priv[i] = next_priv
@@ -93,7 +100,7 @@ class _TaskRing:
 
     def gather_np(self, logical, context_only=False):
         p = self._physical(logical)
-        fields = self._fields()[:4] if context_only else self._fields()
+        fields = self._context_fields() if context_only else self._fields()
         return tuple(f[p] for f in fields)
 
     def episode_steps(self, logical):
@@ -111,7 +118,7 @@ class MultiTaskReplayBuffer:
         self._tasks = {}
 
     def add(self, task_id, obs, act_exec, reward, next_obs, done, context=None,
-            fault=False, priv=None, next_priv=None):
+            fault=False, priv=None, next_priv=None, alarms=None):
         """Append one transition (the EXECUTED action) to a task's bucket."""
         buf = self._tasks.get(task_id)
         if buf is None:
@@ -120,7 +127,8 @@ class MultiTaskReplayBuffer:
                 priv_dim=self.priv_dim)
         buf.append(obs, act_exec, reward, next_obs, 1.0 if done else 0.0,
                    0.0 if context is None else context,
-                   max(0.0, float(fault)), priv=priv, next_priv=next_priv)
+                   max(0.0, float(fault)), priv=priv, next_priv=next_priv,
+                   alarms=alarms)
 
     def task_ids(self):
         return [t for t, b in self._tasks.items() if b.n > 0]
@@ -150,10 +158,10 @@ class MultiTaskReplayBuffer:
         batch = buf.gather_np(idx.reshape(-1))
         R = W + L - 1
         row_idx = starts[:, None] - W + np.arange(R)[None, :]
-        o, a, r, o2 = buf.gather_np(np.clip(row_idx, 0, n - 1).reshape(-1),
-                                    context_only=True)
+        o, a, r, o2, al = buf.gather_np(
+            np.clip(row_idx, 0, n - 1).reshape(-1), context_only=True)
         rows = (o.reshape(K, R, -1), a.reshape(K, R, -1), r.reshape(K, R),
-                o2.reshape(K, R, -1))
+                o2.reshape(K, R, -1), al.reshape(K, R, -1))
         return batch, rows, lo, hi
 
     def sample_windows(self, task_id, batch_size, window,

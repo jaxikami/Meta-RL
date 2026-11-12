@@ -46,6 +46,17 @@ from metarl.env.safe import FermentationEnv
 # Constraint ids attributed to a reactor in ``reactor_violation_events``.
 REACTOR_CONSTRAINTS = (1, 2, 7, 8)
 
+# The constraint ids a step's alarm vector (``alarms``) reports, in order: a
+# plant's operator sees an overflow or a heat-load exceedance as it happens.
+ALARM_IDS = tuple(range(1, 10))
+N_ALARMS = len(ALARM_IDS)
+
+# Faults that change nothing observed (smoke test: a cooling cap at 5% gives
+# the same observation) until a constraint they move is violated: each kind's
+# constraint ids. Before that alarm no policy can tell them from the nominal
+# plant, so ``fault_label`` reports them only from then on.
+CONSEQUENCE_ONLY_FAULTS = {"storage_capacity": (3,), "cooling_capacity": (9,)}
+
 
 class MetaPlantMixin:
     """Tasks, fault tracking and flat views over a Fermentation-PPO environment.
@@ -75,6 +86,9 @@ class MetaPlantMixin:
         self._flow_mismatch = None
         self._fault_seen = False
         self._fault_kind = 0
+        self._fault_evident = False
+        self._hidden_kinds = set()
+        self._alarms = np.zeros(N_ALARMS, dtype=np.float32)
         self._step_events = np.zeros(n, dtype=np.int64)
         self._pre_M = np.zeros(n)
         self._pre_titer = np.zeros(n)
@@ -117,6 +131,9 @@ class MetaPlantMixin:
         self._kinetic_activity = np.ones(self.n_reactors)
         self._fault_seen = False
         self._fault_kind = 0
+        self._fault_evident = False
+        self._hidden_kinds = set()
+        self._alarms = np.zeros(N_ALARMS, dtype=np.float32)
 
     def reset(self):
         """Install the task, reset the plant; returns the flat observation."""
@@ -226,6 +243,10 @@ class MetaPlantMixin:
         if not self._fault_seen:
             self._fault_kind = DISTURBANCE_KIND_INDEX.get(kind, 0)
         self._fault_seen = True
+        if kind in CONSEQUENCE_ONLY_FAULTS:
+            self._hidden_kinds.add(kind)
+        else:
+            self._fault_evident = True
 
     def get_effective_context(self):
         """Return the task descriptor as it stands now, disturbances included.
@@ -264,6 +285,26 @@ class MetaPlantMixin:
     def fault_kind(self):
         """The ``DISTURBANCE_INDEX_MAP`` code of the first fault, while active; else 0."""
         return self._fault_kind if self.fault_active() else 0
+
+    def fault_label(self):
+        """``fault_kind()`` once the fault could be seen; else 0 (training only).
+
+        A ``CONSEQUENCE_ONLY_FAULTS`` kind counts from the first alarm of one
+        of its constraints after it acted; any other kind from its onset.
+        """
+        return self.fault_kind() if self._fault_evident else 0
+
+    def alarms(self):
+        """The last step's alarm vector [N_ALARMS]: 1.0 per ``ALARM_IDS`` violated."""
+        return self._alarms.copy()
+
+    def _record_alarms(self, counts):
+        """Set the step's alarms and mark a hidden fault evident on its alarm."""
+        self._alarms = np.array([1.0 if counts.get(c, 0) > 0 else 0.0
+                                 for c in ALARM_IDS], dtype=np.float32)
+        for kind in self._hidden_kinds:
+            if any(counts.get(c, 0) > 0 for c in CONSEQUENCE_ONLY_FAULTS[kind]):
+                self._fault_evident = True
 
     def disturbance_probe(self):
         """Current values of the quantities each disturbance kind acts on.
@@ -383,6 +424,8 @@ class MetaPlantMixin:
         self._step_events = np.zeros(self.n_reactors, dtype=np.int64)
         state, reward_arr, done, info = super().step(
             np.asarray(action, dtype=np.float64).reshape(-1))
+        self._record_alarms(info["violation_counts"])
+        info["alarms"] = self._alarms.copy()
         info["reward_per_reactor"] = np.asarray(reward_arr, dtype=float).copy()
         info["reactor_violation_events"] = self._step_events.copy()
         info["actual_action"] = np.asarray(info["actual_a_reshaped"]).reshape(-1)

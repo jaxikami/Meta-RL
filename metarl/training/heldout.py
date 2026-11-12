@@ -14,6 +14,7 @@ from metarl.env.config import PROD_REWARD_PER_ETH, VIOLATION_SPIKE
 from metarl.env.faults import (DISTURBANCE_ALIASES, DISTURBANCE_KIND_INDEX,
                                DISTURBANCE_INDEX_MAP)
 from metarl.training.config import (SELECT_MAX_WORST_VIOL, SELECT_VIOL_WEIGHT,
+                                    SELECT_TAIL_FRAC,
                                     GATE_FAULT_KINDS, HELDOUT_DISTURBANCES,
                                     HELDOUT_DISTURB_WEIGHT, META_ANCHOR_UP,
                                     META_ANCHOR_DOWN, META_ANCHOR_MIN,
@@ -36,6 +37,15 @@ def violation_price():
     return SELECT_VIOL_WEIGHT * VIOLATION_SPIKE / PROD_REWARD_PER_ETH
 
 
+def tail_mean(values, frac=SELECT_TAIL_FRAC):
+    """Mean of the largest ``ceil(frac * n)`` values (at least one; 0 if empty)."""
+    v = np.sort(np.asarray(values, dtype=float))
+    if v.size == 0:
+        return 0.0
+    k = max(1, int(np.ceil(frac * v.size - 1e-9)))
+    return float(v[-k:].mean())
+
+
 def _score_rows(rows, viol_price=0.0):
     """Aggregate one held-out rollout per task into a held-out score."""
     sep = latent_separability([r["z_mu"] for r in rows],
@@ -50,6 +60,7 @@ def _score_rows(rows, viol_price=0.0):
         "gate_late": gate_late,
         "violations": violations,
         "viol_worst": float(max(per_task_viol)) if per_task_viol else 0.0,
+        "viol_tail": tail_mean(per_task_viol),
         "viol_per_task": per_task_viol,
         "eth_per_task": per_task_eth,
         "reward": float(np.mean([r["reward"] for r in rows])),
@@ -73,8 +84,9 @@ def blended_heldout_score(env, agent, tasks, z_mode="mean", disturbed=True,
 
     The lean study's blend (see its docstring): ``violations``, ``reward``,
     ``on_spec_ethanol`` and ``score`` are the blend, ``viol_worst`` the worst
-    single episode anywhere, ``gate_violations`` / ``gate_viol_worst`` what
-    the feasibility gate reads, ``panel`` each branch's own numbers.
+    single episode anywhere, ``gate_violations`` / ``gate_viol_tail`` what
+    the feasibility gate reads (``gate_viol_worst`` the gated branches' worst
+    single episode, logged only), ``panel`` each branch's own numbers.
     """
     faults = tuple(HELDOUT_DISTURBANCES) if disturbed else ()
     onset = env.max_steps // 2
@@ -96,6 +108,7 @@ def blended_heldout_score(env, agent, tasks, z_mode="mean", disturbed=True,
             out[f"disturbed_{k}"] = base[k]
         out["gate_violations"] = base["violations"]
         out["gate_viol_worst"] = base["viol_worst"]
+        out["gate_viol_tail"] = base["viol_tail"]
         out["panel"] = {}
         return out
     panel = [_score_rows([rows[k + 1] for rows in per_task], price)
@@ -113,8 +126,10 @@ def blended_heldout_score(env, agent, tasks, z_mode="mean", disturbed=True,
     out["viol_worst"] = max(base["viol_worst"], d_worst)
     out["gate_violations"] = max(g["violations"] for g in gated)
     out["gate_viol_worst"] = max(g["viol_worst"] for g in gated)
+    out["gate_viol_tail"] = max(g["viol_tail"] for g in gated)
     out["panel"] = {name: {k: p[k] for k in (
-                        "violations", "viol_worst", "on_spec_ethanol", "score",
+                        "violations", "viol_worst", "viol_tail",
+                        "on_spec_ethanol", "score",
                         "viol_per_task", "eth_per_task", "gate_late")}
                     for name, p in zip(names, panel)}
     return out

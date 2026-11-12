@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
-from metarl.env.adapter import PlantFermentationEnv
+from metarl.env.adapter import N_ALARMS, PlantFermentationEnv
 from metarl.agent.common import (ROLLOUT_DEVICE, PRE_TANH_CLIP,
                                  EXPLORE_NOISE_LEN, powerlaw_noise)
 
@@ -102,22 +102,31 @@ class ActingMixin:
             self._set_shield_state(state["shield"])
 
     @staticmethod
-    def _flatten_transition(obs, act, reward, next_obs):
-        """Flatten one transition into the encoder's input vector."""
+    def _flatten_transition(obs, act, reward, next_obs, alarms=None):
+        """Flatten one transition into the encoder's input vector.
+
+        Order: obs, action, reward, alarms (zeros when None), next_obs; the
+        encoder finds the observations at the two ends.
+        """
         return np.concatenate([
             np.asarray(obs, dtype=np.float32).reshape(-1),
             np.asarray(act, dtype=np.float32).reshape(-1),
             np.array([np.float32(reward)]),
+            (np.zeros(N_ALARMS, dtype=np.float32) if alarms is None
+             else np.asarray(alarms, dtype=np.float32).reshape(N_ALARMS)),
             np.asarray(next_obs, dtype=np.float32).reshape(-1),
         ])
 
-    def update_context(self, obs, act, reward, next_obs):
-        """Fold one observed transition into the online posterior (GRU step)."""
+    def update_context(self, obs, act, reward, next_obs, alarms=None):
+        """Fold one observed transition into the online posterior (GRU step).
+
+        ``alarms`` is the step's ``env.alarms()`` (None: none fired).
+        """
         if not self.use_context:
             return
         self._sync_rollout()
         reward_n = reward / self.ret_rms.std if self.ret_rms is not None else reward
-        trans = self._flatten_transition(obs, act, reward_n, next_obs)
+        trans = self._flatten_transition(obs, act, reward_n, next_obs, alarms)
         trans_t = torch.as_tensor(
             trans, dtype=torch.float32, device=ROLLOUT_DEVICE).unsqueeze(0)
         with torch.no_grad():

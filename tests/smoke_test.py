@@ -110,8 +110,9 @@ from metarl.training.rollouts import (collect_rollout, rollout_deterministic,
                                       scenario_rollouts,
                                       collect_episode_record,
                                       ingest_episode_record)
-from metarl.training.heldout import (_regressions,
+from metarl.training.heldout import (_regressions, tail_mean,
                                      blended_heldout_score, violation_price)
+from metarl.env.adapter import ALARM_IDS, N_ALARMS
 from metarl.training.workers import RolloutPool
 from metarl.training import plots
 from metarl.env.config import PROD_REWARD_PER_ETH, VIOLATION_SPIKE
@@ -992,6 +993,26 @@ def check_plant_wide_faults():
         _, _, _, info = env._step_internal(np.tile([T1, -1, -1, -1.0], N_REACTORS))
         assert (3 in info["violation_counts"]) == want, (mag, info["violation_counts"])
     assert np.isclose(env.get_effective_context()[CTX_STORAGE_CAP], 0.9)
+    # A storage cut is labelled only from its first overflow alarm (id 3); a
+    # leak from its onset.
+    act = np.tile([T1, -1, -1, -1.0], N_REACTORS)
+    for start, want in ((0.10, 0), (0.95, DISTURBANCE_KIND_INDEX["storage_capacity"])):
+        env.clear_disturbances()
+        env.schedule_disturbance("storage_capacity", 0, 0.9)
+        env.reset()
+        env.S_mass = start * S_MAX
+        _, _, _, info = env.step(act)
+        assert env.fault_kind() == DISTURBANCE_KIND_INDEX["storage_capacity"]
+        assert env.fault_label() == want, (start, env.fault_label())
+        assert info["alarms"][ALARM_IDS.index(3)] == (1.0 if want else 0.0)
+        assert np.array_equal(env.alarms(), info["alarms"])
+    env.clear_disturbances()
+    env.schedule_disturbance("leak", 0, 0.01, reactor=0)
+    env.reset()
+    env.step(act)
+    assert env.fault_label() == DISTURBANCE_KIND_INDEX["leak"]
+    env.reset()
+    assert env.fault_label() == 0 and not env.alarms().any()
     # cooling_capacity: the heat-load cap moves, nothing observed does.
     loads = {}
     for mag in (1.0, 0.05):
@@ -1005,6 +1026,7 @@ def check_plant_wide_faults():
                 counts[k] = counts.get(k, 0) + v
         loads[mag] = (counts.get(9, 0), obs.copy(), env.disturbance_probe())
     assert loads[1.0][0] == 0 and loads[0.05][0] > 0, loads
+    assert env.fault_label() == DISTURBANCE_KIND_INDEX["cooling_capacity"]
     assert np.array_equal(loads[1.0][1], loads[0.05][1])
     assert np.isclose(loads[0.05][2]["cooling_capacity"], 0.05 * env.max_heat_load)
     assert np.isclose(env.get_effective_context()[CTX_COOLING_CAP], 0.05)
@@ -1157,8 +1179,10 @@ def check_recurrent_encoder():
             a = np.random.uniform(-1, 1, ACTION_DIM)
             online.append(agent.z_mu.clone())
             nobs, r, done, _ = env.step(a)
-            replay.add(0, obs, a, r, nobs, done)
-            agent.update_context(obs, a, r, nobs)
+            # Random alarms, so the check covers their path into the GRU.
+            al = (np.random.rand(N_ALARMS) < 0.3).astype(np.float32)
+            replay.add(0, obs, a, r, nobs, done, alarms=al)
+            agent.update_context(obs, a, r, nobs, al)
             obs = nobs
     n = replay.size(0)
     steps = replay._tasks[0].episode_steps(np.arange(n))
@@ -1186,6 +1210,20 @@ def check_recurrent_encoder():
     stats = tagent.update(preplay, meta_batch=1, batch_size=16, context_size=window)
     for k in ("critic_loss", "actor_loss", "kl", "aux_loss"):
         assert np.isfinite(stats[k]), (k, stats[k])
+    # With every other encoder loss weighted 0, only the Bellman gradient
+    # through z can move the encoder: critic_detach_z must cut it. The
+    # critics read z through a zero-initialised projection, so the first
+    # update has no z gradient and the check needs a few.
+    for detach in (False, True):
+        dagent = _ctx_agent(kl_lambda=0.0, aux_weight=0.0,
+                            critic_detach_z=detach)
+        e0 = [p.detach().clone() for p in dagent.encoder.parameters()]
+        for _ in range(3):
+            dagent.update(preplay, meta_batch=1, batch_size=16,
+                          context_size=window)
+        moved = not all(torch.equal(p0, p) for p0, p in
+                        zip(e0, dagent.encoder.parameters()))
+        assert moved != detach, f"critic_detach_z={detach}: encoder moved={moved}"
     # A context-free arm (saferl) stores no privileged state and still updates.
     sagent = PEARLAgent(STATE_DIM, ACTION_DIM, use_context=False)
     sreplay = MultiTaskReplayBuffer(STATE_DIM, ACTION_DIM)
@@ -1586,6 +1624,8 @@ def check_selection_logic():
     tail = dict(ref, undisturbed_viol_per_task=[0.0] * 9 + [40.0])
     assert "undisturbed:tail" in _regressions(tail, ref)
     s = EarlyStopper(min_checks=1, patience=2, max_viol=3, max_worst_viol=12)
+    assert tail_mean([0, 1, 2, 3, 4, 5, 6, 7, 8, 17]) == 12.5
+    assert tail_mean([5.0]) == 5.0 and tail_mean([]) == 0.0
     assert not s.should_stop(1, 0.0, 10.0, 20.0, 0.0)[0]
     assert not s.should_stop(2, 0.0, 1.0, 5.0, 1.0)[0] and s.feasible_seen
     print("  selection logic OK")

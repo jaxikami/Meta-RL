@@ -104,13 +104,14 @@ class LearningMixin:
         """
         if reset is None:
             reset = self._resets_of(rows, lo, hi)
-        o, a, r, o2 = rows
+        o, a, r, o2, al = rows
         K, R = r.shape
         L = lo.shape[1]
         r = r.reshape(K, R, 1).float()
         if self.ret_rms is not None:
             r = r / self.ret_rms.std
-        trans = torch.cat([o.float(), a.float(), r, o2.float()], dim=-1)
+        trans = torch.cat([o.float(), a.float(), r, al.float(), o2.float()],
+                          dim=-1)
         enc = self.encoder
         x = enc.embed_inputs(trans.reshape(K * R, -1)).reshape(K, R, -1)
         keep = (~reset).to(x.dtype).t().unsqueeze(-1)        # [R, K, 1]
@@ -328,7 +329,7 @@ class LearningMixin:
         batch = _to_device(np.concatenate([p[0][i] for p in parts])
                            for i in range(len(parts[0][0])))
         rows = _to_device(np.concatenate([p[1][i] for p in parts])
-                          for i in range(4))
+                          for i in range(len(parts[0][1])))
         lo_np = np.concatenate([p[2] for p in parts])
         hi_np = np.concatenate([p[3] for p in parts])
         reset = torch.as_tensor(window_resets(lo_np, hi_np, rows[2].shape[1]),
@@ -348,7 +349,7 @@ class LearningMixin:
         else:
             z = mu = torch.zeros(batch[0].shape[0], self._z_dim, device=device)
             kl = torch.zeros((), device=device)
-        o, a, r, o2, d, ctx_true, fault_code, priv, priv2 = batch
+        o, a, r, o2, d, ctx_true, fault_code, priv, priv2, _ = batch
         o, a, o2, d = o.float(), a.float(), o2.float(), d.float()
         if self.adapt_gate and not self.history_frozen:
             raise ValueError("the gate's base policy reads the actor's history "
@@ -424,9 +425,11 @@ class LearningMixin:
                 entropy_term = gate_act * entropy_term
             target = b.r + (1.0 - b.d) * self.gamma * (
                 torch.min(q1_t, q2_t) - entropy_term)
-        # z is NOT detached here: this is the encoder's Bellman gradient; nor
-        # are the history features, unless the history module is frozen.
-        q1, q2 = self.critic(b.feat, b.a, self._critic_cond(b.z, b.ctx, b.priv))
+        # Unless critic_detach_z, z is not detached here: this is the
+        # encoder's Bellman gradient. The history features are not detached
+        # either, unless the history module is frozen.
+        z_q = b.z.detach() if self.critic_detach_z else b.z
+        q1, q2 = self.critic(b.feat, b.a, self._critic_cond(z_q, b.ctx, b.priv))
         critic_loss = (F.smooth_l1_loss(q1, target, beta=1.0)
                        + F.smooth_l1_loss(q2, target, beta=1.0))
         zero = torch.zeros((), device=device)

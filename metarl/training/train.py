@@ -37,7 +37,8 @@ from metarl.training.config import (APN_REFINE_EVERY, APN_REFINE_EPISODES,
                                     EARLY_STOP_PATIENCE,
                                     EARLY_STOP_MIN_REL_DELTA,
                                     EARLY_STOP_REL_FLOOR, SELECT_MAX_VIOL,
-                                    SELECT_MAX_WORST_VIOL, GATE_FAULT_KINDS,
+                                    SELECT_MAX_TAIL_VIOL, SELECT_TAIL_FRAC,
+                                    GATE_FAULT_KINDS,
                                     EARLY_STOP_DIVERGE_FACTOR,
                                     EARLY_STOP_DIVERGE_VIOL_FLOOR,
                                     EARLY_STOP_DIVERGE_REL_DROP,
@@ -170,7 +171,7 @@ LOG_KEYS = ("iter", "avg_reward", "avg_violations", "critic_loss",
             "heldout_viol_worst", "heldout_undisturbed_viol_worst",
             "heldout_disturbed_viol_worst",
             "heldout_gate_violations", "heldout_gate_viol_worst",
-            "heldout_panel", "heldout_undisturbed_per_task",
+            "heldout_gate_viol_tail", "heldout_panel", "heldout_undisturbed_per_task",
             "heldout_regressions", "heldout_anchor_weight",
             "heldout_anchor_kind_weights", "heldout_gate_late")
 
@@ -182,7 +183,7 @@ _HELDOUT_STATS = ("violations", "reward", "on_spec_ethanol", "score",
                   "disturbed_reward", "disturbed_on_spec_ethanol",
                   "disturbed_score", "viol_worst",
                   "undisturbed_viol_worst", "disturbed_viol_worst",
-                  "gate_violations", "gate_viol_worst")
+                  "gate_violations", "gate_viol_worst", "gate_viol_tail")
 
 
 @dataclass
@@ -202,14 +203,15 @@ class _Selection:
     def consider(self, ho, regress, it):
         """Judge one held-out check; True when it is the new best.
 
-        A check is feasible when its gated mean and worst-episode violations
-        pass and it regresses nowhere. The best is the highest-scoring
+        A check is feasible when its gated mean and tail (worst
+        SELECT_TAIL_FRAC of episodes) violations pass and it regresses
+        nowhere. The best is the highest-scoring
         feasible check, or, before any check was feasible, the one with the
         fewest gated violations.
         """
-        gate_v, gate_w = ho["gate_violations"], ho["gate_viol_worst"]
+        gate_v, gate_w = ho["gate_violations"], ho["gate_viol_tail"]
         mean_ok = gate_v <= SELECT_MAX_VIOL
-        tail_ok = gate_w <= SELECT_MAX_WORST_VIOL
+        tail_ok = gate_w <= SELECT_MAX_TAIL_VIOL
         feasible = mean_ok and tail_ok and not regress
         if mean_ok and not tail_ok:
             self.tail_rejects += 1
@@ -352,13 +354,13 @@ def _gate_skip(spec, ref_score):
     for name, p in ref_score["panel"].items():
         if (name.split("@")[0] in GATE_FAULT_KINDS
                 and (p["violations"] > SELECT_MAX_VIOL
-                     or p["viol_worst"] > SELECT_MAX_WORST_VIOL)):
+                     or p["viol_tail"] > SELECT_MAX_TAIL_VIOL)):
             skip.add(name)
     if skip:
         print(f"  {spec.warm_start} fails the absolute gate on "
               + ", ".join(f"{n} ({ref_score['panel'][n]['violations']:.1f}"
-                          f" mean, {ref_score['panel'][n]['viol_worst']:.0f}"
-                          f" worst)" for n in sorted(skip))
+                          f" mean, {ref_score['panel'][n]['viol_tail']:.1f}"
+                          f" tail)" for n in sorted(skip))
               + "; judged there against it by NO_REGRESS instead")
     return skip
 
@@ -403,7 +405,7 @@ def _early_stopper():
     return EarlyStopper(
         min_checks=EARLY_STOP_MIN_ITERS, patience=EARLY_STOP_PATIENCE,
         min_rel_delta=EARLY_STOP_MIN_REL_DELTA, rel_floor=EARLY_STOP_REL_FLOOR,
-        max_viol=SELECT_MAX_VIOL, max_worst_viol=SELECT_MAX_WORST_VIOL,
+        max_viol=SELECT_MAX_VIOL, max_worst_viol=SELECT_MAX_TAIL_VIOL,
         diverge_factor=EARLY_STOP_DIVERGE_FACTOR,
         diverge_viol_floor=EARLY_STOP_DIVERGE_VIOL_FLOOR,
         diverge_rel_drop=EARLY_STOP_DIVERGE_REL_DROP,
@@ -425,7 +427,7 @@ def _postfix(spec, agent, stats, pstats, avg_r, avg_v, ho, regress, stopper):
     """The progress bar's fields."""
     post = {"Rwd": f"{avg_r:.1f}", "Viol": f"{avg_v:.1f}",
             "hoV": f"{ho['gate_violations']:.1f}",
-            "hoW": f"{ho['gate_viol_worst']:.0f}"}
+            "hoT": f"{ho['gate_viol_tail']:.1f}"}
     if os.environ.get("PLANT_VERBOSE_PBAR", "0") == "1":
         post.update({"QL": f"{stats['critic_loss']:.1f}",
                      "a": f"{stats['alpha']:.2f}"})
@@ -504,7 +506,8 @@ def _train(arm):
     loaded_misses = None
     reward_hist, viol_hist = [], []
     ho = {"violations": float("nan"), "z_snr": float("nan"),
-          "gate_violations": float("nan"), "gate_viol_worst": float("nan")}
+          "gate_violations": float("nan"), "gate_viol_worst": float("nan"),
+          "gate_viol_tail": float("nan")}
     final_path, best_path = arm_paths(spec)
 
     pbar = _trange(1, META_ITERATIONS + 1)
@@ -581,13 +584,16 @@ def _train(arm):
             log["heldout_gate_late"].append(
                 {"undisturbed": ho["undisturbed_gate_late"],
                  **{n: p["gate_late"] for n, p in ho.get("panel", {}).items()}})
-            if best.consider(ho, regress, it):
+            # A check while the actor is held is the warm-start source's
+            # policy (the run that picked iter 200 of 810 evaluated saferl's
+            # actor, bit for bit), so only checks after it can be selected.
+            if not held and best.consider(ho, regress, it):
                 os.makedirs(POLICY_DIR, exist_ok=True)
                 agent.save(best_path)
 
         if stopper is not None and fresh and (it == 1 or not held):
             stop, reason = stopper.should_stop(
-                it, ho["reward"], ho["gate_violations"], ho["gate_viol_worst"],
+                it, ho["reward"], ho["gate_violations"], ho["gate_viol_tail"],
                 ho["score"], extra_ok=not regress)
 
         if stats is not None:
@@ -637,7 +643,8 @@ def _print_summary(spec, agent, best, ref_score, gate_skip, log, ho):
         print(f"[{label}] {spec.warm_start} as it runs, on the same checks: "
               f"plant score={ref_score['score']:.4e} panel violations="
               f"{ref_score['disturbed_violations']:.2f}")
-    print(f"[{label}] tail gate (SELECT_MAX_WORST_VIOL={SELECT_MAX_WORST_VIOL}) "
+    print(f"[{label}] tail gate (SELECT_MAX_TAIL_VIOL={SELECT_MAX_TAIL_VIOL} on "
+          f"the worst {SELECT_TAIL_FRAC:.0%} of episodes) "
           f"rejected {best.tail_rejects} check(s) the mean band would have "
           f"admitted")
     if no_regress:
@@ -654,12 +661,12 @@ def _print_summary(spec, agent, best, ref_score, gate_skip, log, ho):
                   f"read exactly 0.")
     if not best.feasible:
         print(f"[{label}] WARNING: no checkpoint was ever feasible (mean <= "
-              f"{SELECT_MAX_VIOL} and worst <= {SELECT_MAX_WORST_VIOL}"
+              f"{SELECT_MAX_VIOL} and tail <= {SELECT_MAX_TAIL_VIOL}"
               + (f", and no regression vs {spec.warm_start}" if no_regress else "")
               + "); selection fell back to minimum-mean-violations. Treat this "
                 "arm's checkpoint as selected on safety alone. If the plant's "
                 "nominal optimum itself violates more than the gate allows, "
-                "calibrate SELECT_MAX_VIOL / SELECT_MAX_WORST_VIOL.")
+                "calibrate SELECT_MAX_VIOL / SELECT_MAX_TAIL_VIOL.")
     if spec.use_context and np.isfinite(ho.get("z_snr", float("nan"))):
         print(f"[{label}] final latent separability SNR = {ho['z_snr']:.4f} "
               f"(gate wants > {Z_INFORM_MIN_SNR})")

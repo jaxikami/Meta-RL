@@ -26,7 +26,8 @@ from metarl.training.config import (APN_PENALTY_WEIGHT, APN_SAFETY_GRAD_WEIGHT,
                                     GATE_SHARPNESS, GATE_INIT_BIAS,
                                     META_EXPLORE_NOISE_BETA,
                                     META_TRAIN_GATE_OPEN, META_FAULT_CLS_WEIGHT,
-                                    META_ENCODER_UPDATE_EVERY)
+                                    META_ENCODER_UPDATE_EVERY,
+                                    META_CRITIC_DETACH_Z)
 
 
 class ArmSpec:
@@ -200,7 +201,8 @@ def _build_agent(env, arm, train_apn_if_missing=False, quiet=False):
                                         else 0.0),
                       train_gate_open=META_TRAIN_GATE_OPEN,
                       encoder_update_every=(META_ENCODER_UPDATE_EVERY
-                                            if spec.multitask else 1))
+                                            if spec.multitask else 1),
+                      critic_detach_z=META_CRITIC_DETACH_Z)
     return PEARLAgent(env.stateDim, env.actionDim,
                       use_context=spec.use_context, **kwargs)
 

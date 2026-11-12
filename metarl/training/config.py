@@ -48,13 +48,33 @@ WARMUP_EPISODES_PER_TASK = 3
 # Evaluation tasks per scenario. The pool is drawn in order from one seed, so
 # a larger value extends it. Each plant episode costs ~3x a lean one.
 EVAL_EPISODES = int(os.environ.get("PLANT_EVAL_EPISODES", 100))
+
+
+def _usable_cpus():
+    """CPUs this process may run on: a Slurm job's allocation, not the node's."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:          # not Linux
+        return os.cpu_count() or 1
+
+
+USABLE_CPUS = _usable_cpus()
 # Worker processes for evaluation: one job per (arm, task), each running every
 # scenario of its task from one undisturbed prefix. 0 or 1 runs in-process.
-EVAL_WORKERS = int(os.environ.get("PLANT_EVAL_WORKERS", os.cpu_count() or 1))
+EVAL_WORKERS = int(os.environ.get("PLANT_EVAL_WORKERS", USABLE_CPUS))
+# The arm whose refined KineticNet every arm's shield runs in evaluation
+# ("none": each arm its own). meta refines its shield for its whole run on top
+# of saferl's. With its own shield, the iter-810 meta scored +6.2% over saferl.
+# With saferl's it scored +0.15%, and the toxin win (+4.2e7 either way)
+# vanished. The comparison was measuring the shield, not the actor.
+EVAL_SHARED_SHIELD = os.environ.get("PLANT_EVAL_SHARED_SHIELD", "saferl")
+EVAL_SHARED_SHIELD = None if EVAL_SHARED_SHIELD == "none" else EVAL_SHARED_SHIELD
 
 # ─── Held-out deterministic evaluation (checkpoint selection + early stop) ────
 HELDOUT_EVAL_EVERY = 10
-HELDOUT_EVAL_TASKS = 8
+# 14 random + 2 corner tasks fill one wave of a 16-CPU pool, so the check takes
+# the same wall time as 8 + 2 did.
+HELDOUT_EVAL_TASKS = 14
 HELDOUT_TASK_SEED = 777
 # The most overflow-prone prior draws (``corner_risk``), appended to the
 # random held-out tasks.
@@ -67,7 +87,7 @@ HELDOUT_CORNER_CANDIDATES = 512
 # CPU is available to the workers.
 HELDOUT_WORKERS = int(os.environ.get(
     "PLANT_HELDOUT_WORKERS",
-    min(HELDOUT_EVAL_TASKS + HELDOUT_CORNER_TASKS, os.cpu_count() or 2)))
+    min(HELDOUT_EVAL_TASKS + HELDOUT_CORNER_TASKS, max(2, USABLE_CPUS))))
 
 # Training episodes run in the held-out worker pool, concurrently with the
 # GPU updates (each iteration's episodes use the weights from before its
@@ -367,6 +387,14 @@ EARLY_STOP_REL_FLOOR = 1.0
 # the tank in one hour). A first guess: calibrate on a trained saferl.
 SELECT_MAX_VIOL = 3.0
 SELECT_MAX_WORST_VIOL = 12.0
+# The tail gate reads the mean of each gated branch's worst SELECT_TAIL_FRAC of
+# episodes, not its single worst one. A maximum climbs with the episode count,
+# and in the 810-iteration meta run single episodes (one leak task at 17)
+# rejected otherwise feasible checks. On saferl's 88 logged checks (10 tasks
+# per branch), a cap of 10 on the worst-20% mean admits the same 42 checks as
+# 12 on the maximum.
+SELECT_TAIL_FRAC = 0.2
+SELECT_MAX_TAIL_VIOL = 10.0
 SELECT_VIOL_WEIGHT = 1.0
 # Panel branches that must pass the absolute gate on their own: the faults
 # that move an ONLINE measurement (reactor masses, the storage mass), so an
@@ -399,6 +427,13 @@ EARLY_STOP_DIVERGE_MIN_CHECKS = 15
 # ─── SAC / encoder schedule ───────────────────────────────────────────────────
 ALPHA_MIN = 0.15
 META_KL_LAMBDA = 0.05
+# The critic already reads the true task descriptor, so z's Bellman gradient
+# taught the encoder little. In the 810-iteration run the actor loss reached
+# +166, the critic loss 18, the KL 28 and |z| 1.9 together at iterations 383-412
+# and 721-745, with no catastrophic episode starting it. This suggests a loop:
+# the encoder moves z, the critic's targets move, and so on. With the gradient
+# cut, the encoder learns from the KL, aux, gate and fault-kind losses.
+META_CRITIC_DETACH_Z = True
 KL_ANNEAL_ITERS = 150
 META_ENCODER_LR = 5e-4
 

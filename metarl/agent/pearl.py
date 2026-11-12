@@ -52,6 +52,7 @@ import torch
 from metarl.env.config import TASK_CONTEXT_DIM, N_REACTORS
 from metarl.env.layout import OBS_LAYOUT_VERSION, ACTION_DIM_PER_REACTOR
 from metarl.env.faults import N_DISTURBANCE_KINDS
+from metarl.env.adapter import N_ALARMS
 from metarl.agent.common import (device, ROLLOUT_DEVICE, _on_rollout_device,
                                  LATENT_DIM, LOG_ALPHA_MIN, NET_ARCH,
                                  RunningMeanStd, RunningObsNorm, _adamw)
@@ -97,7 +98,7 @@ class PEARLAgent(ActingMixin, ShieldMixin, LearningMixin, CheckpointMixin):
                  fault_cls_weight=0.0, train_gate_open=False,
                  encoder_update_every=1, history_hidden=256,
                  history_layers=2, history_attn_dim=64, history_attn_heads=4,
-                 history_skip=128, head_hidden=256):
+                 history_skip=128, head_hidden=256, critic_detach_z=False):
         """Initialise the agent.
 
         Arguments are the lean agent's, plus the token networks' shape:
@@ -120,6 +121,9 @@ class PEARLAgent(ActingMixin, ShieldMixin, LearningMixin, CheckpointMixin):
         always act through the learned gate. ``encoder_update_every`` steps
         the encoder on one update in that many (the heads and critics on
         every one), so it revisits each stored episode fewer times.
+        ``critic_detach_z`` stops the Bellman loss from reaching the encoder
+        through z, which then learns from the KL, aux, gate and fault-kind
+        losses only (VariBAD-style).
         """
         self._check_args(explore_noise_beta, adapt_gate, use_context,
                          critic_privileged_dim, aux_state_targets, aux_mode,
@@ -177,7 +181,7 @@ class PEARLAgent(ActingMixin, ShieldMixin, LearningMixin, CheckpointMixin):
         self.device = device
 
         # ── Networks ─────────────────────────────────────────────────────────
-        trans_dim = obs_dim + action_dim + 1 + obs_dim
+        trans_dim = obs_dim + action_dim + 1 + N_ALARMS + obs_dim
         self.trans_dim = trans_dim
         self.net_config = {"arch": NET_ARCH,
                            "n_reactors": int(N_REACTORS),
@@ -259,6 +263,7 @@ class PEARLAgent(ActingMixin, ShieldMixin, LearningMixin, CheckpointMixin):
         self.fault_head = (AuxHead(self._z_dim, N_DISTURBANCE_KINDS + 1,
                                    hidden=head_hidden, mode="task").to(device)
                            if self.fault_cls_weight > 0.0 else None)
+        self.critic_detach_z = bool(critic_detach_z)
 
         # The encoder and aux heads stay on plain Adam: the KL bottleneck
         # already regularises the encoder.

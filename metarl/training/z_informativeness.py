@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 # ─── Local ────────────────────────────────────────────────────────────────────
+from metarl.env.adapter import CONSEQUENCE_ONLY_FAULTS
 from metarl.training.config import (SEED, Z_INFORM_MIN_SNR,
                                     Z_INFORM_MIN_ACTION_DELTA,
                                     Z_INFORM_MIN_PRIOR_SENS,
@@ -49,7 +50,8 @@ def _z_rollout(env, agent, task, disturbance=None, z_mode="mean", fixed_z=None,
     times = np.asarray(ep["t_traj"], dtype=int)
     out.update(states=ep["states"] or [],
                times=times.tolist() if keep_states else [],
-               gate_times=times)
+               gate_times=times,
+               gate_labels=np.asarray(ep["label_traj"], dtype=bool))
     return out
 
 
@@ -83,6 +85,29 @@ def _actions_under_z(agent, states, z_vec, gate=None):
     finally:
         agent.set_posterior_state(snap)
         agent.gate_override = prev_gate
+
+
+def actor_z_sensitivity(agent, task, n_states=Z_INFORM_PROBE_STATES, seed=0):
+    """d|a|/d|z|: how far the actor's action moves per unit change of z.
+
+    Scores ``n_states`` observations of one undisturbed episode (on a fresh
+    environment, so no evaluated arm's duals move) under two prior draws of
+    z with the gate forced open. Encoder separability alone passed a meta
+    arm whose FiLM weights were exactly 0, since z was separable and unread.
+    """
+    env = make_arm_env(ARMS["meta"])
+    m = _z_rollout(env, agent, task, None, z_mode="mean", keep_states=True)
+    states = _probe_states(m["states"], m["times"], -1, True, n_states)
+    rng = np.random.default_rng(seed)
+    sens = []
+    for s in states:
+        z1 = rng.standard_normal(agent._z_dim).astype(np.float32)
+        z2 = rng.standard_normal(agent._z_dim).astype(np.float32)
+        a1, _ = _actions_under_z(agent, [s], z1, gate=1.0)
+        a2, _ = _actions_under_z(agent, [s], z2, gate=1.0)
+        sens.append(float(np.mean(np.abs(a1 - a2)))
+                    / max(float(np.mean(np.abs(z1 - z2))), 1e-12))
+    return float(np.mean(sens)) if sens else float("nan")
 
 
 def z_informativeness(episodes=None):
@@ -124,8 +149,12 @@ def z_informativeness(episodes=None):
         gate_pre = _finite_mean([
             gate_opening(m["gate_traj"][m["gate_times"] <= onset])
             for m in matched])
+        # A consequence-only fault is invisible until its first alarm, so its
+        # gate is read from then on.
+        hidden = dist is not None and dist["kind"] in CONSEQUENCE_ONLY_FAULTS
         gate_post = _finite_mean([
-            gate_opening(m["gate_traj"][m["gate_times"] > onset])
+            gate_opening(m["gate_traj"][m["gate_labels"] if hidden
+                                        else m["gate_times"] > onset])
             for m in matched])
         gated = agent.adapt_gate
 
@@ -221,6 +250,7 @@ def z_informativeness(episodes=None):
             "z_mu_per_task": z_mus.tolist(),
             "gate_open_pre_onset": gate_pre,
             "gate_open_post_onset": gate_post,
+            "gate_post_from_first_alarm": bool(hidden),
             "probe_split_step": int(onset),
             "action_delta_swapped_safe": post["safe"],
             "action_delta_swapped_raw": post["raw"],

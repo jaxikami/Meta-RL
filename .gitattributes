@@ -1,3 +1,0 @@
-# Shell and Slurm scripts run on Linux clusters: keep LF even with autocrlf.
-*.sh text eol=lf
-*.sbatch text eol=lf

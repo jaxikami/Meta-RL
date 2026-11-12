@@ -48,20 +48,9 @@ WARMUP_EPISODES_PER_TASK = 3
 # Evaluation tasks per scenario. The pool is drawn in order from one seed, so
 # a larger value extends it. Each plant episode costs ~3x a lean one.
 EVAL_EPISODES = int(os.environ.get("PLANT_EVAL_EPISODES", 100))
-
-
-def _usable_cpus():
-    """CPUs this process may run on: a Slurm job's allocation, not the node's."""
-    try:
-        return len(os.sched_getaffinity(0))
-    except AttributeError:          # not Linux
-        return os.cpu_count() or 1
-
-
-USABLE_CPUS = _usable_cpus()
 # Worker processes for evaluation: one job per (arm, task), each running every
 # scenario of its task from one undisturbed prefix. 0 or 1 runs in-process.
-EVAL_WORKERS = int(os.environ.get("PLANT_EVAL_WORKERS", USABLE_CPUS))
+EVAL_WORKERS = int(os.environ.get("PLANT_EVAL_WORKERS", os.cpu_count() or 1))
 # The arm whose refined KineticNet every arm's shield runs in evaluation
 # ("none": each arm its own). meta refines its shield for its whole run on top
 # of saferl's. With its own shield, the iter-810 meta scored +6.2% over saferl.
@@ -87,7 +76,7 @@ HELDOUT_CORNER_CANDIDATES = 512
 # CPU is available to the workers.
 HELDOUT_WORKERS = int(os.environ.get(
     "PLANT_HELDOUT_WORKERS",
-    min(HELDOUT_EVAL_TASKS + HELDOUT_CORNER_TASKS, max(2, USABLE_CPUS))))
+    min(HELDOUT_EVAL_TASKS + HELDOUT_CORNER_TASKS, os.cpu_count() or 2)))
 
 # Training episodes run in the held-out worker pool, concurrently with the
 # GPU updates (each iteration's episodes use the weights from before its
